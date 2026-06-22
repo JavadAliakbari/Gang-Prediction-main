@@ -1,3 +1,31 @@
-.DS_Store
-__pycache__/
+__pycache__
 *.pyc
+.vscode
+.venv
+*.egg-info
+.pytest_cache
+*.db
+*.pkl
+src/train/federated_learning/results
+old
+*results/
+*data/
+*experiments/
+
+
+
+# Experiments: Keep config files, ignore generated outputs
+experiments/*/spatial/
+experiments/*/temporal/
+experiments/*/preprocessed/
+experiments/*/results/
+experiments/*/checkpoints/
+
+# Keep config directory and all files within it
+!experiments/*/config/
+!experiments/*/config/**
+
+# Test data: Keep config files, ignore generated outputs
+tests/data_creation/parameters/*/spatial/
+tests/data_creation/parameters/*/temporal/
+tests/data_creation/parameters/temporal/
