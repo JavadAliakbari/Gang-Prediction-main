@@ -365,7 +365,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=0.005)
     parser.add_argument("--structural-width", type=int, default=32)
-    parser.add_argument("--embed-dim", type=int, default=8)
+    parser.add_argument("--embed-dim", type=int, default=16)
     parser.add_argument("--ridge", type=float, default=1e-3, help="encoder W ridge")
     parser.add_argument(
         "--feature-ridge", type=float, default=1e-2, help="classifier LDA ridge"
@@ -443,7 +443,7 @@ def main() -> None:
         normalized, retain, features=None, mode="lambda_min", **common
     )
     generator = torch.Generator(device=normalized.device)
-    generator.manual_seed(args.seed)
+    generator.manual_seed(seed)
     omega = torch.randn(
         normalized.shape[0],
         total_width,
@@ -452,7 +452,7 @@ def main() -> None:
         generator=generator,
     )
     structural_basis = build_sgc_subspace(
-        normalized, structural_fit.theta, None, width=total_width, seed=args.seed
+        normalized, structural_fit.theta, None, width=total_width, seed=seed
     )
     structural_embed = apply_graph_filter(normalized, omega, structural_fit.theta)
 
