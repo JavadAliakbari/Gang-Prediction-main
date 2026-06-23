@@ -461,7 +461,7 @@ def main() -> None:
         normalized, retain, features=X, mode="lambda_min", **common
     )
     feature_basis = build_sgc_subspace(
-        normalized, feature_fit.theta, X, width=total_width, seed=args.seed
+        normalized, feature_fit.theta, X, width=total_width, seed=seed
     )
     feature_embed = apply_graph_filter(normalized, X, feature_fit.theta)
 
@@ -476,7 +476,7 @@ def main() -> None:
         ridge=args.ridge,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
-        seed=args.seed,
+        seed=seed,
         label_patterns=clf_train,
         label_weight=args.label_weight,
         label_ridge=args.label_ridge,
@@ -488,7 +488,7 @@ def main() -> None:
         X,
         joint.feature_map,
         structural_width=args.structural_width,
-        seed=args.seed,
+        seed=seed,
         per_hop=joint.per_hop_features,
     )
     joint_embed = apply_feature_channel(
