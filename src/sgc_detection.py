@@ -43,6 +43,7 @@ class SGCTrainingResult:
     alert_scores: List[float] = field(default_factory=list)
     normal_scores: List[float] = field(default_factory=list)
     auc: float | None = None
+    retention_side: str = "pattern"
 
 
 @dataclass
@@ -110,6 +111,7 @@ class JointEncoderResult:
     combined_objective: float | None = None
     label_separation: float | None = None
     per_hop_features: bool = False
+    retention_side: str = "pattern"
 
 
 def normalized_adjacency(
@@ -297,6 +299,111 @@ def gram_matrix(
     if features is not None:
         filtered = features.T @ filtered
     return filtered.T @ filtered
+
+
+def _retention_side(r: int, m: int, mode: str) -> str:
+    """Which Gram :func:`_retention_lambda_min` uses: ``'pattern'`` or ``'channel'``."""
+
+    if mode == "channel":
+        return "channel"
+    if mode == "auto" and m > r:
+        return "channel"
+    return "pattern"
+
+
+def _reduce_eigs(
+    evals: torch.Tensor,
+    *,
+    reduce: str = "min",
+    temp: float = 0.1,
+    positive_tol: float = 1e-10,
+) -> torch.Tensor:
+    """Reduce ascending PSD eigenvalues to a scalar retention objective.
+
+    Only the *resolvable* eigenvalues (above ``positive_tol * lambda_max``) take
+    part, so rank-deficiency zeros never dominate the reduction.
+
+    * ``"min"``     -- smallest resolvable eigenvalue (the strict ``lambda_min``);
+    * ``"mean"``    -- mean of the resolvable eigenvalues (the trace/energy limit,
+      provided mostly to confirm it under-performs);
+    * ``"softmin"`` -- soft minimum ``-tau * log mean_i exp(-lambda_i / tau)`` over
+      the ``k`` resolvable eigenvalues: a smooth, Schur-concave *eigenvalue-
+      weighted trace* whose gradient weights are ``softmax(-lambda / tau)`` (peaked
+      on the smallest eigenvalues).  The ``log mean`` (i.e. the ``- log k``
+      normalization) keeps it bounded in ``[min, mean]``: ``tau = temp *
+      lambda_max`` is scale free (``temp`` relative to the spectrum), ``temp -> 0``
+      recovers ``"min"`` and ``temp -> inf`` approaches ``"mean"``.
+
+    ``"min"`` reproduces :func:`_retention_lambda_min`'s original behaviour
+    exactly.
+    """
+
+    lam_max = evals[-1].clamp_min(0.0)
+    floor = positive_tol * lam_max
+    mask = evals > floor
+    resolvable = evals[mask] if bool(mask.any()) else evals[-1:]
+    if reduce == "min":
+        return resolvable[0]
+    if reduce == "mean":
+        return resolvable.mean()
+    if reduce == "softmin":
+        eps = torch.finfo(evals.dtype).eps
+        tau = (temp * lam_max).detach().clamp_min(eps)
+        # log-mean-exp: the - log(k) keeps the soft-min bounded in [min, mean].
+        log_k = math.log(resolvable.shape[0]) if resolvable.shape[0] > 1 else 0.0
+        return -tau * (torch.logsumexp(-resolvable / tau, dim=0) - log_k)
+    raise ValueError("retention_reduce must be 'min', 'mean', or 'softmin'")
+
+
+def _retention_lambda_min(
+    signatures: torch.Tensor,
+    *,
+    mode: str = "auto",
+    ridge: float = 0.0,
+    positive_tol: float = 1e-10,
+    reduce: str = "min",
+    temp: float = 0.1,
+) -> torch.Tensor:
+    """Smallest *resolvable* retention eigenvalue, robust to the over-complete regime.
+
+    ``signatures`` is the channel signature matrix ``Y`` of shape ``(r, m)``
+    (``r`` = encoder output dimension, ``m`` = number of patterns).  The pattern
+    Gram ``Y.T Y`` (``m x m``) and the channel Gram ``Y Y.T`` (``r x r``) share
+    the same *non-zero* spectrum, so this evaluates ``lambda_min`` on whichever
+    side is cheaper and not rank starved:
+
+    * ``mode="pattern"`` -- always ``Y.T Y`` (the strict Eq. (48) Gram);
+    * ``mode="channel"`` -- always ``Y Y.T``;
+    * ``mode="auto"``    -- the smaller Gram: pattern side when ``m <= r`` else
+      channel side.
+
+    Two distinct things force a zero eigenvalue: (i) ``m > r`` (more patterns
+    than channel directions) and (ii) the channel itself being rank deficient
+    (``rank(Y) < min(r, m)``, e.g. collinear node features or over-smoothing).
+    The side switch only cures (i).  To also survive (ii) we return the smallest
+    eigenvalue *above a relative floor* ``positive_tol * lambda_max`` -- the
+    worst-resolved direction the encoder can actually lift off zero -- instead of
+    the absolute minimum.  When ``Y`` is full rank (the well-posed regime, incl.
+    every ``m <= r`` default run) every eigenvalue clears the floor and this is
+    byte-for-byte the original ``lambda_min``.  ``channel`` is meant for the
+    feature/joint encoders where ``r`` is small; forcing it on the structural
+    encoder builds an ``N x N`` Gram and should be avoided.
+
+    ``reduce`` selects how the (resolvable) spectrum is collapsed to a scalar --
+    ``"min"`` (default, strict ``lambda_min``), ``"softmin"`` (smooth
+    eigenvalue-weighted trace, temperature ``temp``), or ``"mean"`` -- via
+    :func:`_reduce_eigs`.
+    """
+
+    r, m = signatures.shape
+    use_channel = mode == "channel" or (mode == "auto" and m > r)
+    gram = signatures @ signatures.T if use_channel else signatures.T @ signatures
+    gram = 0.5 * (gram + gram.T)
+    if ridge:
+        eye = torch.eye(gram.shape[0], dtype=gram.dtype, device=gram.device)
+        gram = gram + ridge * eye
+    evals = torch.linalg.eigvalsh(gram)  # ascending; PSD so >= 0
+    return _reduce_eigs(evals, reduce=reduce, temp=temp, positive_tol=positive_tol)
 
 
 def feature_moment_matrices(
@@ -624,6 +731,9 @@ def fit_joint_encoder(
     label_weight: float = 0.0,
     label_ridge: float = 1e-2,
     per_hop_features: bool = False,
+    retention_mode: str = "auto",
+    retention_reduce: str = "min",
+    retention_temp: float = 0.1,
 ) -> JointEncoderResult:
     """Jointly learn ``(theta, W)`` for ``Z = [g_theta(A_hat) Omega | g_theta(A_hat) X W]``.
 
@@ -669,6 +779,18 @@ def fit_joint_encoder(
     ``lambda_min(G)`` objective and the spectral story are unchanged; only the
     feature channel gains ``(K+1)x`` parameters.  ``theta`` then shapes only the
     structural channel ``g_theta(A_hat) Omega``.
+
+    ``retention_mode`` handles the over-complete regime where the number of
+    patterns ``m`` exceeds the encoder's channel dimension
+    ``c = structural_width + embed_dim``.  There the ``m x m`` pattern Gram is
+    rank deficient and its ``lambda_min`` is pinned at the ridge floor with no
+    gradient in ``(theta, W)``.  ``"auto"`` (default) then switches the objective
+    to ``lambda_min`` of the ``c x c`` channel Gram ``Y Y.T`` -- same non-zero
+    spectrum, but full rank, so ``(theta, W)`` keep a live gradient.
+    ``"pattern"`` forces the strict ``m x m`` Gram; ``"channel"`` forces the
+    channel Gram.  For ``m <= c`` (and ``mode != "channel"``) the objective is
+    byte-for-byte the original ``lambda_min(Y.T Y)`` (see
+    :func:`_retention_lambda_min`).
     """
 
     if degree < 0:
@@ -681,6 +803,12 @@ def fit_joint_encoder(
         raise ValueError("structural_width must be non-negative")
     if label_weight < 0:
         raise ValueError("label_weight must be non-negative")
+    if retention_mode not in ("auto", "pattern", "channel"):
+        raise ValueError("retention_mode must be 'auto', 'pattern', or 'channel'")
+    if retention_reduce not in ("min", "softmin", "mean"):
+        raise ValueError("retention_reduce must be 'min', 'softmin', or 'mean'")
+    if retention_temp <= 0:
+        raise ValueError("retention_temp must be positive")
 
     device, dtype = adjacency.device, adjacency.dtype
     X = features.to(device=device, dtype=dtype)
@@ -782,12 +910,41 @@ def fit_joint_encoder(
             else None
         )
 
-    def regularized_gram(theta: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
-        feature_gram, structural_gram = channel_grams(theta, W)
-        gram = feature_gram / feature_scale
-        if structural_gram is not None:
-            gram = gram + structural_gram / structural_scale
-        return 0.5 * (gram + gram.T) + eye_m
+    # Channel dimension c (feature d (+ structural r)) and which Gram side the
+    # retention objective uses.  When m > c the m x m pattern Gram is rank
+    # starved, so the objective drops to the c x c channel Gram (same non-zero
+    # spectrum, full rank, live gradient); see :func:`_retention_lambda_min`.
+    channel_dim = embed + (structural_width if structural_stack is not None else 0)
+    retention_side = _retention_side(channel_dim, m, retention_mode)
+
+    def channel_signatures(theta: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+        """Per-channel-normalized signature matrix ``Y`` of shape ``(c, m)``.
+
+        ``Y.T @ Y`` reproduces the normalized pattern Gram exactly (the old
+        ``regularized_gram`` minus its ridge), while ``Y @ Y.T`` is the channel
+        Gram with the same non-zero spectrum.
+        """
+
+        if per_hop_features:
+            feature_sig = torch.einsum("kfm,kfd->dm", signature_stack, W)  # (d, m)
+        else:
+            feature_sig = W.T @ torch.einsum("k,kfm->fm", theta, signature_stack)
+        blocks = [feature_sig / feature_scale.sqrt()]
+        if structural_stack is not None:
+            structural_sig = torch.einsum("k,kmr->mr", theta, structural_stack)  # (m, r)
+            blocks.append((structural_sig / structural_scale.sqrt()).T)  # (r, m)
+        return torch.cat(blocks, dim=0)  # (c, m)
+
+    def retention_lambda_min(theta: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+        Y = channel_signatures(theta, W)
+        if retention_side == "channel":
+            gram = Y @ Y.T  # (c, c)
+            eye = ridge * torch.eye(gram.shape[0], dtype=dtype, device=device)
+        else:
+            gram = Y.T @ Y  # (m, m)
+            eye = eye_m
+        evals = torch.linalg.eigvalsh(0.5 * (gram + gram.T) + eye)
+        return _reduce_eigs(evals, reduce=retention_reduce, temp=retention_temp)
 
     def label_margin(theta: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
         # Mean-pooled signatures -> (m_lab, d); same feature channel as the Gram.
@@ -800,9 +957,7 @@ def fit_joint_encoder(
         return _label_separation(signatures, is_alert_label, ridge=label_ridge)
 
     with torch.no_grad():
-        init_lambda = torch.linalg.eigvalsh(regularized_gram(init_theta, init_W))[
-            0
-        ].item()
+        init_lambda = float(retention_lambda_min(init_theta, init_W))
         init_separation = (
             float(label_margin(init_theta, init_W)) if use_labels else None
         )
@@ -822,7 +977,7 @@ def fit_joint_encoder(
     def combined_objective(
         theta: torch.Tensor, W: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        lam = torch.linalg.eigvalsh(regularized_gram(theta, W))[0]
+        lam = retention_lambda_min(theta, W)
         if not use_labels:
             return lam, lam, None
         sep = label_margin(theta, W)
@@ -879,6 +1034,7 @@ def fit_joint_encoder(
         combined_objective=best_total if use_labels else None,
         label_separation=best_separation if use_labels else None,
         per_hop_features=per_hop_features,
+        retention_side=retention_side,
     )
 
 
@@ -915,6 +1071,9 @@ def fit_collective_sgc(
     features: torch.Tensor | None = None,
     mode: str = "lambda_min",
     ridge: float = 1e-6,
+    retention_mode: str = "auto",
+    retention_reduce: str = "min",
+    retention_temp: float = 0.1,
 ) -> SGCTrainingResult:
     """Fit unit-norm ``theta`` on training patterns.
 
@@ -932,6 +1091,20 @@ def fit_collective_sgc(
       ``"discriminative"`` trains ``theta`` by projected Adam to maximize the
       soft Fisher ratio of the per-pattern energies
       :func:`discriminative_score_ratio` (also needs both classes).
+
+    ``retention_mode`` (``"lambda_min"`` mode only) controls the over-complete
+    regime where the number of patterns ``m`` exceeds the channel rank ``r``
+    (here ``r = f`` for the feature-aware Gram, ``r = N`` for the structural
+    one).  ``"pattern"`` keeps the strict ``m x m`` Gram (whose ``lambda_min``
+    collapses to ``0`` with no ``theta`` gradient once ``m > r``); ``"auto"``
+    (default) switches to the channel-side ``r x r`` Gram ``Y Y.T`` in that
+    regime so ``theta`` keeps a live gradient (see :func:`_retention_lambda_min`).
+    For ``m <= r`` (and the structural encoder, ``N >> m``) ``"auto"`` is
+    identical to ``"pattern"``.
+
+    ``retention_reduce`` (with ``retention_temp``) chooses how the spectrum is
+    reduced -- ``"min"`` (strict ``lambda_min``, default), ``"softmin"`` (smooth
+    eigenvalue-weighted trace), or ``"mean"`` -- via :func:`_reduce_eigs`.
     """
 
     if degree < 0:
@@ -942,6 +1115,12 @@ def fit_collective_sgc(
         raise ValueError("threshold_quantile must be in [0, 1]")
     if mode not in ("lambda_min", "fisher", "discriminative"):
         raise ValueError("mode must be 'lambda_min', 'fisher', or 'discriminative'")
+    if retention_mode not in ("auto", "pattern", "channel"):
+        raise ValueError("retention_mode must be 'auto', 'pattern', or 'channel'")
+    if retention_reduce not in ("min", "softmin", "mean"):
+        raise ValueError("retention_reduce must be 'min', 'softmin', or 'mean'")
+    if retention_temp <= 0:
+        raise ValueError("retention_temp must be positive")
 
     device, dtype = adjacency.device, adjacency.dtype
     V = pattern_indicator_matrix(
@@ -957,12 +1136,28 @@ def fit_collective_sgc(
     labels = [str(pattern.label) for pattern in train_patterns]
     moments = feature_moment_matrices(propagated, features)
 
+    # Channel signature matrix Y (r, m): r = f (feature-aware) or N (structural).
+    m_patterns = V.shape[1]
+    channel_rank = features.shape[1] if features is not None else adjacency.shape[0]
+    retention_side = _retention_side(channel_rank, m_patterns, retention_mode)
+
+    def _signatures(theta: torch.Tensor) -> torch.Tensor:
+        filtered = filter_signals(propagated, theta)  # (N, m) = g_theta(A_hat) V
+        if features is not None:
+            filtered = features.T @ filtered  # (f, m) = Y
+        return filtered
+
     initial_theta = torch.zeros(degree + 1, dtype=dtype, device=device)
     initial_theta[-1] = 1.0
     with torch.no_grad():
-        vanilla = torch.linalg.eigvalsh(
-            gram_matrix(propagated, initial_theta, features)
-        )[0].item()
+        vanilla = float(
+            _retention_lambda_min(
+                _signatures(initial_theta),
+                mode=retention_mode,
+                reduce=retention_reduce,
+                temp=retention_temp,
+            )
+        )
 
     separation_ratio: float | None = None
     if mode == "fisher":
@@ -1019,9 +1214,12 @@ def fit_collective_sgc(
         for _ in range(epochs):
             optimizer.zero_grad(set_to_none=True)
             theta = _unit(raw_theta)
-            current_gram = gram_matrix(propagated, theta, features)
-            gram = 0.5 * (current_gram + current_gram.T)
-            objective = torch.linalg.eigvalsh(gram)[0]
+            objective = _retention_lambda_min(
+                _signatures(theta),
+                mode=retention_mode,
+                reduce=retention_reduce,
+                temp=retention_temp,
+            )
             if not torch.isfinite(objective):
                 raise FloatingPointError("non-finite lambda_min(G) while fitting SGC")
             (-objective).backward()
@@ -1070,6 +1268,7 @@ def fit_collective_sgc(
         alert_scores=alert_scores,
         normal_scores=normal_scores,
         auc=auc,
+        retention_side=retention_side if mode == "lambda_min" else "pattern",
     )
 
 

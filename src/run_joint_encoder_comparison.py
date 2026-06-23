@@ -33,8 +33,10 @@ import os
 import argparse
 import json
 from pathlib import Path
-
 import sys
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
 
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "src")))
 project_root = Path.cwd()
@@ -116,6 +118,12 @@ def _coarsen_and_score(
         epsilon=args.epsilon,
         max_levels=args.max_levels,
         method=args.coarsening_method,
+        max_contraction_size=args.max_contraction_size,
+        leaf_degree=args.leaf_degree,
+        min_spokes=args.min_spokes,
+        kmeans_iters=args.kmeans_iters,
+        kmeans_seed=seed,
+        max_cluster_size=args.linkage_max_size,
     )
     _, by_label = evaluate_loukas_patterns(
         eval_patterns,
@@ -359,7 +367,7 @@ def _save_comparison_plot(rows: list, output: Path, *, experiment: str = "") -> 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment", default="tutorial_demo16")
+    parser.add_argument("--experiment", default="tutorial_demo5")
     parser.add_argument("--train-ratio", type=float, default=0.25)
     parser.add_argument("--degree", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=200)
@@ -373,7 +381,7 @@ def main() -> None:
     parser.add_argument(
         "--label-weight",
         type=float,
-        default=0.0,
+        default=1.0,
         help="weight of the supervised LDA-margin term in the joint encoder "
         "objective (0 = pure lambda_min; >0 trades coarsening for label "
         "separability)",
@@ -391,18 +399,87 @@ def main() -> None:
         help="give the joint encoder one feature map W_k per propagation depth "
         "(linear filterbank sum_k A_hat^k X W_k) instead of a single shared W",
     )
+    parser.add_argument(
+        "--retention-mode",
+        choices=["auto", "pattern", "channel"],
+        default="auto",
+        help="lambda_min Gram side when #patterns m exceeds the channel rank r: "
+        "'pattern' keeps the m x m Gram (theta frozen once m>r); 'auto' "
+        "(default) switches to the r x r channel Gram so theta/W keep a "
+        "gradient; 'channel' always uses the channel Gram",
+    )
+    parser.add_argument(
+        "--retention-reduce",
+        choices=["min", "softmin", "mean"],
+        default="softmin",
+        help="how the retention spectrum is reduced: 'min' (strict lambda_min, "
+        "default); 'softmin' (smooth eigenvalue-weighted trace "
+        "-tau*logsumexp(-lambda/tau), tau=--retention-temp*lambda_max); 'mean' "
+        "(trace/energy limit)",
+    )
+    parser.add_argument(
+        "--retention-temp",
+        type=float,
+        default=0.5,
+        help="softmin temperature as a fraction of lambda_max (smaller -> closer "
+        "to strict min, larger -> closer to mean)",
+    )
     parser.add_argument("--reduction", type=float, default=0.7)
     parser.add_argument("--epsilon", type=float, default=float("inf"))
     parser.add_argument("--max-levels", type=int, default=30)
     parser.add_argument("--threshold", type=float, default=0.51)
     parser.add_argument(
-        "--coarsening-method", choices=["edges", "neighborhood"], default="edges"
+        "--coarsening-method",
+        choices=["edges", "neighborhood", "capped", "star", "kmeans", "linkage"],
+        default="edges",
+        help="local-variation candidate family: 'edges' (1 pair, conservative); "
+        "'neighborhood' ({i}uN(i), aggressive); 'capped' (in-between, sets <= "
+        "--max-contraction-size); 'star' (hub+spokes pre-pass for fan patterns); "
+        "'kmeans' (global subspace clustering + connectivity, non-greedy); "
+        "'linkage' (single-linkage union-find on the cost graph, connected by "
+        "construction)",
+    )
+    parser.add_argument(
+        "--kmeans-iters",
+        type=int,
+        default=10,
+        help="Lloyd iterations for --coarsening-method kmeans",
+    )
+    parser.add_argument(
+        "--linkage-max-size",
+        type=int,
+        default=8,
+        help="supernode size cap for --coarsening-method linkage (curbs single-"
+        "linkage chaining; 0 = uncapped). Smaller -> better fans, larger -> "
+        "better overall",
+    )
+    parser.add_argument(
+        "--max-contraction-size",
+        type=int,
+        default=4,
+        help="cap on contraction-set size for --coarsening-method capped "
+        "(2 = edges, large -> neighborhood)",
+    )
+    parser.add_argument(
+        "--leaf-degree",
+        type=int,
+        default=1,
+        help="for --coarsening-method star: a spoke is a neighbor with "
+        "combinatorial degree <= this (raise to catch fan_in sources with "
+        "extra edges, at the cost of more collateral on dense motifs)",
+    )
+    parser.add_argument(
+        "--min-spokes",
+        type=int,
+        default=4,
+        help="for --coarsening-method star: a hub must have at least this many "
+        "spokes to fire (raise to restrict to large, genuine fans)",
     )
     # parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--include-normal-train",
         action="store_true",
-        default=False,
+        default=True,
         help="add normal patterns to the lambda_min retention target",
     )
     parser.add_argument("--remove-overlaps", action="store_true")
@@ -442,7 +519,14 @@ def main() -> None:
 
     # --- structural encoder: theta on the structural Gram (Sigma_X = I) ---
     structural_fit = fit_collective_sgc(
-        normalized, retain, features=None, mode="lambda_min", **common
+        normalized,
+        retain,
+        features=None,
+        mode="lambda_min",
+        retention_mode=args.retention_mode,
+        retention_reduce=args.retention_reduce,
+        retention_temp=args.retention_temp,
+        **common,
     )
     generator = torch.Generator(device=normalized.device)
     generator.manual_seed(seed)
@@ -460,7 +544,14 @@ def main() -> None:
 
     # --- raw-feature encoder: theta on the feature-aware Gram (Sigma_X = X X.T) ---
     feature_fit = fit_collective_sgc(
-        normalized, retain, features=X, mode="lambda_min", **common
+        normalized,
+        retain,
+        features=X,
+        mode="lambda_min",
+        retention_mode=args.retention_mode,
+        retention_reduce=args.retention_reduce,
+        retention_temp=args.retention_temp,
+        **common,
     )
     feature_basis = build_sgc_subspace(
         normalized, feature_fit.theta, X, width=total_width, seed=seed
@@ -483,6 +574,9 @@ def main() -> None:
         label_weight=args.label_weight,
         label_ridge=args.label_ridge,
         per_hop_features=args.per_hop_features,
+        retention_mode=args.retention_mode,
+        retention_reduce=args.retention_reduce,
+        retention_temp=args.retention_temp,
     )
     joint_basis = build_joint_subspace(
         normalized,
@@ -537,6 +631,14 @@ def main() -> None:
                 "joint_encoder_label_separation": joint.label_separation,
                 "joint_encoder_combined_objective": joint.combined_objective,
                 "joint_encoder_per_hop_features": joint.per_hop_features,
+                "retention_mode": args.retention_mode,
+                "retention_reduce": args.retention_reduce,
+                "retention_temp": args.retention_temp,
+                "retention_side": {
+                    "structural": structural_fit.retention_side,
+                    "raw-feature": feature_fit.retention_side,
+                    "joint": joint.retention_side,
+                },
                 "encoders": rows,
             },
             indent=2,
@@ -545,8 +647,8 @@ def main() -> None:
     )
     _save_comparison_plot(rows, plot_out, experiment=args.experiment)
 
-    print("\nLinear encoder comparison  (Z = g_theta(A_hat) [.])")
-    print(
+    LOGGER.info("\nLinear encoder comparison  (Z = g_theta(A_hat) [.])")
+    LOGGER.info(
         f"  experiment={args.experiment}  degree={args.degree}  "
         f"target_dim~{total_width}  reduction={args.reduction:.0%}  "
         f"method={args.coarsening_method}"
@@ -554,12 +656,22 @@ def main() -> None:
     feature_channel = (
         "per-hop W_k (filterbank)" if joint.per_hop_features else "shared W"
     )
-    print(
+    LOGGER.info(
         f"  joint encoder lambda_min(G(theta,W)): {joint.objective:.6g} "
         f"(init {joint.vanilla_objective:.6g})  feature-channel={feature_channel}"
     )
+    reduce_desc = args.retention_reduce + (
+        f"(tau={args.retention_temp:g}*lambda_max)"
+        if args.retention_reduce == "softmin"
+        else ""
+    )
+    LOGGER.info(
+        f"  retention_mode={args.retention_mode}  reduce={reduce_desc}  Gram side -> "
+        f"structural:{structural_fit.retention_side}  "
+        f"raw-feature:{feature_fit.retention_side}  joint:{joint.retention_side}"
+    )
     if joint.label_weight > 0:
-        print(
+        LOGGER.info(
             f"  joint encoder label supervision: weight={joint.label_weight:g}  "
             f"LDA-margin={joint.label_separation:.6g}  "
             f"combined={joint.combined_objective:.6g}"
@@ -569,10 +681,10 @@ def main() -> None:
         f"{'alert_recall':>13} {'alert_prec':>11} {'alert_det':>10} "
         f"{'clf_AUC(test)':>14} {'clf_AUC(train)':>15}"
     )
-    print(header)
-    print("  " + "-" * (len(header) - 3))
+    LOGGER.info(header)
+    LOGGER.info("  " + "-" * (len(header) - 3))
     for row in rows:
-        print(
+        LOGGER.info(
             f"  {row['encoder']:<12} {row['basis_dim']:>4} {row['n_coarse']:>9} "
             f"{(row['alert_mean_recall'] or 0):>13.3f} "
             f"{(row['alert_mean_precision'] or 0):>11.3f} "
@@ -584,30 +696,30 @@ def main() -> None:
     # Per-type alert detection rate
     all_alert_types = sorted({t for row in rows for t in row["alert_by_type"]})
     if all_alert_types:
-        print("\n  Alert detection rate by pattern type:")
+        LOGGER.info("\n  Alert detection rate by pattern type:")
         type_header = f"  {'encoder':<12}  " + "".join(
             f"{t:>14}" for t in all_alert_types
         )
-        print(type_header)
-        print("  " + "-" * (len(type_header) - 2))
+        LOGGER.info(type_header)
+        LOGGER.info("  " + "-" * (len(type_header) - 2))
         for row in rows:
             cells = "".join(
                 f"{row['alert_by_type'].get(t, {}).get('detection_rate', 0.0):>14.1%}"
                 for t in all_alert_types
             )
-            print(f"  {row['encoder']:<12}  {cells}")
+            LOGGER.info(f"  {row['encoder']:<12}  {cells}")
 
-        print("\n  Alert mean recall by pattern type:")
-        print(type_header)
-        print("  " + "-" * (len(type_header) - 2))
+        LOGGER.info("\n  Alert mean recall by pattern type:")
+        LOGGER.info(type_header)
+        LOGGER.info("  " + "-" * (len(type_header) - 2))
         for row in rows:
             cells = "".join(
                 f"{row['alert_by_type'].get(t, {}).get('mean_recall', 0.0):>14.3f}"
                 for t in all_alert_types
             )
-            print(f"  {row['encoder']:<12}  {cells}")
+            LOGGER.info(f"  {row['encoder']:<12}  {cells}")
 
-    print(
+    LOGGER.info(
         "\nRead: 'alert_recall/prec/det' is the STRUCTURAL coarsening quality "
         "(theta/W's job); 'clf_AUC(test)' is the held-out alert classifier on "
         "each encoder's embedding (the label head). The structural embedding "
@@ -616,8 +728,8 @@ def main() -> None:
         "with the learned feature channel, so it keeps coarsening quality while "
         "lifting the classifier above the structural baseline."
     )
-    print(f"\nJSON report:  {json_out}")
-    print(f"Plot:         {plot_out}")
+    LOGGER.info(f"\nJSON report:  {json_out}")
+    LOGGER.info(f"Plot:         {plot_out}")
 
 
 if __name__ == "__main__":
