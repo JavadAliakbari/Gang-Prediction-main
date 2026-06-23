@@ -365,7 +365,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=0.005)
     parser.add_argument("--structural-width", type=int, default=32)
-    parser.add_argument("--embed-dim", type=int, default=16)
+    parser.add_argument("--embed-dim", type=int, default=8)
     parser.add_argument("--ridge", type=float, default=1e-3, help="encoder W ridge")
     parser.add_argument(
         "--feature-ridge", type=float, default=1e-2, help="classifier LDA ridge"
@@ -373,7 +373,7 @@ def main() -> None:
     parser.add_argument(
         "--label-weight",
         type=float,
-        default=1.0,
+        default=0.0,
         help="weight of the supervised LDA-margin term in the joint encoder "
         "objective (0 = pure lambda_min; >0 trades coarsening for label "
         "separability)",
@@ -387,6 +387,7 @@ def main() -> None:
     parser.add_argument(
         "--per-hop-features",
         action="store_true",
+        default=False,
         help="give the joint encoder one feature map W_k per propagation depth "
         "(linear filterbank sum_k A_hat^k X W_k) instead of a single shared W",
     )
@@ -401,6 +402,7 @@ def main() -> None:
     parser.add_argument(
         "--include-normal-train",
         action="store_true",
+        default=False,
         help="add normal patterns to the lambda_min retention target",
     )
     parser.add_argument("--remove-overlaps", action="store_true")
