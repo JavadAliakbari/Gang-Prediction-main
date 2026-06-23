@@ -54,6 +54,7 @@ from src.experiment_utils import load_and_preprocess_data
 from src.loukas_sgc_detection import (
     _orthonormal_range,
     build_joint_subspace,
+    build_laplacian_subspace,
     build_sgc_subspace,
     evaluate_loukas_patterns,
     graph_operators,
@@ -431,7 +432,7 @@ def main() -> None:
     parser.add_argument(
         "--coarsening-method",
         choices=["edges", "neighborhood", "capped", "star", "kmeans", "linkage"],
-        default="edges",
+        default="kmeans",
         help="local-variation candidate family: 'edges' (1 pair, conservative); "
         "'neighborhood' ({i}uN(i), aggressive); 'capped' (in-between, sets <= "
         "--max-contraction-size); 'star' (hub+spokes pre-pass for fan patterns); "
@@ -542,6 +543,10 @@ def main() -> None:
     )
     structural_embed = apply_graph_filter(normalized, omega, structural_fit.theta)
 
+    # Baseline: span(U_K), the bottom-K combinatorial Laplacian eigenvectors.
+    laplacian_basis = build_laplacian_subspace(adjacency, width=total_width)
+    laplacian_embed = apply_graph_filter(normalized, omega, structural_fit.theta)
+
     # --- raw-feature encoder: theta on the feature-aware Gram (Sigma_X = X X.T) ---
     feature_fit = fit_collective_sgc(
         normalized,
@@ -592,6 +597,7 @@ def main() -> None:
     )
 
     encoders = [
+        ("laplacian", laplacian_basis, laplacian_embed),
         ("structural", structural_basis, structural_embed),
         ("raw-feature", feature_basis, feature_embed),
         ("joint", joint_basis, joint_embed),
@@ -677,7 +683,7 @@ def main() -> None:
             f"combined={joint.combined_objective:.6g}"
         )
     header = (
-        f"\n  {'encoder':<12} {'dim':>4} {'n_coarse':>9} "
+        f"{'  encoder':<12} {'dim':>4} {'n_coarse':>9} "
         f"{'alert_recall':>13} {'alert_prec':>11} {'alert_det':>10} "
         f"{'clf_AUC(test)':>14} {'clf_AUC(train)':>15}"
     )

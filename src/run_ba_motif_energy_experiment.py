@@ -33,6 +33,7 @@ Usage (from repo root, with FedStruct conda env active)::
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import os
 import sys
 import warnings
@@ -62,21 +63,27 @@ from src.coarsening_diagnostics import (
     _ensure_graph_params,
 )
 from src.utils.utils import save_path, LOGGER
+from src.pattern_models import Pattern, create_pattern
 
 # ── constants ─────────────────────────────────────────────────────────────────
 MOTIF_TYPES = ["clique", "cycle", "star"]
-MOTIF_SIZES = [10, 50, 100, 250]
+MOTIF_SIZES = [
+    10,
+    # 25,
+    50,
+    100,
+]
 REPETITIONS = [
     1,
-    3,
+    # 3,
     5,
     10,
-    20,
+    # 20,
 ]
 
 # colour palette per motif type
 MOTIF_COLORS = {"clique": "#e41a1c", "cycle": "#377eb8", "star": "#4daf4a"}
-SIZE_ALPHA = {10: 1.0, 50: 0.85, 100: 0.65, 250: 0.45}
+SIZE_ALPHA = {10: 1.0, 25: 0.9, 50: 0.85, 100: 0.65}
 REP_STYLES = {1: "-", 3: "--", 5: ":", 10: "-.", 20: (0, (3, 1, 1, 1))}
 
 
@@ -148,109 +155,161 @@ EDGE_GENERATORS = {
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def plant_motifs(
-    G: Data,
-    motif_type: str,
+def select_random_nodes(
+    N: int, size: int, used: set, rng: np.random.Generator
+) -> Optional[np.ndarray]:
+    """Pick *size* nodes uniformly at random, avoiding *used* nodes."""
+    available = np.array(sorted(set(range(N)) - used))
+    if len(available) < size:
+        return None
+    chosen = rng.choice(available, size=size, replace=False)
+    return chosen
+
+
+def _adj_list_from_edge_index(edge_index: torch.Tensor, N: int) -> Dict[int, List[int]]:
+    """Build an adjacency list dict from a PyG edge_index (cached per call site)."""
+    adj: Dict[int, List[int]] = defaultdict(list)
+    src, dst = edge_index[0].tolist(), edge_index[1].tolist()
+    for s, d in zip(src, dst):
+        adj[s].append(d)
+    return adj
+
+
+def select_bfs_nodes(
+    edge_index: torch.Tensor,
+    N: int,
+    size: int,
+    used: set,
+    rng: np.random.Generator,
+    adj: Optional[Dict[int, List[int]]] = None,
+) -> Optional[np.ndarray]:
+    """BFS from a random seed, collecting *size* neighbours.
+
+    Avoids nodes in *used*.  Retries up to 50 seeds if BFS doesn't yield enough.
+    """
+    if adj is None:
+        adj = _adj_list_from_edge_index(edge_index, N)
+    available = list(set(range(N)) - used)
+    if len(available) < size:
+        return None
+
+    for _ in range(50):
+        seed = int(rng.choice(available))
+        visited = [seed]
+        visited_set = {seed}
+        frontier = [seed]
+        while len(visited) < size and frontier:
+            next_frontier = []
+            for node in frontier:
+                for nb in adj.get(node, []):
+                    if nb not in visited_set and nb not in used:
+                        visited_set.add(nb)
+                        visited.append(nb)
+                        next_frontier.append(nb)
+                        if len(visited) >= size:
+                            break
+                if len(visited) >= size:
+                    break
+            frontier = next_frontier
+        if len(visited) >= size:
+            return np.array(visited[:size])
+    return None  # exhausted retries
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Graph planting
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def plant_patterns_in_graph(
+    G_original: Data,
+    pattern_type: str,
     size: int,
     n_reps: int,
-    seed: int = 0,
-) -> Tuple[Data, List[np.ndarray]]:
-    """Plant *n_reps* non-overlapping copies of *motif_type* of *size* nodes.
+    strategy: str = "random",
+    seed: int = 42,
+) -> Tuple[Data, List]:
+    """Plant *n_reps* copies of *pattern_type* into a copy of the graph.
 
-    Each copy:
-      1. Picks a random seed from available nodes, then expands via BFS
-         through the *original* graph edges until *size* unused neighbours
-         are collected (retries up to 50 seeds if BFS yields too few nodes).
-      2. Removes existing edges among them.
-      3. Adds the motif-specific edges (both directions → undirected).
+    Steps per repetition
+    --------------------
+    1. Select *size* nodes (random or BFS).
+    2. Remove all existing edges among those nodes.
+    3. Add the pattern-specific edges (undirected).
 
     Returns
     -------
-    G_new        : modified Data object
-    motif_nodes  : list of node-index arrays, one per planted copy
+    G_new : Data  — modified graph with patterns planted
+    patterns : list[Pattern]  — Pattern objects for each planted instance
     """
     rng = np.random.default_rng(seed)
-    N = G.num_nodes
-    src_l, dst_l = G.edge_index[0].tolist(), G.edge_index[1].tolist()
-    edge_set: set = set(zip(src_l, dst_l))
+    N = G_original.num_nodes
 
-    # Build adjacency list once for BFS (uses original graph edges)
-    adj: Dict[int, List[int]] = {}
-    for s, d in zip(src_l, dst_l):
-        adj.setdefault(s, []).append(d)
+    # Work with edge sets for efficient add/remove
+    ei = G_original.edge_index
+    src_list, dst_list = ei[0].tolist(), ei[1].tolist()
+    edge_set = set(zip(src_list, dst_list))
 
-    gen = EDGE_GENERATORS[motif_type]
-    used: set = set()
-    planted: List[np.ndarray] = []
+    # Precompute adjacency for BFS
+    adj = _adj_list_from_edge_index(ei, N) if strategy == "bfs" else None
 
-    for rep in range(n_reps):
-        available_set = set(range(N)) - used
-        available = np.array(sorted(available_set))
-        if len(available) < size:
-            LOGGER.warning(
-                f"  [plant] only {len(available)} nodes left at rep {rep}; "
-                f"stopping early (needed {size})"
-            )
-            break
+    edge_gen = EDGE_GENERATORS[pattern_type]
+    used_nodes: set = set()
+    patterns = []
 
-        # BFS: try up to 50 random seeds to collect exactly *size* connected nodes
-        nodes = None
-        for _ in range(50):
-            seed_node = int(rng.choice(available))
-            visited: List[int] = [seed_node]
-            visited_set: set = {seed_node}
-            frontier: List[int] = [seed_node]
-            while len(visited) < size and frontier:
-                next_frontier: List[int] = []
-                for node in frontier:
-                    for nb in adj.get(node, []):
-                        if nb not in visited_set and nb not in used:
-                            visited_set.add(nb)
-                            visited.append(nb)
-                            next_frontier.append(nb)
-                            if len(visited) >= size:
-                                break
-                    if len(visited) >= size:
-                        break
-                frontier = next_frontier
-            if len(visited) >= size:
-                nodes = np.array(visited[:size])
-                break
-
+    for rep_idx in range(n_reps):
+        # ── select nodes ────────────────────────────────────────────────
+        if strategy == "random":
+            nodes = select_random_nodes(N, size, used_nodes, rng)
+        else:
+            nodes = select_bfs_nodes(ei, N, size, used_nodes, rng, adj=adj)
         if nodes is None:
             LOGGER.warning(
-                f"  [plant] BFS exhausted 50 seeds at rep {rep}; "
-                f"stopping early (needed {size})"
+                f"  [plant] could not find {size} unused nodes at rep {rep_idx} "
+                f"({strategy}); stopping at {rep_idx} reps"
             )
             break
 
-        used.update(nodes.tolist())
+        used_nodes.update(nodes.tolist())
 
-        # Remove existing edges inside motif node set
+        # ── remove existing edges among selected nodes ──────────────────
         node_set = set(nodes.tolist())
-        edge_set -= {(u, v) for u, v in edge_set if u in node_set and v in node_set}
+        to_remove = {(u, v) for u, v in edge_set if u in node_set and v in node_set}
+        edge_set -= to_remove
 
-        # Add motif edges (both directions)
-        for u, v in gen(nodes):
+        # ── add pattern edges (both directions for undirected) ──────────
+        new_edges = edge_gen(nodes)
+        for u, v in new_edges:
             edge_set.add((u, v))
             edge_set.add((v, u))
 
-        planted.append(nodes)
+        # ── create Pattern object ───────────────────────────────────────
+        p = create_pattern(
+            pattern_id=f"{pattern_type}_{rep_idx}",
+            nodes=nodes,
+            pattern_type=pattern_type,
+            label="alert",
+        )
+        patterns.append(p)
 
-    # Rebuild PyG Data
+    # ── rebuild PyG Data ────────────────────────────────────────────────
     if edge_set:
         all_src, all_dst = zip(*sorted(edge_set))
     else:
         all_src, all_dst = [], []
-    new_ei = torch.tensor([list(all_src), list(all_dst)], dtype=torch.long)
+    new_edge_index = torch.tensor([list(all_src), list(all_dst)], dtype=torch.long)
+
     G_new = Data(
-        x=G.x.clone(),
-        edge_index=new_ei,
+        x=G_original.x.clone(),
+        edge_index=new_edge_index,
         num_nodes=N,
     )
+    if hasattr(G_original, "y") and G_original.y is not None:
+        G_new.y = G_original.y.clone()
     G_new.edge_weight = torch.ones(G_new.edge_index.size(1), dtype=torch.float32)
     G_new = _ensure_graph_params(G_new)
-    return G_new, planted
+
+    return G_new, patterns
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -258,7 +317,7 @@ def plant_motifs(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def motif_energy(Uk: np.ndarray, node_sets: List[np.ndarray], N: int) -> np.ndarray:
+def motif_energy(Uk: np.ndarray, node_sets: List[Pattern], N: int) -> np.ndarray:
     """Aggregate energy per eigenvector across all motif instances.
 
     For each instance with node set S, indicator v = 1_S / ‖1_S‖.
@@ -267,7 +326,7 @@ def motif_energy(Uk: np.ndarray, node_sets: List[np.ndarray], N: int) -> np.ndar
     Parameters
     ----------
     Uk        : (N, K) eigenvector matrix
-    node_sets : list of node-index arrays
+    node_sets : list of Pattern objects
     N         : number of graph nodes
 
     Returns
@@ -277,9 +336,9 @@ def motif_energy(Uk: np.ndarray, node_sets: List[np.ndarray], N: int) -> np.ndar
     """
     K = Uk.shape[1]
     energies = []
-    for nodes in node_sets:
+    for pattern in node_sets:
         v = np.zeros(N, dtype=np.float64)
-        v[nodes] = 1.0
+        v[pattern.nodes] = 1.0
         norm = np.linalg.norm(v)
         if norm > 0:
             v /= norm
@@ -815,14 +874,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--n_nodes",
         type=int,
-        default=2000,
-        help="Number of nodes in the BA graph (default: 2000)",
+        default=6000,
+        help="Number of nodes in the BA graph (default: 6000)",
     )
     p.add_argument(
         "--ba_m",
         type=int,
-        default=2,
-        help="BA model m: edges to attach per new node (default: 2)",
+        default=1,
+        help="BA model m: edges to attach per new node (default: 1)",
     )
     p.add_argument("--seed", type=int, default=42, help="Global random seed")
     p.add_argument(
@@ -859,7 +918,7 @@ def main() -> None:
     LOGGER.info(f"  Output dir  : {SAVE_DIR}")
     LOGGER.info("=" * 70)
 
-    configs = list(product(MOTIF_TYPES, MOTIF_SIZES, REPETITIONS))
+    configs = list(product(MOTIF_SIZES, REPETITIONS, MOTIF_TYPES))
     LOGGER.info(f"  Total configurations: {len(configs)}  × {args.n_trials} trials")
 
     # Accumulators: key → list of per-trial (K,) energy arrays
@@ -880,14 +939,14 @@ def main() -> None:
         K_max = args.k_max if args.k_max > 0 else N
         dense_threshold = N + 10
 
-        for idx, (mtype, size, n_reps) in enumerate(configs, 1):
+        for idx, (size, n_reps, mtype) in enumerate(configs, 1):
             tag = f"{mtype}_s{size}_r{n_reps}"
 
             if size >= N:
                 continue
 
             # Plant motifs (vary seed by config index too)
-            G_planted, motif_node_sets = plant_motifs(
+            G_planted, motif_node_sets = plant_patterns_in_graph(
                 G_base, mtype, size, n_reps, seed=trial_seed + idx
             )
             n_planted = len(motif_node_sets)
