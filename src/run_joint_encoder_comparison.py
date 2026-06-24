@@ -368,13 +368,13 @@ def _save_comparison_plot(rows: list, output: Path, *, experiment: str = "") -> 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment", default="tutorial_demo5")
+    parser.add_argument("--experiment", default="tutorial_demo16")
     parser.add_argument("--train-ratio", type=float, default=0.25)
     parser.add_argument("--degree", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=0.005)
-    parser.add_argument("--structural-width", type=int, default=32)
-    parser.add_argument("--embed-dim", type=int, default=8)
+    parser.add_argument("--structural-width", type=int, default=64)
+    parser.add_argument("--embed-dim", type=int, default=32)
     parser.add_argument("--ridge", type=float, default=1e-3, help="encoder W ridge")
     parser.add_argument(
         "--feature-ridge", type=float, default=1e-2, help="classifier LDA ridge"
@@ -432,7 +432,7 @@ def main() -> None:
     parser.add_argument(
         "--coarsening-method",
         choices=["edges", "neighborhood", "capped", "star", "kmeans", "linkage"],
-        default="kmeans",
+        default="edges",
         help="local-variation candidate family: 'edges' (1 pair, conservative); "
         "'neighborhood' ({i}uN(i), aggressive); 'capped' (in-between, sets <= "
         "--max-contraction-size); 'star' (hub+spokes pre-pass for fan patterns); "

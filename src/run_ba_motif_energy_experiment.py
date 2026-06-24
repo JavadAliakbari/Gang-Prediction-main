@@ -33,6 +33,7 @@ Usage (from repo root, with FedStruct conda env active)::
 from __future__ import annotations
 
 import argparse
+import csv
 from collections import defaultdict
 import os
 import sys
@@ -40,6 +41,8 @@ import warnings
 from itertools import product
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+import scipy.sparse as sp
 
 warnings.filterwarnings("ignore")
 
@@ -68,6 +71,7 @@ from src.pattern_models import Pattern, create_pattern
 # ── constants ─────────────────────────────────────────────────────────────────
 MOTIF_TYPES = ["clique", "cycle", "star"]
 MOTIF_SIZES = [
+    5,
     10,
     # 25,
     50,
@@ -85,6 +89,16 @@ REPETITIONS = [
 MOTIF_COLORS = {"clique": "#e41a1c", "cycle": "#377eb8", "star": "#4daf4a"}
 SIZE_ALPHA = {10: 1.0, 25: 0.9, 50: 0.85, 100: 0.65}
 REP_STYLES = {1: "-", 3: "--", 5: ":", 10: "-.", 20: (0, (3, 1, 1, 1))}
+
+# Bridge internal degree δ_br per motif (note Prop. 2): the number of internal
+# motif edges incident to a node that carries a bridge to the host. This is the
+# ONLY motif-specific quantity that enters the moments — and only the 3rd one.
+DELTA_BR = {
+    "clique": lambda s: s - 1,  # bridge node is adjacent to every other node
+    "cycle": lambda s: 2,  # bridge node has two ring neighbours
+    "star": lambda s: 1,  # bridge attaches at a leaf (one spoke)
+}
+DEFAULT_BRIDGES = 3  # b: bridge edges per planted copy (cut per copy)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -221,6 +235,78 @@ def select_bfs_nodes(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def plant_patterns_fresh(
+    G_original: Data,
+    pattern_type: str,
+    size: int,
+    n_reps: int,
+    bridges: int,
+    seed: int = 42,
+) -> Tuple[Data, List]:
+    """Low-conductance planting on **fresh** vertices (the paper's planting model).
+
+    For each of *n_reps* copies we append *size* brand-new vertices, wire them
+    with the pattern's internal edges, and attach the copy to the host with
+    exactly *bridges* (=b) edges, each from a distinct non-hub gang node (so the
+    star attaches at a leaf ⇒ δ_br=1) to a globally distinct host node.  This
+    realises the simple-boundary, low-conductance regime ϕ=b/s of the note, in
+    which the closed forms m1=ϕ, σ²=2ϕ−ϕ² hold and only γ sees the motif type.
+
+    Crucially the boundary (cut, boundary-degree profile) is *constructed* and
+    therefore identical across motif types for a given (size, b) — so m1 and σ²
+    come out type-independent regardless of which fresh nodes are used.
+    """
+    rng = np.random.default_rng(seed)
+    N0 = G_original.num_nodes
+    edge_gen = EDGE_GENERATORS[pattern_type]
+
+    ei = G_original.edge_index
+    edge_set = set(zip(ei[0].tolist(), ei[1].tolist()))
+
+    b = min(bridges, size - 1)
+    # global pool of distinct host endpoints (no two copies share a host node)
+    host_endpoints = rng.choice(N0, size=n_reps * b, replace=False)
+
+    patterns = []
+    next_id = N0
+    for rep_idx in range(n_reps):
+        nodes = np.arange(next_id, next_id + size)
+        next_id += size
+
+        # internal motif edges (both directions for undirected)
+        for u, v in edge_gen(nodes):
+            edge_set.add((u, v))
+            edge_set.add((v, u))
+
+        # b bridges: distinct NON-hub gang nodes (index ≥ 1) → distinct host nodes
+        gpos = rng.choice(np.arange(1, size), size=b, replace=False)
+        for k in range(b):
+            u, v = int(nodes[gpos[k]]), int(host_endpoints[rep_idx * b + k])
+            edge_set.add((u, v))
+            edge_set.add((v, u))
+
+        patterns.append(
+            create_pattern(
+                pattern_id=f"{pattern_type}_{rep_idx}",
+                nodes=nodes,
+                pattern_type=pattern_type,
+                label="alert",
+            )
+        )
+
+    N_new = next_id
+    all_src, all_dst = zip(*sorted(edge_set)) if edge_set else ([], [])
+    new_edge_index = torch.tensor([list(all_src), list(all_dst)], dtype=torch.long)
+    G_new = Data(
+        x=torch.eye(N_new, dtype=torch.float32),
+        edge_index=new_edge_index,
+        num_nodes=N_new,
+    )
+    G_new.edge_weight = torch.ones(G_new.edge_index.size(1), dtype=torch.float32)
+    G_new = _ensure_graph_params(G_new)
+    return G_new, patterns
+
+
 def plant_patterns_in_graph(
     G_original: Data,
     pattern_type: str,
@@ -228,20 +314,24 @@ def plant_patterns_in_graph(
     n_reps: int,
     strategy: str = "random",
     seed: int = 42,
+    bridges: int = DEFAULT_BRIDGES,
 ) -> Tuple[Data, List]:
     """Plant *n_reps* copies of *pattern_type* into a copy of the graph.
 
-    Steps per repetition
-    --------------------
-    1. Select *size* nodes (random or BFS).
-    2. Remove all existing edges among those nodes.
-    3. Add the pattern-specific edges (undirected).
+    strategy="fresh"  → low-conductance planting on brand-new vertices (paper
+                        model; required for the moment/theory comparison).
+    strategy="random"/"bfs" → legacy high-conductance planting on existing nodes.
 
     Returns
     -------
     G_new : Data  — modified graph with patterns planted
     patterns : list[Pattern]  — Pattern objects for each planted instance
     """
+    if strategy == "fresh":
+        return plant_patterns_fresh(
+            G_original, pattern_type, size, n_reps, bridges, seed=seed
+        )
+
     rng = np.random.default_rng(seed)
     N = G_original.num_nodes
 
@@ -347,6 +437,58 @@ def motif_energy(Uk: np.ndarray, node_sets: List[Pattern], N: int) -> np.ndarray
     per_instance = np.array(energies)  # (n, K)
     mean_energy = per_instance.mean(axis=0)  # (K,)
     return mean_energy, per_instance
+
+
+# ── Energy moments: mean / variance / skewness (measured vs theory) ─────────────
+def _laplacian_from_edge_index(edge_index: torch.Tensor, N: int) -> sp.csr_matrix:
+    """Combinatorial Laplacian L = D − A as a scipy sparse matrix (simple graph)."""
+    src = edge_index[0].cpu().numpy()
+    dst = edge_index[1].cpu().numpy()
+    A = sp.csr_matrix((np.ones(len(src)), (src, dst)), shape=(N, N))
+    A = A.minimum(1)  # collapse any duplicate directed entries to a simple edge
+    deg = np.asarray(A.sum(axis=1)).ravel()
+    return sp.diags(deg) - A
+
+
+def measured_moments(
+    edge_index: torch.Tensor, N: int, support: np.ndarray
+) -> Dict[str, float]:
+    """Exact moments of the energy measure ν of v = 1_S/√|S| (note Defs. 2–3).
+
+    m_t = vᵀ Lᵗ v are computed directly from the Laplacian (no eigendecomposition,
+    note eq. 5).  Returns mean m1, variance σ², (excess) skewness γ, plus the
+    measured conductance ϕ = cut(S)/s.
+    """
+    L = _laplacian_from_edge_index(edge_index, N)
+    s = len(support)
+    v = np.zeros(N, dtype=np.float64)
+    v[support] = 1.0 / np.sqrt(s)
+    Lv = L @ v
+    L2v = L @ Lv
+    m1 = float(v @ Lv)  # = cut(S)/s = ϕ  (Prop. 1, an identity)
+    m2 = float(Lv @ Lv)  # vᵀL²v = ‖Lv‖²  (L symmetric)
+    m3 = float(Lv @ L2v)  # vᵀL³v = (Lv)ᵀ(L²v)
+    sigma2 = m2 - m1 * m1
+    mu3 = m3 - 3 * m1 * m2 + 2 * m1**3
+    gamma = mu3 / sigma2**1.5 if sigma2 > 1e-15 else float("nan")
+    return {"phi": m1, "m1": m1, "m2": m2, "sigma2": sigma2, "gamma": gamma}
+
+
+def theoretical_moments(phi: float, motif_type: str, size: int) -> Dict[str, float]:
+    """Closed-form predictions of the note for the simple-boundary regime:
+
+        m1 = ϕ                         (Prop. 1 — boundary only, type/r independent)
+        σ² = 2ϕ − ϕ²                   (Cor. 1)
+        γ  = (ϕ δ_br + 4ϕ − 6ϕ² + 2ϕ³) / (2ϕ − ϕ²)^{3/2}   (Prop. 2, eq. 10)
+
+    Only γ carries the motif type, through δ_br ∈ {s-1, 2, 1} for clique/cycle/star.
+    """
+    delta_br = DELTA_BR[motif_type](size)
+    m1 = phi
+    sigma2 = 2 * phi - phi**2
+    num = phi * delta_br + 4 * phi - 6 * phi**2 + 2 * phi**3
+    gamma = num / sigma2**1.5 if sigma2 > 1e-15 else float("nan")
+    return {"m1": m1, "sigma2": sigma2, "gamma": gamma, "delta_br": delta_br}
 
 
 def random_baseline_energy(
@@ -479,6 +621,79 @@ def plot_energy_by_size(
     LOGGER.info(f"  Saved → {path}")
 
 
+def plot_energy_by_size_all_types(
+    results: Dict,
+    n_reps: int,
+    save_dir: str,
+    smooth_window: int = 15,
+) -> None:
+    """
+    Same layout as ``plot_energy_by_size`` (one subplot per motif size) but with
+    **all motif types overlaid** in every panel instead of a single type.  Each
+    panel shows the smoothed mean energy ± std for clique/cycle/star against the
+    shared random baseline, with each type's k50/k90 marked.
+    """
+    sizes = MOTIF_SIZES
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(
+        f"Motif energy across eigenvectors  –  ALL TYPES  "
+        f"({n_reps} rep{'s' if n_reps > 1 else ''})",
+        fontsize=14,
+    )
+
+    for ax, size in zip(axes.flat, sizes):
+        present = [m for m in MOTIF_TYPES if (m, size, n_reps) in results]
+        if not present:
+            ax.set_title(f"size={size}  [no data]")
+            ax.axis("off")
+            continue
+
+        title_bits = []
+        for mtype in present:
+            res = results[(mtype, size, n_reps)]
+            energy = res["mean_energy"]
+            K = len(energy)
+            x = np.arange(K)
+            e_sm = _smoothed(energy, smooth_window)
+            std_e = res.get("std_energy")
+            if std_e is not None:
+                s_sm = _smoothed(std_e, smooth_window)
+                ax.fill_between(
+                    x, np.maximum(0, e_sm - s_sm), e_sm + s_sm,
+                    alpha=0.15, color=MOTIF_COLORS[mtype],
+                )
+            cum = cumulative_energy(energy)
+            k50 = k_threshold(cum, 0.50)
+            k90 = k_threshold(cum, 0.90)
+            ax.plot(
+                x, e_sm, color=MOTIF_COLORS[mtype], lw=1.6,
+                label=f"{mtype} (k50={k50}, k90={k90})",
+            )
+            ax.axvline(k50, color=MOTIF_COLORS[mtype], ls=":", lw=1.0, alpha=0.6)
+            ax.axvline(k90, color=MOTIF_COLORS[mtype], ls="--", lw=1.0, alpha=0.6)
+            title_bits.append(mtype)
+
+        # shared random baseline (same node-set size → essentially type-independent)
+        ref = results[(present[0], size, n_reps)]
+        b_sm = _smoothed(ref["baseline"], smooth_window)
+        ax.plot(np.arange(len(b_sm)), b_sm, color="grey", lw=1.2, ls="--",
+                label="random baseline")
+
+        ax.set_title(
+            f"size={size}  (planted: {ref['n_planted']})", fontsize=10
+        )
+        ax.set_xlabel("Eigenvector index  k  (sorted by eigenvalue)")
+        ax.set_ylabel("Energy  (u_k^T v)²")
+        ax.legend(fontsize=7, loc="upper right")
+        ax.grid(alpha=0.25)
+
+    plt.tight_layout()
+    path = os.path.join(save_dir, f"energy_dist_all_types_reps{n_reps}.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    LOGGER.info(f"  Saved → {path}")
+
+
 def plot_energy_compare_types(
     results: Dict,
     size: int,
@@ -496,6 +711,7 @@ def plot_energy_compare_types(
         fontsize=13,
     )
 
+    moment_lines = []  # collected per-type mean/variance/skewness for the text box
     for mtype in MOTIF_TYPES:
         key = (mtype, size, n_reps)
         if key not in results:
@@ -507,7 +723,20 @@ def plot_energy_compare_types(
         cum = cumulative_energy(energy)
         k50 = k_threshold(cum, 0.50)
         k90 = k_threshold(cum, 0.90)
-        lbl = f"{mtype}  (k50={k50}, k90={k90})"
+        # Energy-distribution moments (mean m1, variance σ², skewness γ) of ν
+        m1 = res.get("m1")
+        sig2 = res.get("sigma2")
+        gam = res.get("gamma")
+        if m1 is not None:
+            lbl = (
+                f"{mtype}  (m1={m1:.3g}, σ²={sig2:.3g}, γ={gam:.1f}; "
+                f"k50={k50}, k90={k90})"
+            )
+            moment_lines.append(
+                f"{mtype:<6} m1={m1:.4f}  σ²={sig2:.4f}  γ={gam:.2f}"
+            )
+        else:
+            lbl = f"{mtype}  (k50={k50}, k90={k90})"
         std_e = res.get("std_energy")
         if std_e is not None:
             s_sm = _smoothed(std_e, smooth_window)
@@ -545,6 +774,32 @@ def plot_energy_compare_types(
     ax.set_ylabel("Energy  (u_k^T v)²")
     ax.legend(fontsize=9)
     ax.grid(alpha=0.25)
+
+    # ── mean / variance / skewness box (theory: m1=ϕ, σ²=2ϕ−ϕ² are type-indep.) ──
+    if moment_lines:
+        any_key = next(((m, size, n_reps) for m in MOTIF_TYPES
+                        if (m, size, n_reps) in results), None)
+        ref = results[any_key]
+        phi = ref.get("phi")
+        head = "Energy moments (measured)"
+        if phi is not None:
+            head += (
+                f"\ntheory: m1=ϕ={ref['m1_th']:.4f}, σ²=2ϕ−ϕ²={ref['sigma2_th']:.4f}"
+                "  (type-independent)"
+            )
+        box = head + "\n" + "\n".join(moment_lines)
+        ax.text(
+            0.985,
+            0.97,
+            box,
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+            family="monospace",
+            bbox=dict(boxstyle="round", fc="white", ec="0.6", alpha=0.85),
+        )
+
     plt.tight_layout()
     path = os.path.join(save_dir, f"energy_compare_size{size}_reps{n_reps}.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
@@ -874,14 +1129,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--n_nodes",
         type=int,
-        default=6000,
-        help="Number of nodes in the BA graph (default: 6000)",
+        default=5000,
+        help="Number of nodes in the BA graph (default: 5000)",
     )
     p.add_argument(
         "--ba_m",
         type=int,
-        default=1,
-        help="BA model m: edges to attach per new node (default: 1)",
+        default=2,
+        help="BA model m: edges to attach per new node (default: 2)",
     )
     p.add_argument("--seed", type=int, default=42, help="Global random seed")
     p.add_argument(
@@ -899,7 +1154,128 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="Independent BA graph trials to average over (default: 10)",
     )
+    p.add_argument(
+        "--planting",
+        choices=["fresh", "random", "bfs"],
+        default="random",
+        help="fresh = low-conductance planting on new nodes (paper model; "
+        "needed for the moment/theory comparison). default: random",
+    )
+    p.add_argument(
+        "--bridges",
+        type=int,
+        default=DEFAULT_BRIDGES,
+        help=f"b: bridge edges per planted copy (cut/copy). default: {DEFAULT_BRIDGES}",
+    )
     return p.parse_args()
+
+
+def write_moment_csvs(moment_rows: List[Dict], save_dir: str) -> None:
+    """Write per-trial and trial-averaged energy-moment CSVs (measured vs theory)
+    and log a compact comparison table.
+    """
+    if not moment_rows:
+        LOGGER.warning("  [moments] no rows collected; skipping CSV.")
+        return
+
+    # 1. Raw per-(trial, config) rows
+    raw_path = os.path.join(save_dir, "energy_moments.csv")
+    fields = list(moment_rows[0].keys())
+    with open(raw_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in moment_rows:
+            w.writerow(r)
+    LOGGER.info(f"  Saved → {raw_path}  ({len(moment_rows)} rows)")
+
+    # 2. Trial-averaged summary per (motif_type, size, reps)
+    groups: Dict[tuple, List[Dict]] = defaultdict(list)
+    for r in moment_rows:
+        groups[(r["motif_type"], r["size"], r["reps"])].append(r)
+
+    summary_fields = [
+        "motif_type",
+        "size",
+        "reps",
+        "bridges",
+        "delta_br",
+        "n_trials",
+        "phi_measured",
+        "phi_theory",
+        "m1_measured",
+        "m1_theory",
+        "m1_abs_err",
+        "sigma2_measured",
+        "sigma2_theory",
+        "sigma2_abs_err",
+        "gamma_measured",
+        "gamma_std",
+        "gamma_theory",
+        "gamma_abs_err",
+    ]
+    summary_rows = []
+    for (mtype, size, reps), rows in sorted(
+        groups.items(), key=lambda kv: (MOTIF_TYPES.index(kv[0][0]), kv[0][1], kv[0][2])
+    ):
+
+        def mean(k):
+            return float(np.mean([x[k] for x in rows]))
+
+        srow = {
+            "motif_type": mtype,
+            "size": size,
+            "reps": reps,
+            "bridges": rows[0]["bridges"],
+            "delta_br": rows[0]["delta_br"],
+            "n_trials": len(rows),
+            "phi_measured": mean("phi_measured"),
+            "phi_theory": mean("phi_theory"),
+            "m1_measured": mean("m1_measured"),
+            "m1_theory": mean("m1_theory"),
+            "m1_abs_err": abs(mean("m1_measured") - mean("m1_theory")),
+            "sigma2_measured": mean("sigma2_measured"),
+            "sigma2_theory": mean("sigma2_theory"),
+            "sigma2_abs_err": abs(mean("sigma2_measured") - mean("sigma2_theory")),
+            "gamma_measured": mean("gamma_measured"),
+            "gamma_std": float(np.std([x["gamma_measured"] for x in rows])),
+            "gamma_theory": mean("gamma_theory"),
+            "gamma_abs_err": abs(mean("gamma_measured") - mean("gamma_theory")),
+        }
+        summary_rows.append(srow)
+
+    sum_path = os.path.join(save_dir, "energy_moments_summary.csv")
+    with open(sum_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=summary_fields)
+        w.writeheader()
+        for r in summary_rows:
+            w.writerow(
+                {
+                    k: (f"{r[k]:.6f}" if isinstance(r[k], float) else r[k])
+                    for k in summary_fields
+                }
+            )
+    LOGGER.info(f"  Saved → {sum_path}  ({len(summary_rows)} configs)")
+
+    # 3. Log a compact comparison table (measured | theory)
+    LOGGER.info("\n" + "=" * 92)
+    LOGGER.info(
+        "  ENERGY MOMENTS: measured (vᵀLᵗv) vs theory  — mean/variance type-indep., skew type-stamped"
+    )
+    LOGGER.info("-" * 92)
+    LOGGER.info(
+        f"{'type':<7}{'s':>4}{'r':>4}{'ϕ':>8} | "
+        f"{'m1 meas':>9}{'m1 th':>9} | {'σ² meas':>9}{'σ² th':>9} | "
+        f"{'γ meas':>9}{'γ th':>9}{'δbr':>5}"
+    )
+    LOGGER.info("-" * 92)
+    for r in summary_rows:
+        LOGGER.info(
+            f"{r['motif_type']:<7}{r['size']:>4}{r['reps']:>4}{r['phi_measured']:>8.3f} | "
+            f"{r['m1_measured']:>9.4f}{r['m1_theory']:>9.4f} | "
+            f"{r['sigma2_measured']:>9.4f}{r['sigma2_theory']:>9.4f} | "
+            f"{r['gamma_measured']:>9.2f}{r['gamma_theory']:>9.2f}{r['delta_br']:>5}"
+        )
+    LOGGER.info("=" * 92)
 
 
 def main() -> None:
@@ -925,6 +1301,10 @@ def main() -> None:
     trial_energies: Dict[tuple, List[np.ndarray]] = {}
     trial_baselines: Dict[tuple, List[np.ndarray]] = {}
     trial_n_planted: Dict[tuple, List[int]] = {}
+    trial_moments: Dict[tuple, List[Dict]] = {}  # key → list of measured-moment dicts
+
+    # Per-(trial, config) energy-moment rows: measured vs theory (→ CSV)
+    moment_rows: List[Dict] = []
 
     # ── Trial loop ───────────────────────────────────────────────────────────
     for trial in range(args.n_trials):
@@ -947,11 +1327,42 @@ def main() -> None:
 
             # Plant motifs (vary seed by config index too)
             G_planted, motif_node_sets = plant_patterns_in_graph(
-                G_base, mtype, size, n_reps, seed=trial_seed + idx
+                G_base,
+                mtype,
+                size,
+                n_reps,
+                strategy=args.planting,
+                bridges=args.bridges,
+                seed=trial_seed + idx,
             )
             n_planted = len(motif_node_sets)
             if n_planted == 0:
                 continue
+
+            Np = G_planted.num_nodes  # node count of the planted graph (grows if fresh)
+
+            # ── Energy moments: measured (vᵀLᵗv) vs closed-form theory ──────
+            support = np.concatenate([np.asarray(p.nodes) for p in motif_node_sets])
+            meas = measured_moments(G_planted.edge_index, Np, support)
+            theo = theoretical_moments(meas["phi"], mtype, size)
+            moment_rows.append(
+                {
+                    "trial": trial,
+                    "motif_type": mtype,
+                    "size": size,
+                    "reps": n_reps,
+                    "bridges": args.bridges,
+                    "delta_br": theo["delta_br"],
+                    "phi_measured": meas["phi"],
+                    "phi_theory": args.bridges / size,
+                    "m1_measured": meas["m1"],
+                    "m1_theory": theo["m1"],
+                    "sigma2_measured": meas["sigma2"],
+                    "sigma2_theory": theo["sigma2"],
+                    "gamma_measured": meas["gamma"],
+                    "gamma_theory": theo["gamma"],
+                }
+            )
 
             # Spectral decomposition
             lk, Uk = compute_spectral_decomp(
@@ -959,15 +1370,16 @@ def main() -> None:
             )
 
             # Energy
-            mean_e, _ = motif_energy(Uk, motif_node_sets, N)
+            mean_e, _ = motif_energy(Uk, motif_node_sets, Np)
             baseline = random_baseline_energy(
-                Uk, [size] * n_planted, N, n_trials=20, seed=trial_seed
+                Uk, [size] * n_planted, Np, n_trials=20, seed=trial_seed
             )
 
             key = (mtype, size, n_reps)
             trial_energies.setdefault(key, []).append(mean_e)
             trial_baselines.setdefault(key, []).append(baseline)
             trial_n_planted.setdefault(key, []).append(n_planted)
+            trial_moments.setdefault(key, []).append({**meas, **{f"{k}_th": v for k, v in theo.items()}})
 
         LOGGER.info(f"  Trial {trial + 1} done.")
 
@@ -1000,6 +1412,24 @@ def main() -> None:
             "k90": k90,
         }
 
+        # Trial-averaged energy moments (measured + theory) for annotations
+        mlist = trial_moments.get(key, [])
+        if mlist:
+            results[key].update(
+                {
+                    "m1": float(np.mean([m["m1"] for m in mlist])),
+                    "sigma2": float(np.mean([m["sigma2"] for m in mlist])),
+                    "gamma": float(np.mean([m["gamma"] for m in mlist])),
+                    "m1_th": float(np.mean([m["m1_th"] for m in mlist])),
+                    "sigma2_th": float(np.mean([m["sigma2_th"] for m in mlist])),
+                    "gamma_th": float(np.mean([m["gamma_th"] for m in mlist])),
+                    "phi": float(np.mean([m["phi"] for m in mlist])),
+                }
+            )
+
+    # ── Energy moments → CSV (measured vs theory) ─────────────────────────────
+    write_moment_csvs(moment_rows, SAVE_DIR)
+
     # Re-read N from last trial graph (all trials have same n_nodes)
     N = args.n_nodes
 
@@ -1011,6 +1441,10 @@ def main() -> None:
     for mtype in MOTIF_TYPES:
         for n_reps in REPETITIONS:
             plot_energy_by_size(results, mtype, n_reps, SAVE_DIR, smooth_window=sw)
+
+    # A2. Same layout but all motif types overlaid (one figure per rep-count)
+    for n_reps in REPETITIONS:
+        plot_energy_by_size_all_types(results, n_reps, SAVE_DIR, smooth_window=sw)
 
     # B. Cross-motif comparison per size
     for size in MOTIF_SIZES:
