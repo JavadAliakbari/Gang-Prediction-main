@@ -62,7 +62,11 @@ import pandas as pd
 import torch
 from scipy.sparse import triu
 
-from src.run_elliptic_gang_conductance import build_graph, connected_components_sets
+from src.run_elliptic_gang_conductance import (
+    build_graph,
+    connected_components_sets,
+    random_connected_set,
+)
 from src.pattern_models import create_pattern
 from src.loukas_sgc_detection import (
     build_joint_subspace,
@@ -70,6 +74,11 @@ from src.loukas_sgc_detection import (
     evaluate_loukas_patterns,
     graph_operators,
     loukas_coarsen_pytorch,
+    _adjacency_lists,
+    _degrees,
+    _laplacian,
+    _local_variation_cost,
+    _l_orthonormalize,
 )
 from src.sgc_detection import (
     apply_feature_channel,
@@ -159,6 +168,65 @@ def split_train_test(patterns, train_ratio, rng):
 
 
 # ---------------------------------------------------------------------------
+# Oracle epsilon: the RSA cost of the *true* gang partition under a subspace
+# ---------------------------------------------------------------------------
+
+
+def prepare_subspace(adjacency, basis):
+    """Pre-compute the (expensive) L-orthonormal basis + adjacency lookups once.
+
+    Returned bundle is reused to score many node sets under the same subspace,
+    so the costly ``L``-orthonormalization (QR of ``basis`` under ``L``) is paid
+    a single time per encoder rather than once per set family.
+    """
+
+    A = _l_orthonormalize(basis, _laplacian(adjacency))
+    degree = _degrees(adjacency)
+    neighbors, weight = _adjacency_lists(adjacency)
+    eps = torch.finfo(A.dtype).eps
+    return A, degree, neighbors, weight, eps
+
+
+def set_costs(prep, sets):
+    """Per-set local-variation cost ``c(C)`` and cumulative ``epsilon = sqrt(sum)``.
+
+    ``c(C) = trace(R.T L_C R)/(|C|-1)``, ``R = (I - 1 p.T)(L-orthonormal basis)_C``
+    -- the *same* cost the coarsener charges to contract ``C`` into one supernode.
+    Small ``c(C)`` means the subspace is nearly constant on ``C`` (it lives in the
+    retained low-frequency subspace); the squared costs add across disjoint sets.
+    """
+
+    A, degree, neighbors, weight, eps = prep
+    per = np.asarray(
+        [
+            _local_variation_cost(
+                list(int(v) for v in C), A, degree, neighbors, weight, eps
+            )
+            for C in sets
+        ]
+    )
+    epsilon = float(np.sqrt(per.sum())) if per.size else 0.0
+    return epsilon, per
+
+
+def random_connected_baseline(A_scipy, sizes, rng, samples_per_size=1):
+    """Random *connected* node sets matched to ``sizes`` (the null for gangs).
+
+    Grows each set by randomized BFS (``random_connected_set``) so the baseline
+    is a generic connected motif of the same size -- the right control: if a
+    gang's cost is no lower than a random connected set of equal size, the
+    subspace is not localizing gangs, it just likes small/low-degree sets.
+    """
+
+    out = []
+    for sz in sizes:
+        for _ in range(samples_per_size):
+            S = random_connected_set(A_scipy, int(sz), rng)
+            out.append(np.asarray(S, dtype=np.int64))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Encoder construction + coarsening
 # ---------------------------------------------------------------------------
 
@@ -175,6 +243,7 @@ def coarsen_and_count(name, basis, *, adjacency, node_labels, eval_patterns, arg
         method=args.coarsening_method,
         max_contraction_size=args.max_contraction_size,
         max_cluster_size=args.linkage_max_size,
+        epsilon_ramp_levels=(args.max_levels if args.epsilon_ramp else None),
     )
     _, by_label = evaluate_loukas_patterns(
         eval_patterns,
@@ -208,7 +277,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data-dir", default="data/elliptic_actors", type=Path)
     ap.add_argument("--day-start", type=int, default=24)
-    ap.add_argument("--day-end", type=int, default=26)
+    ap.add_argument("--day-end", type=int, default=27)
     ap.add_argument("--min-gang-size", type=int, default=2)
     ap.add_argument(
         "--weighted",
@@ -216,7 +285,7 @@ def main() -> None:
         default=False,
         help="use transaction multiplicity as edge weight (else 0/1)",
     )
-    ap.add_argument("--train-ratio", type=float, default=0.5)
+    ap.add_argument("--train-ratio", type=float, default=0.15)
     ap.add_argument(
         "--max-normal-patterns",
         type=int,
@@ -241,7 +310,7 @@ def main() -> None:
     ap.add_argument(
         "--epsilon",
         type=float,
-        default=5.0,
+        default=15.0,
         help="OPTION 2 -- label-free RSA cost budget (prod_l (1+sigma_l) - 1). "
         "A merge is refused once it would push the cumulative spectral error past "
         "this bound, so cheap gang-internal edges contract while expensive "
@@ -251,14 +320,29 @@ def main() -> None:
     ap.add_argument(
         "--max-levels",
         type=int,
-        default=20,
+        default=1,
         help="option 2 collapses gangs hierarchically over many levels "
         "(a size-k gang needs ~log2(k) edge-matching levels)",
     )
     ap.add_argument(
+        "--epsilon-ramp",
+        action="store_true",
+        default=True,
+        help="ration the epsilon budget gradually: the cumulative budget at level "
+        "l is capped at epsilon*(l+1)/max_levels, so no single (early) level can "
+        "consume the whole budget -- the coarsening opens up one chunk per level",
+    )
+    ap.add_argument(
+        "--oracle-baseline-samples",
+        type=int,
+        default=3,
+        help="random-connected sets sampled per gang size for the oracle-epsilon "
+        "null baseline (the control the gang cost is judged against)",
+    )
+    ap.add_argument(
         "--coarsening-method",
         choices=["edges", "neighborhood", "capped", "star", "kmeans", "linkage"],
-        default="edges",
+        default="linkage",
         help="local-variation candidate family. 'edges' (default, option 2) is "
         "canonical Loukas Algorithm 2: one cheapest-first matching per level, so "
         "per-level cap = 2 and gangs collapse multiplicatively across levels under "
@@ -276,7 +360,7 @@ def main() -> None:
     ap.add_argument(
         "--linkage-max-size",
         type=int,
-        default=2,
+        default=4,
         help="super-node size cap for --coarsening-method linkage (curbs single-"
         "linkage chaining so a collapsed gang stays pure; 0 = uncapped)",
     )
@@ -391,6 +475,31 @@ def main() -> None:
         for name, basis in encoders
     ]
 
+    # ---- subspace capability: oracle epsilon of gangs vs random-connected ----
+    print(
+        "\n  Measuring subspace capability (oracle epsilon: true gangs vs "
+        f"{args.oracle_baseline_samples}x random-connected sets of matched size) …"
+    )
+    gang_sizes = [len(C) for C in gang_sets]
+    rand_sets = random_connected_baseline(
+        A_unw, gang_sizes, rng, samples_per_size=args.oracle_baseline_samples
+    )
+    for r, (name, basis) in zip(rows, encoders):
+        prep = prepare_subspace(adjacency, basis)
+        eps_gang, per_gang = set_costs(prep, gang_sets)
+        eps_rand, per_rand = set_costs(prep, rand_sets)
+        # ratio of typical per-set cost: <1 => subspace localizes gangs vs null
+        med_gang = float(np.median(per_gang)) if per_gang.size else 0.0
+        med_rand = float(np.median(per_rand)) if per_rand.size else 0.0
+        r["oracle_epsilon"] = eps_gang
+        r["oracle_epsilon_random"] = eps_rand
+        r["oracle_cost_per_gang_median"] = med_gang
+        r["oracle_cost_per_random_median"] = med_rand
+        r["oracle_gang_vs_random_ratio"] = (
+            med_gang / med_rand if med_rand > 0 else float("nan")
+        )
+        r["oracle_cost_top5_gangs"] = [float(c) for c in np.sort(per_gang)[::-1][:5]]
+
     # ---- report -----------------------------------------------------------
     out_json = args.out / f"gang_detection_d{args.day_start}-{args.day_end}.json"
     out_json.write_text(
@@ -444,6 +553,37 @@ def main() -> None:
         "spent (the label-free stop). 'normal_FP' = licit components that also "
         "collapse (lower is better). Precision/recall are reported for evaluation "
         "only; the coarsening decision uses epsilon, never the gang labels."
+    )
+
+    # ---- subspace capability table ---------------------------------------
+    print("\n" + "-" * 86)
+    print("SUBSPACE CAPABILITY — oracle epsilon: TRUE gangs vs random-connected null")
+    print("(gang cost << random cost  =>  the subspace genuinely localizes gangs,")
+    print(" not just small/low-degree sets; ratio < 1 is the signal)")
+    print("-" * 86)
+    cap_hdr = (
+        f"{'encoder':<12} {'eps*_gang':>10} {'eps*_rand':>10} "
+        f"{'med_gang':>11} {'med_rand':>11} {'gang/rand':>10} "
+        f"{'top-3 hardest gangs':>22}"
+    )
+    print(cap_hdr)
+    print("-" * len(cap_hdr))
+    for r in rows:
+        top3 = ", ".join(f"{c:.2g}" for c in r["oracle_cost_top5_gangs"][:3])
+        print(
+            f"{r['encoder']:<12} {r['oracle_epsilon']:>10.3f} "
+            f"{r['oracle_epsilon_random']:>10.3f} "
+            f"{r['oracle_cost_per_gang_median']:>11.3g} "
+            f"{r['oracle_cost_per_random_median']:>11.3g} "
+            f"{r['oracle_gang_vs_random_ratio']:>10.3f} {top3:>22}"
+        )
+    print(
+        "\nNote: eps* uses the known gangs/null so it is a *diagnostic of the "
+        "subspace*, not a detector. 'gang/rand' < 1 means a gang is cheaper to "
+        "collapse than a random connected set of the same size -- i.e. the subspace "
+        "puts gangs in its retained low-frequency range. ~1 means no gang-specific "
+        "structure. Compare eps*_gang to the 'eps' actually spent above: a large "
+        "gap is wasted budget the greedy coarsener spends on non-gang regions."
     )
     print(f"\nJSON report: {out_json}")
 

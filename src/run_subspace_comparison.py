@@ -31,6 +31,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from src.utils.utils import *
 from src.experiment_utils import load_and_preprocess_data
 from src.loukas_sgc_detection import (
     build_laplacian_subspace,
@@ -163,12 +164,12 @@ def _plot_comparison(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment", default="tutorial_demo12")
+    parser.add_argument("--experiment", default="tutorial_demo16")
     parser.add_argument("--train-ratio", type=float, default=0.25)
     parser.add_argument("--degree", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=0.01)
-    parser.add_argument("--subspace-width", type=int, default=70)
+    parser.add_argument("--subspace-width", type=int, default=40)
     parser.add_argument("--reduction", type=float, default=0.7)
     parser.add_argument("--epsilon", type=float, default=math.inf)
     parser.add_argument("--max-levels", type=int, default=30)
@@ -238,23 +239,23 @@ def main() -> None:
         }
 
     # ---- console comparison -------------------------------------------------
-    print("\nTarget-subspace comparison (Loukas RSA + Pattern-model detection)")
-    print(f"  experiment: {args.experiment}")
-    print(
+    LOGGER.info("\nTarget-subspace comparison (Loukas RSA + Pattern-model detection)")
+    LOGGER.info(f"  experiment: {args.experiment}")
+    LOGGER.info(
         f"  theta objective lambda_min(G): {fit.objective:.6g} "
         f"(vanilla SGC: {fit.vanilla_sgc_objective:.6g})"
     )
-    print(
+    LOGGER.info(
         f"  detection rule: recall > {args.threshold} and precision > {args.threshold}\n"
     )
 
     header = f"  {'metric':28s} {'SGC span(gX)':>16s} {'Laplacian span(U_K)':>22s}"
-    print(header)
-    print("  " + "-" * (len(header) - 2))
+    LOGGER.info(header)
+    LOGGER.info("  " + "-" * (len(header) - 2))
 
     def _row(name: str, sgc_val, lap_val, pct: bool = False) -> None:
         fmt = (lambda v: f"{v:.1%}") if pct else (lambda v: f"{v:.4g}")
-        print(f"  {name:28s} {fmt(sgc_val):>16s} {fmt(lap_val):>22s}")
+        LOGGER.info(f"  {name:28s} {fmt(sgc_val):>16s} {fmt(lap_val):>22s}")
 
     _row(
         "R=span dimension",
@@ -327,8 +328,8 @@ def main() -> None:
     json_out.parent.mkdir(parents=True, exist_ok=True)
     json_out.write_text(json.dumps(summary, indent=2) + "\n")
 
-    print(f"\nDiagnostic figure: {output}")
-    print(f"JSON summary:      {json_out}")
+    LOGGER.info(f"\nDiagnostic figure: {output}")
+    LOGGER.info(f"JSON summary:      {json_out}")
 
 
 if __name__ == "__main__":

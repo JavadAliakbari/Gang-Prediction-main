@@ -948,6 +948,7 @@ def loukas_coarsen_pytorch(
     kmeans_iters: int = 10,
     kmeans_seed: int = 0,
     max_cluster_size: int = 8,
+    epsilon_ramp_levels: int | None = None,
 ) -> LoukasCoarseningResult:
     """Loukas Algorithm 1 using the supplied ``R=span(target_basis)``.
 
@@ -1015,11 +1016,19 @@ def loukas_coarsen_pytorch(
         n_current = current_adjacency.shape[0]
         if n_current <= n_target or epsilon_current >= epsilon:
             break
-        sigma_max = (
-            math.inf
-            if math.isinf(epsilon)
-            else (1.0 + epsilon) / (1.0 + epsilon_current) - 1.0
-        )
+        if math.isinf(epsilon):
+            sigma_max = math.inf
+        else:
+            # Gradual budget: instead of offering the whole remaining epsilon to
+            # every level (which lets level 0 spend all of it), ration it as a
+            # linear ramp -- the cumulative budget at level l is capped at
+            # epsilon * (l+1)/ramp_levels, so each level may add at most one
+            # chunk.  ramp_levels=None keeps the original all-at-once behaviour.
+            if epsilon_ramp_levels:
+                budget = epsilon * min(1.0, (level + 1) / epsilon_ramp_levels)
+            else:
+                budget = epsilon
+            sigma_max = max(0.0, (1.0 + budget) / (1.0 + epsilon_current) - 1.0)
         # k-means is a one-shot global partition; connectivity splitting leaves it
         # well above n_target, so the first level clusters and later levels switch
         # to cheap edge matching to refine the leftover fragments down to target

@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import csv
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import os
 import sys
 import warnings
@@ -298,7 +299,9 @@ def plant_patterns_fresh(
     all_src, all_dst = zip(*sorted(edge_set)) if edge_set else ([], [])
     new_edge_index = torch.tensor([list(all_src), list(all_dst)], dtype=torch.long)
     G_new = Data(
-        x=torch.eye(N_new, dtype=torch.float32),
+        # x is unused by the spectral decomposition (which needs only L); use a
+        # cheap (N,1) placeholder instead of an N×N identity to save memory/time.
+        x=torch.ones((N_new, 1), dtype=torch.float32),
         edge_index=new_edge_index,
         num_nodes=N_new,
     )
@@ -482,13 +485,33 @@ def theoretical_moments(phi: float, motif_type: str, size: int) -> Dict[str, flo
         γ  = (ϕ δ_br + 4ϕ − 6ϕ² + 2ϕ³) / (2ϕ − ϕ²)^{3/2}   (Prop. 2, eq. 10)
 
     Only γ carries the motif type, through δ_br ∈ {s-1, 2, 1} for clique/cycle/star.
+
+    IMPORTANT — regime of validity.  These closed forms are derived for the
+    *low-conductance, simple-boundary* regime ϕ ≪ 1 (each gang node carries ≤ 1
+    boundary edge), i.e. the ``--planting fresh`` model.  Outside it (e.g. the
+    legacy ``--planting random``/``bfs`` plantings on existing high-degree BA
+    nodes, where ϕ can exceed 1) ``σ² = 2ϕ − ϕ²`` turns negative and is
+    meaningless.  We therefore return NaN for σ²/γ when ϕ ≥ 1 and flag the row
+    with ``regime_ok = False`` rather than emitting a negative "variance".  The
+    *measured* moments stay exact and valid in every regime.
     """
     delta_br = DELTA_BR[motif_type](size)
     m1 = phi
-    sigma2 = 2 * phi - phi**2
-    num = phi * delta_br + 4 * phi - 6 * phi**2 + 2 * phi**3
-    gamma = num / sigma2**1.5 if sigma2 > 1e-15 else float("nan")
-    return {"m1": m1, "sigma2": sigma2, "gamma": gamma, "delta_br": delta_br}
+    regime_ok = phi < 1.0
+    if regime_ok:
+        sigma2 = 2 * phi - phi**2
+        num = phi * delta_br + 4 * phi - 6 * phi**2 + 2 * phi**3
+        gamma = num / sigma2**1.5 if sigma2 > 1e-15 else float("nan")
+    else:
+        sigma2 = float("nan")
+        gamma = float("nan")
+    return {
+        "m1": m1,
+        "sigma2": sigma2,
+        "gamma": gamma,
+        "delta_br": delta_br,
+        "regime_ok": regime_ok,
+    }
 
 
 def random_baseline_energy(
@@ -1167,6 +1190,22 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_BRIDGES,
         help=f"b: bridge edges per planted copy (cut/copy). default: {DEFAULT_BRIDGES}",
     )
+    p.add_argument(
+        "--n_jobs",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        help="Parallel worker threads for the per-config eigendecompositions. "
+        "Each eigh is pinned to 1 BLAS thread and the cores are filled with "
+        "independent eighs (~2-3x). Lower this if you hit memory pressure. "
+        "default: min(8, n_cpu)",
+    )
+    p.add_argument(
+        "--moments_only",
+        action="store_true",
+        default=False,
+        help="Skip the eigendecomposition and all energy plots; only compute the "
+        "energy moments (mean/variance/skewness) and write the CSVs. Near-instant.",
+    )
     return p.parse_args()
 
 
@@ -1257,25 +1296,40 @@ def write_moment_csvs(moment_rows: List[Dict], save_dir: str) -> None:
     LOGGER.info(f"  Saved → {sum_path}  ({len(summary_rows)} configs)")
 
     # 3. Log a compact comparison table (measured | theory)
-    LOGGER.info("\n" + "=" * 92)
+    out_of_regime = any(r["phi_measured"] >= 1.0 for r in summary_rows)
+    LOGGER.info("\n" + "=" * 99)
     LOGGER.info(
         "  ENERGY MOMENTS: measured (vᵀLᵗv) vs theory  — mean/variance type-indep., skew type-stamped"
     )
-    LOGGER.info("-" * 92)
     LOGGER.info(
-        f"{'type':<7}{'s':>4}{'r':>4}{'ϕ':>8} | "
+        "  theory (σ² th, γ th) is the LOW-ϕ closed form (Cor.1/Prop.2); valid only for ϕ<1 "
+        "(use --planting fresh)"
+    )
+    LOGGER.info("-" * 99)
+    LOGGER.info(
+        f"{'type':<7}{'s':>4}{'r':>4}{'ϕ':>8}{'reg':>5} | "
         f"{'m1 meas':>9}{'m1 th':>9} | {'σ² meas':>9}{'σ² th':>9} | "
         f"{'γ meas':>9}{'γ th':>9}{'δbr':>5}"
     )
-    LOGGER.info("-" * 92)
+    LOGGER.info("-" * 99)
     for r in summary_rows:
+        ok = r["phi_measured"] < 1.0
+        s2t = f"{r['sigma2_theory']:>9.4f}" if ok else f"{'—':>9}"
+        gmt = f"{r['gamma_theory']:>9.2f}" if ok else f"{'—':>9}"
         LOGGER.info(
-            f"{r['motif_type']:<7}{r['size']:>4}{r['reps']:>4}{r['phi_measured']:>8.3f} | "
+            f"{r['motif_type']:<7}{r['size']:>4}{r['reps']:>4}{r['phi_measured']:>8.3f}"
+            f"{('ok' if ok else 'OUT'):>5} | "
             f"{r['m1_measured']:>9.4f}{r['m1_theory']:>9.4f} | "
-            f"{r['sigma2_measured']:>9.4f}{r['sigma2_theory']:>9.4f} | "
-            f"{r['gamma_measured']:>9.2f}{r['gamma_theory']:>9.2f}{r['delta_br']:>5}"
+            f"{r['sigma2_measured']:>9.4f}{s2t} | "
+            f"{r['gamma_measured']:>9.2f}{gmt}{r['delta_br']:>5}"
         )
-    LOGGER.info("=" * 92)
+    LOGGER.info("=" * 99)
+    if out_of_regime:
+        LOGGER.info(
+            "  NOTE: rows marked OUT have ϕ≥1 (high-conductance planting) — the closed-form "
+            "σ²/γ are out of regime (shown as —).\n        Measured moments stay exact; "
+            "re-run with --planting fresh for the low-ϕ theory comparison."
+        )
 
 
 def main() -> None:
@@ -1306,6 +1360,63 @@ def main() -> None:
     # Per-(trial, config) energy-moment rows: measured vs theory (→ CSV)
     moment_rows: List[Dict] = []
 
+    # ── Per-config worker (plant + moments, and energy unless --moments_only) ──
+    def _process_config(G_base, trial, trial_seed, idx, size, n_reps, mtype):
+        N = G_base.num_nodes
+        if size >= N:
+            return None
+        G_planted, motif_node_sets = plant_patterns_in_graph(
+            G_base, mtype, size, n_reps,
+            strategy=args.planting, bridges=args.bridges, seed=trial_seed + idx,
+        )
+        n_planted = len(motif_node_sets)
+        if n_planted == 0:
+            return None
+        Np = G_planted.num_nodes  # node count of the planted graph (grows if fresh)
+
+        # Energy moments: measured (vᵀLᵗv) vs closed-form theory — no eig needed.
+        support = np.concatenate([np.asarray(p.nodes) for p in motif_node_sets])
+        meas = measured_moments(G_planted.edge_index, Np, support)
+        theo = theoretical_moments(meas["phi"], mtype, size)
+        out = {
+            "key": (mtype, size, n_reps),
+            "n_planted": n_planted,
+            "meas": meas,
+            "theo": theo,
+            "row": {
+                "trial": trial, "motif_type": mtype, "size": size, "reps": n_reps,
+                "bridges": args.bridges, "delta_br": theo["delta_br"],
+                "phi_measured": meas["phi"], "phi_theory": args.bridges / size,
+                "regime_ok": theo["regime_ok"],
+                "m1_measured": meas["m1"], "m1_theory": theo["m1"],
+                "sigma2_measured": meas["sigma2"], "sigma2_theory": theo["sigma2"],
+                "gamma_measured": meas["gamma"], "gamma_theory": theo["gamma"],
+            },
+            "mean_e": None,
+            "baseline": None,
+        }
+        if not args.moments_only:
+            K_max = args.k_max if args.k_max > 0 else Np
+            _, Uk = compute_spectral_decomp(
+                G_planted, K_max=K_max, dense_threshold=Np + 10
+            )
+            out["mean_e"], _ = motif_energy(Uk, motif_node_sets, Np)
+            out["baseline"] = random_baseline_energy(
+                Uk, [size] * n_planted, Np, n_trials=20, seed=trial_seed
+            )
+        return out
+
+    n_jobs = max(1, args.n_jobs)
+    prev_threads = torch.get_num_threads()
+    if n_jobs > 1:
+        # Pin each eigendecomposition to one BLAS thread and fill the cores with
+        # independent eighs in parallel (dense eigh barely benefits from threads).
+        torch.set_num_threads(1)
+    LOGGER.info(
+        f"  Parallelism : n_jobs={n_jobs} thread(s)"
+        f"{'  |  moments_only (no eigendecomposition)' if args.moments_only else ''}"
+    )
+
     # ── Trial loop ───────────────────────────────────────────────────────────
     for trial in range(args.n_trials):
         trial_seed = args.seed + trial * 1000
@@ -1315,73 +1426,37 @@ def main() -> None:
 
         # Build a fresh BA graph for this trial
         G_base = build_ba_graph(n_nodes=args.n_nodes, m=args.ba_m, seed=trial_seed)
-        N = G_base.num_nodes
-        K_max = args.k_max if args.k_max > 0 else N
-        dense_threshold = N + 10
 
-        for idx, (size, n_reps, mtype) in enumerate(configs, 1):
-            tag = f"{mtype}_s{size}_r{n_reps}"
+        tasks = list(enumerate(configs, 1))  # (idx, (size, n_reps, mtype))
 
-            if size >= N:
+        def _run(item):
+            idx, (size, n_reps, mtype) = item
+            return _process_config(G_base, trial, trial_seed, idx, size, n_reps, mtype)
+
+        if n_jobs > 1:
+            with ThreadPoolExecutor(max_workers=n_jobs) as ex:
+                outs = list(ex.map(_run, tasks))
+        else:
+            outs = [_run(item) for item in tasks]
+
+        # Collect (single-threaded; accumulator writes are not contended)
+        for out in outs:
+            if out is None:
                 continue
-
-            # Plant motifs (vary seed by config index too)
-            G_planted, motif_node_sets = plant_patterns_in_graph(
-                G_base,
-                mtype,
-                size,
-                n_reps,
-                strategy=args.planting,
-                bridges=args.bridges,
-                seed=trial_seed + idx,
+            key = out["key"]
+            moment_rows.append(out["row"])
+            trial_n_planted.setdefault(key, []).append(out["n_planted"])
+            trial_moments.setdefault(key, []).append(
+                {**out["meas"], **{f"{k}_th": v for k, v in out["theo"].items()}}
             )
-            n_planted = len(motif_node_sets)
-            if n_planted == 0:
-                continue
-
-            Np = G_planted.num_nodes  # node count of the planted graph (grows if fresh)
-
-            # ── Energy moments: measured (vᵀLᵗv) vs closed-form theory ──────
-            support = np.concatenate([np.asarray(p.nodes) for p in motif_node_sets])
-            meas = measured_moments(G_planted.edge_index, Np, support)
-            theo = theoretical_moments(meas["phi"], mtype, size)
-            moment_rows.append(
-                {
-                    "trial": trial,
-                    "motif_type": mtype,
-                    "size": size,
-                    "reps": n_reps,
-                    "bridges": args.bridges,
-                    "delta_br": theo["delta_br"],
-                    "phi_measured": meas["phi"],
-                    "phi_theory": args.bridges / size,
-                    "m1_measured": meas["m1"],
-                    "m1_theory": theo["m1"],
-                    "sigma2_measured": meas["sigma2"],
-                    "sigma2_theory": theo["sigma2"],
-                    "gamma_measured": meas["gamma"],
-                    "gamma_theory": theo["gamma"],
-                }
-            )
-
-            # Spectral decomposition
-            lk, Uk = compute_spectral_decomp(
-                G_planted, K_max=K_max, dense_threshold=dense_threshold
-            )
-
-            # Energy
-            mean_e, _ = motif_energy(Uk, motif_node_sets, Np)
-            baseline = random_baseline_energy(
-                Uk, [size] * n_planted, Np, n_trials=20, seed=trial_seed
-            )
-
-            key = (mtype, size, n_reps)
-            trial_energies.setdefault(key, []).append(mean_e)
-            trial_baselines.setdefault(key, []).append(baseline)
-            trial_n_planted.setdefault(key, []).append(n_planted)
-            trial_moments.setdefault(key, []).append({**meas, **{f"{k}_th": v for k, v in theo.items()}})
+            if out["mean_e"] is not None:
+                trial_energies.setdefault(key, []).append(out["mean_e"])
+                trial_baselines.setdefault(key, []).append(out["baseline"])
 
         LOGGER.info(f"  Trial {trial + 1} done.")
+
+    if n_jobs > 1:
+        torch.set_num_threads(prev_threads)
 
     # ── Average across trials ─────────────────────────────────────────────────
     LOGGER.info("\n[avg] Averaging energy curves across trials …")
@@ -1429,6 +1504,13 @@ def main() -> None:
 
     # ── Energy moments → CSV (measured vs theory) ─────────────────────────────
     write_moment_csvs(moment_rows, SAVE_DIR)
+
+    if args.moments_only:
+        LOGGER.info(
+            "\n[moments_only] skipped eigendecomposition and energy plots. "
+            f"Moments CSVs are under {SAVE_DIR}"
+        )
+        return
 
     # Re-read N from last trial graph (all trials have same n_nodes)
     N = args.n_nodes
