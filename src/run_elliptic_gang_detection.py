@@ -277,7 +277,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data-dir", default="data/elliptic_actors", type=Path)
     ap.add_argument("--day-start", type=int, default=24)
-    ap.add_argument("--day-end", type=int, default=27)
+    ap.add_argument("--day-end", type=int, default=26)
     ap.add_argument("--min-gang-size", type=int, default=2)
     ap.add_argument(
         "--weighted",
@@ -285,7 +285,7 @@ def main() -> None:
         default=False,
         help="use transaction multiplicity as edge weight (else 0/1)",
     )
-    ap.add_argument("--train-ratio", type=float, default=0.15)
+    ap.add_argument("--train-ratio", type=float, default=0.5)
     ap.add_argument(
         "--max-normal-patterns",
         type=int,
@@ -310,7 +310,7 @@ def main() -> None:
     ap.add_argument(
         "--epsilon",
         type=float,
-        default=15.0,
+        default=5.0,
         help="OPTION 2 -- label-free RSA cost budget (prod_l (1+sigma_l) - 1). "
         "A merge is refused once it would push the cumulative spectral error past "
         "this bound, so cheap gang-internal edges contract while expensive "

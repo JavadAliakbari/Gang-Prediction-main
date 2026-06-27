@@ -69,6 +69,39 @@ from src.sgc_detection import (
     fit_joint_encoder,
     score_feature_patterns,
 )
+from scipy.sparse import csr_matrix
+from src.pattern_models import create_pattern
+from src.run_elliptic_gang_conductance import random_connected_set
+
+
+def sample_random_connected_negatives(
+    edge_index, num_nodes, sizes, seed, samples_per=1
+):
+    """Random *connected* node sets matched to ``sizes`` as contrastive negatives.
+
+    The contrastive discriminator is trained to retain the alert gangs *more than
+    generic connected neighborhoods of the same size* (the size-controlled null),
+    instead of against labelled normal patterns.  Each set is grown by randomized
+    BFS so it is a plausible connected motif, then wrapped as a non-alert pattern
+    so ``fit_collective_sgc(mode="contrastive_ratio")`` treats it as a negative.
+    """
+
+    ei = edge_index.detach().cpu().numpy()
+    data = np.ones(ei.shape[1], dtype=np.float64)
+    A = csr_matrix((data, (ei[0], ei[1])), shape=(num_nodes, num_nodes))
+    A = A + A.T
+    A.data[:] = 1.0  # unweighted presence
+    rng = np.random.default_rng(seed)
+    negatives = []
+    k = 0
+    for size in sizes:
+        for _ in range(samples_per):
+            S = random_connected_set(A, int(size), rng)
+            negatives.append(
+                create_pattern(f"rneg{k}", [int(v) for v in S], "random_neg", "normal")
+            )
+            k += 1
+    return negatives
 
 
 def _classifier_auc(
@@ -380,6 +413,28 @@ def main() -> None:
         "--feature-ridge", type=float, default=1e-2, help="classifier LDA ridge"
     )
     parser.add_argument(
+        "--contrastive-negatives",
+        choices=["random", "normal"],
+        default="random",
+        help="negatives for the contrastive_ratio encoder: 'random' (default) "
+        "= random connected sets of matched size (size-controlled null); "
+        "'normal' = the labelled normal training patterns",
+    )
+    parser.add_argument(
+        "--contrastive-neg-samples",
+        type=int,
+        default=5,
+        help="random connected negatives sampled per alert pattern (size-matched)",
+    )
+    parser.add_argument(
+        "--joint-contrastive-weight",
+        type=float,
+        default=0.2,
+        help="weight of the contrastive worst-case ratio term added to the joint "
+        "encoder objective (soft lambda_min(G_+)/lambda_max(G_-) over the same "
+        "random-connected negatives; 0 = pure retention+label joint encoder)",
+    )
+    parser.add_argument(
         "--label-weight",
         type=float,
         default=1.0,
@@ -426,8 +481,9 @@ def main() -> None:
         "to strict min, larger -> closer to mean)",
     )
     parser.add_argument("--reduction", type=float, default=0.7)
+    # parser.add_argument("--epsilon", type=float, default=50)
     parser.add_argument("--epsilon", type=float, default=float("inf"))
-    parser.add_argument("--max-levels", type=int, default=30)
+    parser.add_argument("--max-levels", type=int, default=10)
     parser.add_argument("--threshold", type=float, default=0.51)
     parser.add_argument(
         "--coarsening-method",
@@ -449,7 +505,7 @@ def main() -> None:
     parser.add_argument(
         "--linkage-max-size",
         type=int,
-        default=8,
+        default=4,
         help="supernode size cap for --coarsening-method linkage (curbs single-"
         "linkage chaining; 0 = uncapped). Smaller -> better fans, larger -> "
         "better overall",
@@ -563,7 +619,55 @@ def main() -> None:
     )
     feature_embed = apply_graph_filter(normalized, X, feature_fit.theta)
 
-    # --- joint encoder: learn (theta, W) on lambda_min(G(theta, W)) ---
+    # --- contrastive encoder: theta on the worst-case ratio ---
+    # max_theta lambda_min(G_+) / lambda_max(G_-) over the feature-aware Gram --
+    # the margin discriminator (numerator retains every alert, denominator
+    # suppresses every negative).  The negatives are *random connected sets* of
+    # matched size (the size-controlled null), so theta learns to retain real
+    # gangs above generic neighborhoods rather than above labelled normals.
+    alert_train_patterns = [p for p in retain if p.label == "alert"]
+    contrastive_negatives = None
+    if alert_train_patterns:
+        if args.contrastive_negatives == "random":
+            contrastive_negatives = sample_random_connected_negatives(
+                graph.edge_index,
+                int(graph.num_nodes),
+                [p.num_nodes for p in alert_train_patterns],
+                seed,
+                samples_per=args.contrastive_neg_samples,
+            )
+        else:  # "normal": labelled normal patterns
+            contrastive_negatives = [p for p in retain if p.label != "alert"]
+        LOGGER.info(
+            f"  contrastive negatives = {args.contrastive_negatives} "
+            f"({len(alert_train_patterns)} alert vs "
+            f"{len(contrastive_negatives)} negatives)"
+        )
+
+    contrastive = None
+    if alert_train_patterns:
+        contrastive_train = alert_train_patterns + contrastive_negatives
+        contrastive_fit = fit_collective_sgc(
+            normalized,
+            contrastive_train,
+            features=X,
+            mode="contrastive_ratio",
+            ridge=args.ridge,
+            retention_mode=args.retention_mode,
+            retention_temp=args.retention_temp,
+            **common,
+        )
+        contrastive_basis = build_sgc_subspace(
+            normalized, contrastive_fit.theta, X, width=total_width, seed=seed
+        )
+        contrastive_embed = apply_graph_filter(normalized, X, contrastive_fit.theta)
+        contrastive = (contrastive_basis, contrastive_embed)
+    else:
+        LOGGER.info("  contrastive_ratio encoder skipped: no alert patterns in retain")
+
+    # --- joint encoder: learn (theta, W) on lambda_min(G(theta, W)), optionally
+    # augmented with the contrastive worst-case ratio over random-connected
+    # negatives (soft lambda_min(G_+)/lambda_max(G_-) on the feature channel) ---
     joint = fit_joint_encoder(
         normalized,
         retain,
@@ -578,6 +682,10 @@ def main() -> None:
         label_patterns=clf_train,
         label_weight=args.label_weight,
         label_ridge=args.label_ridge,
+        contrastive_patterns=(
+            contrastive_negatives if args.joint_contrastive_weight > 0 else None
+        ),
+        contrastive_weight=args.joint_contrastive_weight,
         per_hop_features=args.per_hop_features,
         retention_mode=args.retention_mode,
         retention_reduce=args.retention_reduce,
@@ -602,6 +710,8 @@ def main() -> None:
         ("raw-feature", feature_basis, feature_embed),
         ("joint", joint_basis, joint_embed),
     ]
+    if contrastive is not None:
+        encoders.append(("contrastive", contrastive[0], contrastive[1]))
     rows = [
         _coarsen_and_score(
             name,
@@ -636,6 +746,8 @@ def main() -> None:
                 "joint_encoder_label_weight": joint.label_weight,
                 "joint_encoder_label_separation": joint.label_separation,
                 "joint_encoder_combined_objective": joint.combined_objective,
+                "joint_encoder_contrastive_weight": joint.contrastive_weight,
+                "joint_encoder_contrastive_ratio": joint.contrastive_ratio,
                 "joint_encoder_per_hop_features": joint.per_hop_features,
                 "retention_mode": args.retention_mode,
                 "retention_reduce": args.retention_reduce,

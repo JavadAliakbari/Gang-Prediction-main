@@ -112,6 +112,8 @@ class JointEncoderResult:
     label_separation: float | None = None
     per_hop_features: bool = False
     retention_side: str = "pattern"
+    contrastive_weight: float = 0.0
+    contrastive_ratio: float | None = None
 
 
 def normalized_adjacency(
@@ -404,6 +406,46 @@ def _retention_lambda_min(
         gram = gram + ridge * eye
     evals = torch.linalg.eigvalsh(gram)  # ascending; PSD so >= 0
     return _reduce_eigs(evals, reduce=reduce, temp=temp, positive_tol=positive_tol)
+
+
+def _soft_lambda_max(
+    signatures: torch.Tensor,
+    *,
+    mode: str = "auto",
+    ridge: float = 0.0,
+    reduce: str = "softmax",
+    temp: float = 0.1,
+) -> torch.Tensor:
+    """Largest retained eigenvalue of the (smaller-side) pattern/channel Gram.
+
+    The dual of :func:`_retention_lambda_min` used by the ``contrastive_ratio``
+    objective: ``lambda_max(G_-)`` is the *best-retained* negative direction (the
+    worst look-alike).  ``lambda_max`` is shared by the pattern and channel Grams,
+    so we evaluate it on whichever is smaller.
+
+    * ``"max"``     -- strict ``lambda_max``;
+    * ``"softmax"`` -- smooth maximum ``tau * (logsumexp(lambda / tau) - log k)``,
+      ``tau = temp * lambda_max`` (scale free, symmetric to the soft-min), which
+      smooths the eigenvalue-crossing kink so the gradient is well behaved.
+    """
+
+    r, m = signatures.shape
+    use_channel = mode == "channel" or (mode == "auto" and m > r)
+    gram = signatures @ signatures.T if use_channel else signatures.T @ signatures
+    gram = 0.5 * (gram + gram.T)
+    if ridge:
+        eye = torch.eye(gram.shape[0], dtype=gram.dtype, device=gram.device)
+        gram = gram + ridge * eye
+    evals = torch.linalg.eigvalsh(gram)  # ascending; PSD so >= 0
+    lam_max = evals[-1].clamp_min(0.0)
+    if reduce == "max":
+        return lam_max
+    if reduce == "softmax":
+        eps = torch.finfo(evals.dtype).eps
+        tau = (temp * lam_max).detach().clamp_min(eps)
+        log_k = math.log(evals.shape[0]) if evals.shape[0] > 1 else 0.0
+        return tau * (torch.logsumexp(evals / tau, dim=0) - log_k)
+    raise ValueError("reduce must be 'max' or 'softmax'")
 
 
 def feature_moment_matrices(
@@ -730,6 +772,8 @@ def fit_joint_encoder(
     label_patterns: Sequence[Any] | None = None,
     label_weight: float = 0.0,
     label_ridge: float = 1e-2,
+    contrastive_patterns: Sequence[Any] | None = None,
+    contrastive_weight: float = 0.0,
     per_hop_features: bool = False,
     retention_mode: str = "auto",
     retention_reduce: str = "min",
@@ -871,6 +915,28 @@ def fit_joint_encoder(
                 "label_patterns"
             )
 
+    # Contrastive discrimination over the *joint feature channel*: push the worst
+    # alert (soft lambda_min(G_+)) above the best negative (soft lambda_max(G_-)),
+    # with G_pm = V_pm^T g_theta(A_hat) X W W^T X^T g_theta(A_hat) V_pm.  The
+    # negatives come from `contrastive_patterns` (typically random connected sets
+    # of matched size -- a size-controlled null); the positives are the alert
+    # patterns already in `train_patterns`.  This gives the worst-case ratio the
+    # learned feature map W, the capacity a theta-only contrastive filter lacks.
+    use_contrastive = contrastive_weight > 0.0 and contrastive_patterns is not None
+    pos_cols = None
+    neg_signature_stack = None
+    if use_contrastive:
+        pos_cols = torch.tensor([label == "alert" for label in labels], device=device)
+        if not bool(pos_cols.any()):
+            raise ValueError("contrastive term needs alert patterns in train_patterns")
+        V_neg = pattern_indicator_matrix(
+            contrastive_patterns, adjacency.shape[0], dtype=dtype, device=device
+        )
+        propagated_neg = propagation_stack(adjacency, V_neg, degree)
+        neg_signature_stack = torch.stack(
+            [X.T @ signal for signal in propagated_neg], dim=0
+        )  # (K+1, f, m_neg)
+
     eps = torch.finfo(dtype).eps
     eye_m = ridge * torch.eye(m, dtype=dtype, device=device)
 
@@ -956,40 +1022,78 @@ def fit_joint_encoder(
             ).T
         return _label_separation(signatures, is_alert_label, ridge=label_ridge)
 
+    def _feature_sig(stack: torch.Tensor, theta: torch.Tensor, W: torch.Tensor):
+        """Feature-channel signatures ``(d, m)`` for a signature stack ``(K+1,f,m)``."""
+        if per_hop_features:
+            return torch.einsum("kfm,kfd->dm", stack, W)
+        return W.T @ torch.einsum("k,kfm->fm", theta, stack)
+
+    def contrastive_ratio(theta: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+        # soft lambda_min(G_+) / soft lambda_max(G_-) on the feature channel, as a
+        # log-ratio (smooth, scale-free).  >0 means the worst alert out-retains the
+        # best negative -- a worst-case margin discriminator with W capacity.
+        f_pos = _feature_sig(signature_stack[:, :, pos_cols], theta, W)  # (d, m_pos)
+        f_neg = _feature_sig(neg_signature_stack, theta, W)  # (d, m_neg)
+        num = _retention_lambda_min(
+            f_pos, mode=retention_mode, ridge=ridge, reduce="softmin",
+            temp=retention_temp,
+        )
+        den = _soft_lambda_max(
+            f_neg, mode=retention_mode, ridge=ridge, reduce="softmax",
+            temp=retention_temp,
+        )
+        return torch.log(num.clamp_min(eps)) - torch.log(den.clamp_min(eps))
+
     with torch.no_grad():
         init_lambda = float(retention_lambda_min(init_theta, init_W))
         init_separation = (
             float(label_margin(init_theta, init_W)) if use_labels else None
         )
+        init_contrastive = (
+            float(contrastive_ratio(init_theta, init_W)) if use_contrastive else None
+        )
     vanilla = init_lambda
 
-    # Scale-balance the two terms so ``label_weight`` is a clean relative weight.
-    # With ``use_labels`` False this leaves the objective as the raw lambda_min,
-    # so the default path is byte-for-byte the original encoder.
+    # Scale-balance the terms so ``label_weight`` / ``contrastive_weight`` are clean
+    # relative weights.  With both off this leaves the objective as the raw
+    # lambda_min, so the default path is byte-for-byte the original encoder.
     lambda_scale = 1.0
     separation_scale = 1.0
-    if use_labels:
+    contrastive_scale = 1.0
+    if use_labels or use_contrastive:
         lambda_scale = abs(init_lambda) if abs(init_lambda) > eps else 1.0
+    if use_labels:
         separation_scale = (
             init_separation if init_separation and init_separation > eps else 1.0
         )
+    if use_contrastive:
+        contrastive_scale = (
+            abs(init_contrastive) if init_contrastive and abs(init_contrastive) > eps
+            else 1.0
+        )
 
-    def combined_objective(
-        theta: torch.Tensor, W: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    def combined_objective(theta: torch.Tensor, W: torch.Tensor):
         lam = retention_lambda_min(theta, W)
-        if not use_labels:
-            return lam, lam, None
-        sep = label_margin(theta, W)
-        total = lam / lambda_scale + label_weight * sep / separation_scale
-        return total, lam, sep
+        sep = label_margin(theta, W) if use_labels else None
+        con = contrastive_ratio(theta, W) if use_contrastive else None
+        if not use_labels and not use_contrastive:
+            return lam, lam, None, None
+        total = lam / lambda_scale
+        if use_labels:
+            total = total + label_weight * sep / separation_scale
+        if use_contrastive:
+            total = total + contrastive_weight * con / contrastive_scale
+        return total, lam, sep, con
 
-    init_total = (
-        init_lambda
-        if not use_labels
-        else init_lambda / lambda_scale
-        + label_weight * (init_separation or 0.0) / separation_scale
-    )
+    init_total = init_lambda
+    if use_labels or use_contrastive:
+        init_total = init_lambda / lambda_scale
+        if use_labels:
+            init_total += label_weight * (init_separation or 0.0) / separation_scale
+        if use_contrastive:
+            init_total += (
+                contrastive_weight * (init_contrastive or 0.0) / contrastive_scale
+            )
 
     optimizer = torch.optim.Adam((theta_raw, W_raw), lr=learning_rate)
     best_theta = init_theta.detach().clone()
@@ -997,13 +1101,14 @@ def fit_joint_encoder(
     best_total = init_total
     best_lambda = init_lambda
     best_separation = init_separation
+    best_contrastive = init_contrastive
     history: List[float] = [init_total]
 
     for _ in range(epochs):
         optimizer.zero_grad(set_to_none=True)
         theta = _unit(theta_raw)
         W = W_raw / W_raw.norm().clamp_min(eps)
-        total, lam, sep = combined_objective(theta, W)
+        total, lam, sep, con = combined_objective(theta, W)
         if not torch.isfinite(total):
             raise FloatingPointError("non-finite objective while fitting encoder")
         (-total).backward()
@@ -1015,6 +1120,7 @@ def fit_joint_encoder(
             best_total = value
             best_lambda = float(lam.detach().cpu())
             best_separation = float(sep.detach().cpu()) if sep is not None else None
+            best_contrastive = float(con.detach().cpu()) if con is not None else None
             best_theta = theta.detach().clone()
             best_W = W.detach().clone()
 
@@ -1031,10 +1137,12 @@ def fit_joint_encoder(
         history=history,
         train_labels=labels,
         label_weight=label_weight,
-        combined_objective=best_total if use_labels else None,
+        combined_objective=best_total if (use_labels or use_contrastive) else None,
         label_separation=best_separation if use_labels else None,
         per_hop_features=per_hop_features,
         retention_side=retention_side,
+        contrastive_weight=contrastive_weight,
+        contrastive_ratio=best_contrastive if use_contrastive else None,
     )
 
 
@@ -1113,8 +1221,11 @@ def fit_collective_sgc(
         raise ValueError("epochs must be positive")
     if not 0.0 <= threshold_quantile <= 1.0:
         raise ValueError("threshold_quantile must be in [0, 1]")
-    if mode not in ("lambda_min", "fisher", "discriminative"):
-        raise ValueError("mode must be 'lambda_min', 'fisher', or 'discriminative'")
+    if mode not in ("lambda_min", "fisher", "discriminative", "contrastive_ratio"):
+        raise ValueError(
+            "mode must be 'lambda_min', 'fisher', 'discriminative', or "
+            "'contrastive_ratio'"
+        )
     if retention_mode not in ("auto", "pattern", "channel"):
         raise ValueError("retention_mode must be 'auto', 'pattern', or 'channel'")
     if retention_reduce not in ("min", "softmin", "mean"):
@@ -1192,6 +1303,69 @@ def fit_collective_sgc(
             optimizer.step()
 
             value = float(ratio.detach().cpu())
+            history.append(value)
+            if value > best_ratio:
+                best_ratio = value
+                best_theta = theta.detach().clone()
+        separation_ratio = best_ratio
+        with torch.no_grad():
+            best_objective = torch.linalg.eigvalsh(
+                gram_matrix(propagated, best_theta, features)
+            )[0].item()
+    elif mode == "contrastive_ratio":
+        # Worst-case / margin discriminator:  max_theta  lambda_min(G_+) /
+        # lambda_max(G_-),  G_pm = V_pm^T g_theta(A_hat)^2 V_pm (feature-aware when
+        # `features` is given).  Numerator retains every positive (no gang missed);
+        # denominator suppresses every negative (no look-alike passed); ratio > 1
+        # at the optimum is a hard worst-case separation with a margin.  Scale-free
+        # (both extremal eigenvalues carry the filter gain), so no beta to tune.
+        is_alert_t = torch.tensor(
+            [label == "alert" for label in labels], device=device
+        )
+        if not bool(is_alert_t.any()) or not bool((~is_alert_t).any()):
+            raise ValueError(
+                "contrastive_ratio objective needs both alert and normal "
+                "training patterns"
+            )
+        pos_cols, neg_cols = is_alert_t, ~is_alert_t
+        eps_t = torch.finfo(dtype).eps
+        raw_theta = torch.nn.Parameter(initial_theta.clone())
+        optimizer = torch.optim.Adam((raw_theta,), lr=learning_rate)
+
+        def _ratio(theta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            signatures = _signatures(theta)  # (r, m)
+            num = _retention_lambda_min(  # soft lambda_min(G_+)
+                signatures[:, pos_cols], mode=retention_mode, ridge=ridge,
+                reduce="softmin", temp=retention_temp,
+            )
+            den = _soft_lambda_max(  # soft lambda_max(G_-)
+                signatures[:, neg_cols], mode=retention_mode, ridge=ridge,
+                reduce="softmax", temp=retention_temp,
+            )
+            return num, den
+
+        with torch.no_grad():
+            n0, d0 = _ratio(initial_theta)
+            vanilla_ratio = float((n0 / d0.clamp_min(eps_t)).cpu())
+        best_theta = initial_theta.clone()
+        best_ratio = vanilla_ratio
+        history = [vanilla_ratio]
+        for _ in range(epochs):
+            optimizer.zero_grad(set_to_none=True)
+            theta = _unit(raw_theta)
+            num, den = _ratio(theta)
+            # maximize the log-ratio: smooth, scale-free, and avoids the divide
+            # blowing up when the denominator is briefly tiny.
+            objective = torch.log(num.clamp_min(eps_t)) - torch.log(
+                den.clamp_min(eps_t)
+            )
+            if not torch.isfinite(objective):
+                raise FloatingPointError(
+                    "non-finite contrastive ratio while fitting SGC"
+                )
+            (-objective).backward()
+            optimizer.step()
+            value = float((num / den.clamp_min(eps_t)).detach().cpu())
             history.append(value)
             if value > best_ratio:
                 best_ratio = value
