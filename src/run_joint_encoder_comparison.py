@@ -67,6 +67,8 @@ from src.sgc_detection import (
     fit_collective_sgc,
     fit_feature_discriminant,
     fit_joint_encoder,
+    fit_node_discriminant_map,
+    fit_residual_encoder,
     score_feature_patterns,
 )
 from scipy.sparse import csr_matrix
@@ -480,6 +482,20 @@ def main() -> None:
         help="softmin temperature as a fraction of lambda_max (smaller -> closer "
         "to strict min, larger -> closer to mean)",
     )
+    parser.add_argument(
+        "--residual-margin-weight",
+        type=float,
+        default=1.0,
+        help="weight of the node-level gang-vs-rest LDA margin in the residual "
+        "encoder objective (0 = pure lambda_min retention residual)",
+    )
+    parser.add_argument(
+        "--residual-w-penalty",
+        type=float,
+        default=1e-2,
+        help="L2 penalty on the residual feature map W (larger -> stronger pull "
+        "to W=0, i.e. fall back to the pure structural channel)",
+    )
     parser.add_argument("--reduction", type=float, default=0.7)
     # parser.add_argument("--epsilon", type=float, default=50)
     parser.add_argument("--epsilon", type=float, default=float("inf"))
@@ -704,6 +720,76 @@ def main() -> None:
         normalized, X, joint.feature_map, joint.theta, per_hop=joint.per_hop_features
     )
 
+    # --- supervised feature-map encoder: W = node-level gang discriminant ------
+    # W points at the gang-vs-surroundings direction the boundary diagnostic
+    # found (gang nodes sit ~1.25 score-std above their 1-hop neighbours on it),
+    # so g_theta(A_hat) X W preserves a coordinate that separates each gang from
+    # the nodes it would otherwise be merged into -- the feature knowledge the
+    # lambda_min/label encoders bury.  Two coarsening bases are scored: the pure
+    # feature channel (no concatenation) and the structural-augmented concat.
+    lda_basis = lda_embed = lda_concat_basis = None
+    if alert_train_patterns:
+        lda_W = fit_node_discriminant_map(
+            X, alert_train_patterns, embed_dim=args.embed_dim, ridge=args.label_ridge
+        )
+        lda_embed = apply_graph_filter(normalized, X @ lda_W, structural_fit.theta)
+        lda_basis = _orthonormal_range(lda_embed)
+        lda_concat_basis = _orthonormal_range(
+            torch.cat([structural_embed, lda_embed], dim=1)
+        )
+
+    # --- residual encoder: Z = g_theta(A_hat)(Omega + X W), no concatenation ----
+    # Single r-dim channel; Omega is the structural skip connection and X W a
+    # learned additive residual with W init 0 + L2 penalty, so the model falls
+    # back to pure structure unless the feature residual earns its place.
+    residual_basis = residual_embed = None
+    residual_info = None
+    if alert_train_patterns:
+        gang_nodes = torch.zeros(int(graph.num_nodes), dtype=torch.bool)
+        for p in alert_train_patterns:
+            idx = p.nodes
+            idx = idx if torch.is_tensor(idx) else torch.as_tensor(list(idx))
+            gang_nodes[idx.long()] = True
+        train_mask = torch.zeros(int(graph.num_nodes), dtype=torch.bool)
+        train_mask[graph.train_idx.long()] = True
+        residual = fit_residual_encoder(
+            normalized,
+            retain,
+            features=X,
+            node_gang_mask=gang_nodes,
+            node_train_mask=train_mask,
+            structural_width=args.structural_width,
+            degree=args.degree,
+            epochs=args.epochs,
+            learning_rate=args.learning_rate,
+            seed=seed,
+            ridge=args.ridge,
+            margin_weight=args.residual_margin_weight,
+            w_penalty=args.residual_w_penalty,
+            label_ridge=args.label_ridge,
+            retention_reduce=args.retention_reduce,
+            retention_temp=args.retention_temp,
+            retention_mode=args.retention_mode,
+        )
+        omega_res = torch.randn(
+            normalized.shape[0],
+            args.structural_width,
+            dtype=normalized.dtype,
+            device=normalized.device,
+            generator=torch.Generator(device=normalized.device).manual_seed(seed),
+        )
+        residual_embed = apply_graph_filter(
+            normalized, omega_res + X @ residual.feature_map, residual.theta
+        )
+        residual_basis = _orthonormal_range(residual_embed)
+        residual_info = residual
+        LOGGER.info(
+            f"  residual encoder: ||W||={residual.w_norm:.4g} "
+            f"(0=features nullified)  lambda_min {residual.init_objective:.4g}"
+            f"->{residual.objective:.4g}  node-margin {residual.init_margin:.4g}"
+            f"->{residual.margin:.4g}"
+        )
+
     encoders = [
         ("laplacian", laplacian_basis, laplacian_embed),
         ("structural", structural_basis, structural_embed),
@@ -712,6 +798,11 @@ def main() -> None:
     ]
     if contrastive is not None:
         encoders.append(("contrastive", contrastive[0], contrastive[1]))
+    if lda_basis is not None:
+        encoders.append(("feat-lda", lda_basis, lda_embed))
+        encoders.append(("struct+lda", lda_concat_basis, lda_embed))
+    if residual_basis is not None:
+        encoders.append(("residual", residual_basis, residual_embed))
     rows = [
         _coarsen_and_score(
             name,

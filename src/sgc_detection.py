@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Sequence
 
 import json
 import math
@@ -655,6 +655,100 @@ def _ridge_lda_direction(
     return torch.linalg.solve(within + ridge * scale * eye, gap)
 
 
+def fit_node_discriminant_map(
+    features: torch.Tensor,
+    alert_patterns: Sequence[Any],
+    *,
+    embed_dim: int,
+    ridge: float = 1e-2,
+    boundary_negatives: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Learn a feature map ``W in R^{f x d}`` that separates gang nodes from the rest.
+
+    This is the *coarsening*-oriented feature map (distinct from the classifier
+    head :func:`fit_feature_discriminant`, which works on mean-pooled *pattern*
+    signatures for label AUC).  Here the diagnostic established that node features
+    carry gang signal that, projected on the gang-vs-surroundings direction, jumps
+    sharply across the gang boundary -- exactly the coordinate a coarsening must
+    keep so RSA does not merge a gang into its neighbours.
+
+    ``W`` is the top-``d`` multiclass-LDA (Fisher) subspace with one class per
+    gang plus a background class: the generalized eigenvectors of ``S_b w =
+    lambda S_w w`` where ``S_b`` is the between-gang-centroid scatter (so distinct
+    gangs land on distinct coordinates) and ``S_w`` the pooled within-class
+    scatter (ridge-regularized).  Features are z-scored first, so ``W`` is meant
+    to act on standardized ``X``.  ``boundary_negatives`` (node indices), if
+    given, replaces the global background with the gangs' 1-hop neighbours so the
+    map targets the *boundary* contrast directly.
+    """
+
+    X = features
+    if X.dim() == 1:
+        X = X.unsqueeze(1)
+    X = X.to(dtype=torch.float64)
+    n, f = X.shape
+    mu = X.mean(0)
+    sd = X.std(0).clamp_min(1e-9)
+    Xs = (X - mu) / sd
+    Xs = torch.nan_to_num(Xs)
+
+    device = X.device
+    assigned = torch.zeros(n, dtype=torch.bool, device=device)
+    class_means: List[torch.Tensor] = []
+    class_counts: List[int] = []
+    within = torch.zeros(f, f, dtype=torch.float64, device=device)
+    for p in alert_patterns:
+        idx = p.nodes
+        idx = (
+            idx.to(device=device, dtype=torch.long)
+            if torch.is_tensor(idx)
+            else torch.as_tensor(list(idx), dtype=torch.long, device=device)
+        )
+        if idx.numel() == 0:
+            continue
+        assigned[idx] = True
+        block = Xs[idx]
+        m = block.mean(0)
+        class_means.append(m)
+        class_counts.append(int(idx.numel()))
+        centered = block - m
+        within = within + centered.T @ centered
+    if not class_means:
+        raise ValueError("node discriminant map needs at least one non-empty gang")
+
+    if boundary_negatives is not None:
+        bg_idx = boundary_negatives.to(device=device, dtype=torch.long)
+    else:
+        bg_idx = torch.nonzero(~assigned, as_tuple=False).squeeze(1)
+    if bg_idx.numel() > 1:
+        block = Xs[bg_idx]
+        m = block.mean(0)
+        class_means.append(m)
+        class_counts.append(int(bg_idx.numel()))
+        centered = block - m
+        within = within + centered.T @ centered
+
+    means = torch.stack(class_means, 0)  # (C, f)
+    counts = torch.tensor(class_counts, dtype=torch.float64, device=device)
+    grand = (means * counts.unsqueeze(1)).sum(0) / counts.sum()
+    delta = means - grand
+    between = (delta * counts.unsqueeze(1)).T @ delta  # (f, f)
+    within = within / counts.sum()
+    scale = torch.diagonal(within).mean().clamp_min(1e-12)
+    eye = torch.eye(f, dtype=torch.float64, device=device)
+    # Solve S_w^{-1} S_b and take its leading eigenvectors (Fisher directions).
+    mat = torch.linalg.solve(within + ridge * scale * eye, between)
+    evals, evecs = torch.linalg.eig(mat)
+    order = torch.argsort(evals.real, descending=True)
+    d = min(embed_dim, f, len(class_means) - 1 if len(class_means) > 1 else f)
+    W = evecs.real[:, order[:d]]
+    # Fold in the z-scoring so W acts on raw X: (X-mu)/sd @ W == X @ (W/sd) - const.
+    W = W / sd.unsqueeze(1)
+    # Unit-Frobenius for scale parity with the random/structural channels.
+    W = W / W.norm().clamp_min(1e-12)
+    return W.to(dtype=features.dtype)
+
+
 def fit_feature_discriminant(
     adjacency: torch.Tensor,
     train_patterns: Sequence[Any],
@@ -1143,6 +1237,184 @@ def fit_joint_encoder(
         retention_side=retention_side,
         contrastive_weight=contrastive_weight,
         contrastive_ratio=best_contrastive if use_contrastive else None,
+    )
+
+
+class ResidualEncoderResult(NamedTuple):
+    theta: torch.Tensor
+    feature_map: torch.Tensor  # W (f, r)
+    structural_width: int
+    degree: int
+    w_norm: float  # ||W|| at the optimum -- 0 means features were nullified
+    init_objective: float
+    objective: float
+    init_margin: float
+    margin: float
+    history: List[float]
+
+
+def fit_residual_encoder(
+    adjacency: torch.Tensor,
+    retain_patterns: Sequence[Any],
+    *,
+    features: torch.Tensor,
+    node_gang_mask: torch.Tensor,
+    node_train_mask: torch.Tensor,
+    structural_width: int = 64,
+    degree: int = 16,
+    epochs: int = 200,
+    learning_rate: float = 0.01,
+    seed: int = 0,
+    ridge: float = 1e-3,
+    margin_weight: float = 1.0,
+    w_penalty: float = 1e-2,
+    label_ridge: float = 1e-2,
+    retention_reduce: str = "softmin",
+    retention_temp: float = 0.5,
+    retention_mode: str = "auto",
+) -> ResidualEncoderResult:
+    """Residual feature encoder ``Z = g_theta(A_hat) (Omega + X W)`` -- no concat.
+
+    A single ``r = structural_width``-dimensional channel.  The fixed random
+    structural range-finder ``Omega`` is the *skip connection* (it alone gives the
+    structural encoder), and the learned feature branch ``X W`` is an *additive
+    residual* in the **same** ``r`` columns rather than extra concatenated ones.
+
+    ``W`` is initialized to **zero**, so the encoder starts byte-for-byte at the
+    structural encoder, and an ``w_penalty * ||W||^2`` ridge pulls it back to zero.
+    The feature residual is therefore only adopted where it *earns* objective: when
+    structure already carries the signal the optimizer drives ``W -> 0`` on its own
+    (``w_norm`` reports this), which is the learnable answer to "nullify the
+    features and fall back to structure" without an explicit concatenation switch.
+
+    Objective (maximized): ``lambda_min(G)/scale + margin_weight * node_margin``
+    ``- w_penalty * ||W||^2``.  The first term is the Eq. (48) coarsening retention
+    of the residual channel; ``node_margin`` is the differentiable LDA separation
+    of *gang nodes vs non-gang nodes* (restricted to ``node_train_mask`` to avoid
+    leakage) read off the node embedding ``Z`` itself -- the node-level analogue of
+    the boundary signal the diagnostic found, which is what the residual must carry
+    to sharpen coarsening (the structural ``Omega`` part is random, so this gradient
+    flows into ``W``).
+    """
+
+    device, dtype = adjacency.device, adjacency.dtype
+    n = adjacency.shape[0]
+    X = features.to(device=device, dtype=dtype)
+    if X.dim() == 1:
+        X = X.unsqueeze(1)
+    f = X.shape[1]
+    r = structural_width
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    omega = torch.randn(n, r, dtype=dtype, device=device, generator=generator)
+
+    V = pattern_indicator_matrix(retain_patterns, n, dtype=dtype, device=device)
+    Vt = V.T  # (m, n)
+    omega_stack = torch.stack(propagation_stack(adjacency, omega, degree), 0)  # (K+1,n,r)
+    x_stack = torch.stack(propagation_stack(adjacency, X, degree), 0)  # (K+1,n,f)
+    struct_pat = torch.einsum("mn,knr->kmr", Vt, omega_stack)  # (K+1,m,r)
+    featx_pat = torch.einsum("mn,knf->kmf", Vt, x_stack)  # (K+1,m,f)
+
+    gang = node_gang_mask.to(device=device).bool()
+    train = node_train_mask.to(device=device).bool()
+    tr_gang = gang[train]
+    if not bool(tr_gang.any()) or not bool((~tr_gang).any()):
+        raise ValueError("residual encoder needs gang and non-gang nodes in train mask")
+
+    eps = torch.finfo(dtype).eps
+
+    # Scale the unit-direction feature branch to the structural channel's energy
+    # so the gate ``alpha`` is the only magnitude knob -- otherwise lambda_min is
+    # not scale-invariant and the optimizer inflates W without bound (the channel
+    # just gains energy, not resolution).  ``alpha`` carries the residual: at
+    # alpha=0 the channel is exactly g_theta(A_hat) Omega (the structural encoder),
+    # and a ``w_penalty * alpha^2`` ridge pulls it back there unless the feature
+    # residual earns objective.  W (unit Frobenius) only sets the *direction*.
+    def _channels(theta, W, alpha):
+        Wn = W / W.norm().clamp_min(eps)
+        s_pat = torch.einsum("k,kmr->mr", theta, struct_pat)  # (m, r)
+        f_pat = torch.einsum("k,kmf->mf", theta, featx_pat) @ Wn  # (m, r)
+        s_node = torch.einsum("k,knr->nr", theta, omega_stack)  # (n, r)
+        f_node = torch.einsum("k,knf->nf", theta, x_stack) @ Wn  # (n, r)
+        scale = (s_pat.detach().pow(2).mean() /
+                 f_pat.detach().pow(2).mean().clamp_min(eps)).sqrt()
+        Y = s_pat + alpha * scale * f_pat
+        Z = s_node + alpha * scale * f_node
+        return Y, Z
+
+    def retention(Y: torch.Tensor) -> torch.Tensor:
+        sig = Y.T  # (r, m)
+        use_channel = retention_mode == "channel" or (
+            retention_mode == "auto" and sig.shape[1] > sig.shape[0]
+        )
+        gram = sig @ sig.T if use_channel else sig.T @ sig
+        gram = 0.5 * (gram + gram.T)
+        gram = gram + ridge * torch.eye(gram.shape[0], dtype=dtype, device=device)
+        evals = torch.linalg.eigvalsh(gram)
+        return _reduce_eigs(evals, reduce=retention_reduce, temp=retention_temp)
+
+    theta_raw = torch.nn.Parameter(torch.zeros(degree + 1, dtype=dtype, device=device))
+    with torch.no_grad():
+        theta_raw[-1] = 1.0
+    gen = torch.Generator(device=device).manual_seed(seed + 1)
+    W = torch.nn.Parameter(torch.randn(f, r, dtype=dtype, device=device, generator=gen))
+    alpha = torch.nn.Parameter(torch.zeros((), dtype=dtype, device=device))  # gate, 0=struct
+
+    with torch.no_grad():
+        init_theta = _unit(theta_raw)
+        Y0, Z0 = _channels(init_theta, W, alpha)
+        init_lambda = float(retention(Y0))
+        init_margin = float(_label_separation(Z0[train], tr_gang, ridge=label_ridge))
+    lam_scale = abs(init_lambda) if abs(init_lambda) > eps else 1.0
+
+    optimizer = torch.optim.Adam((theta_raw, W, alpha), lr=learning_rate)
+    best = (-float("inf"), init_theta.detach().clone(), W.detach().clone(),
+            0.0, init_lambda, init_margin)
+    history: List[float] = []
+    for _ in range(epochs):
+        optimizer.zero_grad(set_to_none=True)
+        theta = _unit(theta_raw)
+        Y, Z = _channels(theta, W, alpha)
+        lam = retention(Y)
+        mar = _label_separation(Z[train], tr_gang, ridge=label_ridge)
+        total = lam / lam_scale + margin_weight * mar - w_penalty * alpha * alpha
+        if not torch.isfinite(total):
+            raise FloatingPointError("non-finite residual-encoder objective")
+        (-total).backward()
+        optimizer.step()
+        val = float(total.detach().cpu())
+        history.append(val)
+        if val > best[0]:
+            best = (val, theta.detach().clone(),
+                    (alpha.detach() * W.detach() / W.detach().norm().clamp_min(eps)).clone(),
+                    float(alpha.detach().cpu()),
+                    float(lam.detach().cpu()), float(mar.detach().cpu()))
+
+    _, best_theta, best_W, best_alpha, best_lambda, best_margin = best
+    # Fold the gate + structural-energy scale into the returned W so callers can
+    # use the plain residual Z = g_theta(A_hat)(Omega + X W_eff) with no extra
+    # knobs.  ``best_W`` is already ``alpha * unit-direction``.
+    with torch.no_grad():
+        if best_W.norm() > eps:
+            Wn = best_W / best_W.norm()
+            s_pat = torch.einsum("k,kmr->mr", best_theta, struct_pat)
+            f_pat = torch.einsum("k,kmf->mf", best_theta, featx_pat) @ Wn
+            scale = (s_pat.pow(2).mean() / f_pat.pow(2).mean().clamp_min(eps)).sqrt()
+            W_eff = scale * best_W
+        else:
+            W_eff = best_W
+    return ResidualEncoderResult(
+        theta=best_theta,
+        feature_map=W_eff,
+        structural_width=r,
+        degree=degree,
+        w_norm=float(abs(best_alpha)),
+        init_objective=init_lambda,
+        objective=best_lambda,
+        init_margin=init_margin,
+        margin=best_margin,
+        history=history,
     )
 
 
