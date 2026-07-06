@@ -48,6 +48,7 @@ import json
 import os
 import sys
 import warnings
+from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
 
@@ -196,27 +197,99 @@ def build_synthetic_graph(
     return graph, patterns
 
 
+def make_negative_sampler(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    *,
+    num_sets: int,
+    size_min: int,
+    size_max: int,
+    avoid: "list[int] | np.ndarray",
+    rng: "np.random.Generator",
+) -> "callable":
+    """Build a resampler that draws a *fresh* batch of negative sets on each call.
+
+    Each negative "repeller" set grows from a random seed by random neighbor
+    accretion (a shuffled-frontier BFS) up to a random size in
+    ``[size_min, size_max]``.  Seeds and grown nodes avoid ``avoid`` (the planted
+    motif nodes) so the negatives are genuine background neighborhoods -- random
+    sets of neighboring nodes of random size -- rather than gangs.
+
+    Neighbor lists and the seed-candidate pool are precomputed once, so the
+    returned ``sample()`` closure is cheap to call every epoch: resampling the
+    negatives each step stops the filter bank from overfitting one fixed batch.
+    """
+
+    if not 2 <= size_min <= size_max:
+        raise ValueError("require 2 <= --neg-size-min <= --neg-size-max")
+
+    neighbors: "dict[int, list[int]]" = defaultdict(list)
+    src, dst = edge_index[0].tolist(), edge_index[1].tolist()
+    for u, v in zip(src, dst):
+        neighbors[u].append(v)
+    avoid_set = {
+        int(a) for a in (avoid.tolist() if hasattr(avoid, "tolist") else avoid)
+    }
+    candidates = [n for n in range(num_nodes) if n not in avoid_set and neighbors[n]]
+
+    def sample() -> list[list[int]]:
+        if num_sets <= 0 or not candidates:
+            return []
+        sets: list[list[int]] = []
+        for _ in range(num_sets):
+            size = int(rng.integers(size_min, size_max + 1))
+            seed = int(rng.choice(candidates))
+            blob, seen = [seed], {seed}
+            frontier = [w for w in neighbors[seed] if w not in avoid_set]
+            rng.shuffle(frontier)
+            while len(blob) < size and frontier:
+                nxt = int(frontier.pop())
+                if nxt in seen or nxt in avoid_set:
+                    continue
+                blob.append(nxt)
+                seen.add(nxt)
+                extra = [
+                    w for w in neighbors[nxt] if w not in seen and w not in avoid_set
+                ]
+                rng.shuffle(extra)
+                frontier.extend(extra)
+            if len(blob) >= 2:
+                sets.append(blob)
+        return sets
+
+    return sample
+
+
 # --------------------------------------------------------------------------- #
 # 3-4.  collective L_sym filter-bank learning
 # --------------------------------------------------------------------------- #
-def degree_weighted_indicators(adjacency: torch.Tensor, patterns: list) -> torch.Tensor:
+def _degree_weighted_columns(
+    adjacency: torch.Tensor, node_sets: "list"
+) -> torch.Tensor:
     """Degree-weighted indicators ``v_S = D_tilde^{1/2} 1_S / sqrt(vol(S))``.
 
     ``D_tilde = D + I`` matches the self-loop renormalization of ``A_hat``, so
-    ``||v_S||_L^2 = Phi(S)`` under ``L = I - A_hat``.
+    ``||v_S||_L^2 = Phi(S)`` under ``L = I - A_hat``.  ``node_sets`` is any list of
+    node-index sequences (planted gangs or sampled negatives).
     """
 
     n = adjacency.shape[0]
     dtype, device = adjacency.dtype, adjacency.device
     d_tilde = _degrees(adjacency) + 1.0  # self-loop augmented degree
     columns = []
-    for pattern in patterns:
-        nodes = torch.as_tensor(pattern.node_indices, dtype=torch.long, device=device)
+    for nodes in node_sets:
+        nodes = torch.as_tensor(nodes, dtype=torch.long, device=device)
         column = torch.zeros(n, dtype=dtype, device=device)
         column[nodes] = d_tilde[nodes].sqrt()
         column = column / d_tilde[nodes].sum().clamp_min(torch.finfo(dtype).eps).sqrt()
         columns.append(column)
     return torch.stack(columns, dim=1)  # (N, m)
+
+
+def degree_weighted_indicators(adjacency: torch.Tensor, patterns: list) -> torch.Tensor:
+    """Degree-weighted gang indicators for the evaluation :class:`Pattern` list."""
+
+    return _degree_weighted_columns(adjacency, [p.node_indices for p in patterns])
 
 
 def _l_apply(a_hat: torch.Tensor, signals: torch.Tensor) -> torch.Tensor:
@@ -257,6 +330,36 @@ def _collective_gamma(
     return 0.5 * (gamma + gamma.T)
 
 
+def _soft_lambda_max(
+    gamma: torch.Tensor, temperature: float, *, sharpen: bool = False
+) -> torch.Tensor:
+    """Smooth surrogate for ``lambda_max(gamma)``: ``sum_i softmax(lam/tau)_i lam_i``.
+
+    Differentiable and ``-> lambda_max`` as ``temperature -> 0``.  Penalizing it
+    for the *negative* sets drives every negative neighborhood's retained
+    ``L``-energy toward zero (none is preserved by ``R``), so the RSA coarsening
+    pulls those sets apart.
+
+    ``temperature`` is **relative to the top eigenvalue** (``tau_eff = temperature
+    * lambda_max``): the softmax weights decay by ``e`` per ``temperature``
+    fraction of the peak, so the surrogate stays a genuine soft-*max* regardless
+    of the absolute eigenvalue scale.  With a fixed *absolute* temperature the
+    weights collapse to uniform (a plain *mean*, with a weak diffuse gradient)
+    whenever the retained energies are tiny -- exactly the regime the negatives
+    live in -- which is why ``sharpen=False`` (mean-like) is the calmer default
+    and ``sharpen=True`` targets the single worst negative blob.
+    """
+
+    eigs = torch.linalg.eigvalsh(gamma)
+    if sharpen:
+        top = eigs[-1].detach().clamp_min(1e-12)  # eigvalsh is ascending
+        tau = max(float(temperature), 1e-8) * top
+    else:
+        tau = max(float(temperature), 1e-8)
+    weights = torch.softmax((eigs - eigs[-1]) / tau, dim=0)
+    return (weights * eigs).sum()
+
+
 def fit_collective_bank(
     a_hat: torch.Tensor,
     adjacency: torch.Tensor,
@@ -268,6 +371,11 @@ def fit_collective_bank(
     learning_rate: float,
     ridge: float,
     fit_seed: int,
+    neg_sampler: "callable | None" = None,
+    neg_weight: float = 0.0,
+    neg_temperature: float = 0.1,
+    neg_project: bool = False,
+    neg_sharpen: bool = False,
 ) -> dict:
     """Ascend ``lambda_min(Gamma(Theta))`` over the per-channel unit spheres.
 
@@ -283,10 +391,25 @@ def fit_collective_bank(
         )
 
     dtype, device = a_hat.dtype, a_hat.device
+    eps = torch.finfo(dtype).eps
     V = degree_weighted_indicators(adjacency, train_patterns)  # (N, m)
     l_v = _l_apply(a_hat, V)
-    phi = (V * l_v).sum(0).clamp_min(torch.finfo(dtype).eps)  # Phi_j = ||v_j||_L^2
+    phi = (V * l_v).sum(0).clamp_min(eps)  # Phi_j = ||v_j||_L^2
     l_vhat = l_v / phi.sqrt().unsqueeze(0)  # L Vhat = L v_j / sqrt(Phi_j)
+
+    # negative "repeller" sets: their softmax-lambda_max is *minimized*, so ``R``
+    # preserves none of them and the coarsening splits them apart.  The sets are
+    # resampled every epoch (see ``neg_sampler``) so the bank cannot overfit a
+    # single fixed batch of negatives.
+    neg_active = neg_sampler is not None and neg_weight > 0.0
+
+    def _neg_l_vhat(sets: "list | None"):
+        if not sets:
+            return None
+        v_neg = _degree_weighted_columns(adjacency, sets)
+        l_v_neg = _l_apply(a_hat, v_neg)
+        phi_neg = (v_neg * l_v_neg).sum(0).clamp_min(eps)
+        return l_v_neg / phi_neg.sqrt().unsqueeze(0)
 
     propagated = propagation_stack(a_hat, X, degree)  # [A_hat^k X], k=0..K
 
@@ -300,35 +423,79 @@ def fit_collective_bank(
             torch.finfo(dtype).eps
         )
 
+    def _neg_softmax(embedding: torch.Tensor, l_vhat_neg) -> torch.Tensor:
+        if l_vhat_neg is None:
+            return torch.zeros((), dtype=dtype, device=device)
+        return _soft_lambda_max(
+            _collective_gamma(a_hat, embedding, l_vhat_neg, ridge),
+            neg_temperature,
+            sharpen=neg_sharpen,
+        )
+
     with torch.no_grad():
         Z0 = _filtered_bank(propagated, _unit(raw))
         init_obj = float(
             torch.linalg.eigvalsh(_collective_gamma(a_hat, Z0, l_vhat, ridge))[0]
         )
+        init_neg = float(
+            _neg_softmax(Z0, _neg_l_vhat(neg_sampler() if neg_active else None))
+        )
 
     optimizer = torch.optim.Adam((raw,), lr=learning_rate)
     best_theta = _unit(raw).detach().clone()
-    best_obj = init_obj
+    best_obj, best_neg = init_obj, init_neg
     history: list[float] = []
+    neg_history: list[float] = []
     for _ in range(epochs):
-        optimizer.zero_grad(set_to_none=True)
         theta = _unit(raw)
         Z = _filtered_bank(propagated, theta)
         gamma = _collective_gamma(a_hat, Z, l_vhat, ridge)
         lam_min = torch.linalg.eigvalsh(gamma)[0]
-        (-lam_min).backward()
-        optimizer.step()
+
+        if not neg_active:
+            optimizer.zero_grad(set_to_none=True)
+            (-lam_min).backward()
+            optimizer.step()
+            soft_neg_val = 0.0
+        else:
+            # fresh negatives every epoch -> stochastic repeller (no overfitting).
+            l_vhat_neg = _neg_l_vhat(neg_sampler())
+            soft_neg = _neg_softmax(Z, l_vhat_neg)
+            # Take the two gradients separately so the negative step can be made
+            # non-conflicting with the positive margin (gradient surgery).
+            optimizer.zero_grad(set_to_none=True)
+            lam_min.backward(retain_graph=True)
+            grad_pos = raw.grad.detach().clone()  # ascent dir for lambda_min
+            optimizer.zero_grad(set_to_none=True)
+            soft_neg.backward()
+            desc_neg = -raw.grad.detach().clone()  # descent dir for the negatives
+            if neg_project:
+                conflict = (desc_neg * grad_pos).sum()
+                if conflict < 0:  # this step would lower lambda_min -> remove it
+                    denom = grad_pos.pow(2).sum().clamp_min(eps)
+                    desc_neg = desc_neg - (conflict / denom) * grad_pos
+            ascent = grad_pos + neg_weight * desc_neg
+            raw.grad = -ascent  # Adam minimizes, so feed the negated ascent
+            optimizer.step()
+            soft_neg_val = float(soft_neg.detach())
 
         value = float(lam_min.detach())
         history.append(value)
+        neg_history.append(soft_neg_val)
+        # snapshot by the (stable) positive margin; the negatives are a stochastic
+        # regularizer resampled each step, so their per-epoch value is noisy.
         if value > best_obj:
             best_obj = value
+            best_neg = soft_neg_val
             best_theta = _unit(raw).detach().clone()
 
     return {
         "theta": best_theta,
         "init_objective": init_obj,
         "objective": best_obj,
+        "neg_objective_init": init_neg,
+        "neg_objective": best_neg,
+        "neg_objective_mean": float(np.mean(neg_history)) if neg_history else 0.0,
         "history": history,
     }
 
@@ -402,11 +569,55 @@ def main() -> None:
     parser.add_argument("--avg-degree", type=float, default=5.0)
     parser.add_argument("--feature-dim", type=int, default=64)
     parser.add_argument("--train-ratio", type=float, default=0.4)
-    # filter-bank learning
-    parser.add_argument("--degree", type=int, default=15, help="polynomial degree K")
-    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--degree", type=int, default=10, help="polynomial degree K")
+    parser.add_argument("--epochs", type=int, default=1200)
     parser.add_argument("--learning-rate", type=float, default=0.05)
     parser.add_argument("--ridge", type=float, default=1e-4)
+    # negative "repeller" sets (random background neighborhoods)
+    parser.add_argument(
+        "--num-neg-motifs",
+        type=int,
+        default=50,
+        help="number of negative repeller sets: random connected background "
+        "neighborhoods that should NOT coarsen together; the fit also minimizes a "
+        "softmax lambda_max of their Gamma (0 disables the negative term)",
+    )
+    parser.add_argument(
+        "--neg-size-min",
+        type=int,
+        default=3,
+        help="minimum size of a sampled negative neighborhood",
+    )
+    parser.add_argument(
+        "--neg-size-max",
+        type=int,
+        default=10,
+        help="maximum size of a sampled negative neighborhood (random per set)",
+    )
+    parser.add_argument(
+        "--neg-weight",
+        type=float,
+        default=1.0,
+        help="beta: weight of the negative softmax-lambda_max penalty in the fit",
+    )
+    parser.add_argument(
+        "--neg-temperature",
+        type=float,
+        default=0.1,
+        help="softmax temperature for the negative lambda_max surrogate (->0 = hard max)",
+    )
+    parser.add_argument(
+        "--neg-project",
+        action="store_true",
+        help="gradient-surgery: drop the part of the negative step that would lower "
+        "lambda_min (guarantees no positive loss, but largely neuters the negatives)",
+    )
+    parser.add_argument(
+        "--neg-sharpen",
+        action="store_true",
+        help="scale-relative softmax so the negative penalty tracks the single worst "
+        "blob (true lambda_max) instead of the mean retained energy",
+    )
     parser.add_argument(
         "--max-levels",
         type=int,
@@ -471,6 +682,21 @@ def main() -> None:
     train_patterns = [patterns[i] for i in order[:n_train]]
     test_patterns = [patterns[i] for i in order[n_train:]]
 
+    # optional negative "repeller" sets (random background neighborhoods) ------
+    # resampled every epoch so the bank can't overfit one fixed batch.
+    neg_sampler = None
+    if args.num_neg_motifs > 0:
+        avoid = torch.nonzero(graph.y == 1, as_tuple=False).flatten().tolist()
+        neg_sampler = make_negative_sampler(
+            graph.edge_index,
+            args.num_nodes,
+            num_sets=args.num_neg_motifs,
+            size_min=args.neg_size_min,
+            size_max=args.neg_size_max,
+            avoid=avoid,
+            rng=np.random.default_rng(args.seed + 1),
+        )
+
     LOGGER.info("\nCollective learnable filter-bank detection (L_sym metric)")
     _motif_desc = f"{args.motif_type}(size {args.motif_size}" + (
         f", density {args.motif_density:.2f})" if args.motif_type == "random" else ")"
@@ -501,12 +727,23 @@ def main() -> None:
         learning_rate=args.learning_rate,
         ridge=args.ridge,
         fit_seed=args.seed,
+        neg_sampler=neg_sampler,
+        neg_weight=args.neg_weight,
+        neg_temperature=args.neg_temperature,
+        neg_project=args.neg_project,
+        neg_sharpen=args.neg_sharpen,
     )
     theta = fit["theta"]
     LOGGER.info(
         f"  lambda_min(Gamma) train: {fit['init_objective']:.6g} -> "
         f"{fit['objective']:.6g}"
     )
+    if neg_sampler is not None:
+        LOGGER.info(
+            f"  neg softmax-lambda_max ({args.num_neg_motifs} sets/epoch, "
+            f"beta={args.neg_weight:g}): {fit['neg_objective_init']:.6g} -> "
+            f"{fit['neg_objective_mean']:.6g} mean (want down)"
+        )
     train_cap = retained_energy(
         normalized, adjacency, train_patterns, X, theta, args.ridge
     )
@@ -549,6 +786,23 @@ def main() -> None:
         f"epsilon={coarsening.epsilon:.4g} (RSA exact; bound "
         f"{coarsening.epsilon_bound:.4g})"
     )
+
+    # negative separation diagnostic on a *fresh* batch of repellers: how much
+    # each blob collapsed into one supernode (lower dominant share = better).
+    neg_share_mean = None
+    if neg_sampler is not None:
+        n2s = coarsening.node_to_supernode
+        shares = []
+        for nodes in neg_sampler():
+            sup = n2s[torch.as_tensor(nodes, dtype=torch.long)]
+            _, counts = torch.unique(sup, return_counts=True)
+            shares.append(float(counts.max()) / len(nodes))
+        if shares:
+            neg_share_mean = float(np.mean(shares))
+            LOGGER.info(
+                f"  neg co-coarsen: mean dominant-supernode share {neg_share_mean:.3f} "
+                f"(lower = better separated)"
+            )
 
     # 7. recall / precision / detection rate ----------------------------------
     splits = {
@@ -593,6 +847,8 @@ def main() -> None:
                 "learning": {
                     "lambda_min_gamma_init": fit["init_objective"],
                     "lambda_min_gamma_final": fit["objective"],
+                    "neg_softmax_lambda_max_init": fit.get("neg_objective_init"),
+                    "neg_softmax_lambda_max_mean": fit.get("neg_objective_mean"),
                     "theta": theta.detach().cpu().tolist(),
                     "train_capture": train_cap,
                     "test_capture": test_cap,
@@ -605,6 +861,13 @@ def main() -> None:
                     "n_levels": len(coarsening.sigmas),
                 },
                 "detection": report,
+                "negatives": {
+                    "num_sets_per_epoch": args.num_neg_motifs,
+                    "resampled_each_epoch": neg_sampler is not None,
+                    "weight": args.neg_weight,
+                    "temperature": args.neg_temperature,
+                    "co_coarsen_mean_share": neg_share_mean,
+                },
             },
             indent=2,
             default=str,
