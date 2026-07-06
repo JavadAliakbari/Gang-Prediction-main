@@ -1,17 +1,23 @@
-"""Controlled collective learnable-filter (``L_sym``) gang-detection experiment.
+"""Controlled collective learnable-filter (``M_tau``) gang-detection experiment.
 
 This is an end-to-end, *controlled* implementation of the collective detect-all
 objective of Section "Collective Detection":
 
     Theta* = argmax_{||theta^(a)||=1 for all a}  lambda_min(Gamma(Theta)),
-    Gamma(Theta) = Vhat^T L Z (Z^T L Z)^+ Z^T L Vhat  in R^{m x m},
+    Gamma(Theta) = Vhat^T M Z (Z^T M Z)^+ Z^T M Vhat  in R^{m x m},   M = M_tau = L + tau*I,
     Z[:, a] = g_{theta^(a)}(A_hat) x_a = sum_k Theta_{ka} A_hat^k x_a  (one filter
                                                                        per channel),
 
-with everything measured in the *symmetric normalized* metric ``L = I - A_hat``
-(the analysis switches from the plain ``l2`` norm to the ``L_sym`` seminorm), and
-``Vhat`` the ``L``-normalized *degree-weighted* gang indicators
-``v_S = D_tilde^{1/2} 1_S / sqrt(vol(S))`` (so ``||v_S||_L^2 = Phi = cut/vol``).
+with everything measured in the *screened* metric ``M_tau = L + tau*I`` -- the
+one-parameter family that interpolates between the ``L_sym`` seminorm at
+``tau = 0`` (Loukas' analysis; ``L = I - A_hat``) and the plain ``l2`` metric as
+``tau -> inf``, and is positive *definite* for every ``tau > 0``.  ``Vhat`` are the
+``M_tau``-normalized *degree-weighted* gang indicators
+``v_S = D_tilde^{1/2} 1_S / sqrt(vol(S))``, so ``||v_S||_L^2 = Phi = cut/vol`` and
+``||v_S||_{M_tau}^2 = Phi + tau``; the screened channel Gram factorizes as
+``Z^T M_tau Z = Z^T L Z + tau*Z^T Z`` (screening = a Tikhonov ridge on the Gram).
+Pass ``--tau`` (a single value or a comma-separated list, e.g. ``0,0.1,0.3,1.0``)
+to switch metric and compare detection across ``tau``.
 
 Pipeline (the seven requested steps):
 
@@ -23,7 +29,8 @@ Pipeline (the seven requested steps):
 4. learn the per-channel filter bank ``Theta`` by ascending
    ``lambda_min(Gamma(Theta))`` on the *training* motifs only;
 5. form the embedding ``Z = g_Theta(A_hat) X`` and the target subspace
-   ``R = span(Z)`` from the learned filters;
+   ``R = span(Z)`` from the learned filters (``span(Z)`` is itself
+   ``tau``-independent, but the learned ``Theta*`` -- and hence ``Z`` -- is not);
 6. hand ``R`` to the Loukas RSA coarsening (reusing the existing
    :func:`loukas_coarsen_pytorch`);
 7. report post-coarsening recall / precision / detection rate (reusing
@@ -31,14 +38,17 @@ Pipeline (the seven requested steps):
 
 Note on the coarsening metric.  The Loukas coarsening historically measured RSA
 distortion in the *combinatorial* Laplacian ``L = D - W``; the algorithm above is
-derived in the *symmetric normalized* ``L = I - A_hat``.  Both are now exposed
-through ``--coarsening-laplacian`` (default ``symmetric`` to match the algorithm).
+derived in the *symmetric normalized* ``L = I - A_hat``.  Both are exposed through
+``--coarsening-laplacian`` (default ``symmetric``).  The screening ``tau`` enters
+the *learning* objective and the capture diagnostic (where the ``L_sym`` norm used
+to live); it flows into detection through the learned filter ``Theta*(tau)``.
 
 Run, e.g.::
 
     python -m src.run_collective_bank_detection \
         --motif-type clique --num-motifs 10 --num-nodes 2000 \
-        --train-ratio 0.4 --degree 10 --feature-dim 64 --reduction 0.85
+        --train-ratio 0.4 --degree 10 --feature-dim 64 --reduction 0.85 \
+        --tau 0,0.1,0.3,1.0
 """
 
 from __future__ import annotations
@@ -298,6 +308,19 @@ def _l_apply(a_hat: torch.Tensor, signals: torch.Tensor) -> torch.Tensor:
     return signals - torch.sparse.mm(a_hat, signals)
 
 
+def _m_apply(a_hat: torch.Tensor, signals: torch.Tensor, tau: float) -> torch.Tensor:
+    """Apply the screened metric ``M_tau = L + tau*I = (I - A_hat) + tau*I``.
+
+    ``tau = 0`` recovers the ``L_sym`` seminorm; ``tau > 0`` makes the metric
+    positive *definite* (a true norm) and adds ``tau*||x||_2^2`` of within-supernode
+    (l2) energy to every inner product, per the screened-metric family
+    ``||x||_{M_tau}^2 = ||x||_L^2 + tau*||x||_2^2``.
+    """
+
+    out = _l_apply(a_hat, signals)
+    return out + tau * signals if tau else out
+
+
 def _filtered_bank(propagated: list[torch.Tensor], theta: torch.Tensor) -> torch.Tensor:
     """Per-channel filter bank ``Z[:, a] = sum_k theta[k, a] (A_hat^k X)[:, a]``.
 
@@ -311,19 +334,23 @@ def _filtered_bank(propagated: list[torch.Tensor], theta: torch.Tensor) -> torch
 def _collective_gamma(
     a_hat: torch.Tensor,
     Z: torch.Tensor,
-    l_vhat: torch.Tensor,
+    m_vhat: torch.Tensor,
     ridge: float,
+    tau: float,
 ) -> torch.Tensor:
-    """Collective ``L``-Gram ``Gamma = Vhat^T L Z (Z^T L Z)^+ Z^T L Vhat``.
+    """Collective ``M_tau``-Gram ``Gamma = Vhat^T M Z (Z^T M Z)^+ Z^T M Vhat``.
 
-    ``l_vhat = L Vhat`` is precomputed (independent of ``theta``).  A small
-    ``ridge`` stabilizes the pseudo-inverse of the ``d x d`` channel Gram.
+    ``m_vhat = M_tau Vhat`` is precomputed (independent of ``theta``).  The channel
+    Gram ``Z^T M_tau Z = Z^T L Z + tau*Z^T Z`` is the ``tau=0`` Gram plus ``tau``
+    times the plain dictionary Gram -- a structured Tikhonov ridge that stabilizes
+    the (otherwise Hankel-ill-conditioned) solve, exactly the paper's
+    ``screening is a ridge on the Gram``.  A small ``ridge`` adds a further guard.
     """
 
-    l_z = _l_apply(a_hat, Z)  # L Z            (N, d)
-    g_z = Z.T @ l_z  # Z^T L Z               (d, d)
+    m_z = _m_apply(a_hat, Z, tau)  # M_tau Z          (N, d)
+    g_z = Z.T @ m_z  # Z^T M_tau Z                    (d, d)
     g_z = 0.5 * (g_z + g_z.T)
-    m = Z.T @ l_vhat  # Z^T L Vhat            (d, m)
+    m = Z.T @ m_vhat  # Z^T M_tau Vhat                (d, m)
     eye = torch.eye(g_z.shape[0], dtype=g_z.dtype, device=g_z.device)
     g_inv_m = torch.linalg.solve(g_z + ridge * eye, m)  # (d, m)
     gamma = m.T @ g_inv_m  # (m, m)
@@ -371,6 +398,7 @@ def fit_collective_bank(
     learning_rate: float,
     ridge: float,
     fit_seed: int,
+    tau: float = 0.0,
     neg_sampler: "callable | None" = None,
     neg_weight: float = 0.0,
     neg_temperature: float = 0.1,
@@ -394,8 +422,9 @@ def fit_collective_bank(
     eps = torch.finfo(dtype).eps
     V = degree_weighted_indicators(adjacency, train_patterns)  # (N, m)
     l_v = _l_apply(a_hat, V)
-    phi = (V * l_v).sum(0).clamp_min(eps)  # Phi_j = ||v_j||_L^2
-    l_vhat = l_v / phi.sqrt().unsqueeze(0)  # L Vhat = L v_j / sqrt(Phi_j)
+    phi = (V * l_v).sum(0).clamp_min(eps)  # Phi_j = ||v_j||_L^2 (conductance)
+    m_norm = (phi + tau).sqrt().unsqueeze(0)  # ||v_j||_{M_tau} = sqrt(Phi_j + tau)
+    m_vhat = (l_v + tau * V) / m_norm  # M_tau Vhat = (L + tau I) v_j / sqrt(Phi_j+tau)
 
     # negative "repeller" sets: their softmax-lambda_max is *minimized*, so ``R``
     # preserves none of them and the coarsening splits them apart.  The sets are
@@ -409,7 +438,7 @@ def fit_collective_bank(
         v_neg = _degree_weighted_columns(adjacency, sets)
         l_v_neg = _l_apply(a_hat, v_neg)
         phi_neg = (v_neg * l_v_neg).sum(0).clamp_min(eps)
-        return l_v_neg / phi_neg.sqrt().unsqueeze(0)
+        return (l_v_neg + tau * v_neg) / (phi_neg + tau).sqrt().unsqueeze(0)
 
     propagated = propagation_stack(a_hat, X, degree)  # [A_hat^k X], k=0..K
 
@@ -427,7 +456,7 @@ def fit_collective_bank(
         if l_vhat_neg is None:
             return torch.zeros((), dtype=dtype, device=device)
         return _soft_lambda_max(
-            _collective_gamma(a_hat, embedding, l_vhat_neg, ridge),
+            _collective_gamma(a_hat, embedding, l_vhat_neg, ridge, tau),
             neg_temperature,
             sharpen=neg_sharpen,
         )
@@ -435,7 +464,7 @@ def fit_collective_bank(
     with torch.no_grad():
         Z0 = _filtered_bank(propagated, _unit(raw))
         init_obj = float(
-            torch.linalg.eigvalsh(_collective_gamma(a_hat, Z0, l_vhat, ridge))[0]
+            torch.linalg.eigvalsh(_collective_gamma(a_hat, Z0, m_vhat, ridge, tau))[0]
         )
         init_neg = float(
             _neg_softmax(Z0, _neg_l_vhat(neg_sampler() if neg_active else None))
@@ -449,7 +478,7 @@ def fit_collective_bank(
     for _ in range(epochs):
         theta = _unit(raw)
         Z = _filtered_bank(propagated, theta)
-        gamma = _collective_gamma(a_hat, Z, l_vhat, ridge)
+        gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau)
         lam_min = torch.linalg.eigvalsh(gamma)[0]
 
         if not neg_active:
@@ -517,16 +546,17 @@ def retained_energy(
     X: torch.Tensor,
     theta: torch.Tensor,
     ridge: float,
+    tau: float = 0.0,
 ) -> dict:
-    """Per-gang retained ``L``-energy ``C_S = Gamma_jj`` and the collective margin."""
+    """Per-gang retained ``M_tau``-energy ``C_S = Gamma_jj`` and the collective margin."""
 
     V = degree_weighted_indicators(adjacency, patterns)
     l_v = _l_apply(a_hat, V)
     phi = (V * l_v).sum(0).clamp_min(torch.finfo(a_hat.dtype).eps)
-    l_vhat = l_v / phi.sqrt().unsqueeze(0)
+    m_vhat = (l_v + tau * V) / (phi + tau).sqrt().unsqueeze(0)
     propagated = propagation_stack(a_hat, X, theta.shape[0] - 1)
     Z = _filtered_bank(propagated, theta)
-    gamma = _collective_gamma(a_hat, Z, l_vhat, ridge)
+    gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau)
     diag = torch.diagonal(gamma).clamp(0.0, 1.0)
     return {
         "per_gang_capture": [float(v) for v in diag],
@@ -546,6 +576,266 @@ def _alert_metrics(patterns: list, node_to_supernode, node_labels, threshold: fl
         patterns, node_to_supernode, node_labels, threshold=threshold
     )
     return by_label.get("alert", {})
+
+
+def _parse_taus(spec: str) -> list:
+    """Parse ``--tau`` into a list of floats (single value or comma-separated)."""
+
+    vals = [float(t) for t in str(spec).replace(" ", "").split(",") if t != ""]
+    if not vals:
+        raise ValueError("--tau must contain at least one value")
+    return vals
+
+
+def run_for_tau(
+    tau: float,
+    *,
+    normalized,
+    adjacency,
+    X,
+    graph,
+    patterns,
+    train_patterns,
+    test_patterns,
+    neg_sampler,
+    args,
+    out_dir: Path,
+    tag: str = "",
+) -> dict:
+    """Steps 4-7 for one screening level ``tau``: learn, coarsen, detect, persist.
+
+    Everything is measured in the screened metric ``M_tau = L + tau*I``.  The
+    target subspace ``span(Z)`` handed to the coarsener is itself tau-independent
+    (the paper's observation), but the learned filter ``theta*`` -- and therefore
+    ``Z`` and the detection outcome -- does change with ``tau``.  Returns a compact
+    summary consumed by the multi-``tau`` comparison.
+    """
+
+    suffix = f"_tau{tag}" if tag else ""
+
+    # 4. learn the filter bank on the training motifs -------------------------
+    fit = fit_collective_bank(
+        normalized,
+        adjacency,
+        train_patterns,
+        X,
+        degree=args.degree,
+        epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        ridge=args.ridge,
+        fit_seed=args.seed,
+        tau=tau,
+        neg_sampler=neg_sampler,
+        neg_weight=args.neg_weight,
+        neg_temperature=args.neg_temperature,
+        neg_project=args.neg_project,
+        neg_sharpen=args.neg_sharpen,
+    )
+    theta = fit["theta"]
+    LOGGER.info(
+        f"  [tau={tau:g}] lambda_min(Gamma) train: {fit['init_objective']:.6g} -> "
+        f"{fit['objective']:.6g}"
+    )
+    if neg_sampler is not None:
+        LOGGER.info(
+            f"  [tau={tau:g}] neg softmax-lambda_max ({args.num_neg_motifs} sets/epoch, "
+            f"beta={args.neg_weight:g}): {fit['neg_objective_init']:.6g} -> "
+            f"{fit['neg_objective_mean']:.6g} mean (want down)"
+        )
+    train_cap = retained_energy(
+        normalized, adjacency, train_patterns, X, theta, args.ridge, tau
+    )
+    test_cap = retained_energy(
+        normalized, adjacency, test_patterns, X, theta, args.ridge, tau
+    )
+    LOGGER.info(
+        f"  [tau={tau:g}] retained M_tau-energy  train: min={train_cap['min_capture']:.3f} "
+        f"mean={train_cap['mean_capture']:.3f}   "
+        f"test: min={test_cap['min_capture']:.3f} "
+        f"mean={test_cap['mean_capture']:.3f}"
+    )
+
+    # 5. embedding + target subspace R = span(Z) (tau-independent) ------------
+    basis = build_bank_subspace(normalized, X, theta)
+
+    # 6. Loukas RSA coarsening with the learned target ------------------------
+    if args.epsilon is not None:
+        coarsen_budget = dict(
+            reduction=args.reduction,
+            epsilon=args.epsilon,
+            epsilon_ramp_levels=args.epsilon_ramp_levels,
+        )
+    else:
+        coarsen_budget = dict(reduction=args.reduction)
+    coarsening = loukas_coarsen_pytorch(
+        adjacency,
+        basis,
+        method=args.coarsening_method,
+        laplacian=args.coarsening_laplacian,
+        max_levels=args.max_levels,
+        **coarsen_budget,
+    )
+    LOGGER.info(
+        f"  [tau={tau:g}] coarsening: N={coarsening.n_original} -> n_coarse="
+        f"{coarsening.n_coarse}  levels={len(coarsening.sigmas)}  "
+        f"epsilon={coarsening.epsilon:.4g} (RSA exact; bound "
+        f"{coarsening.epsilon_bound:.4g})"
+    )
+
+    # negative separation diagnostic on a fresh batch of repellers
+    neg_share_mean = None
+    if neg_sampler is not None:
+        n2s = coarsening.node_to_supernode
+        shares = []
+        for nodes in neg_sampler():
+            sup = n2s[torch.as_tensor(nodes, dtype=torch.long)]
+            _, counts = torch.unique(sup, return_counts=True)
+            shares.append(float(counts.max()) / len(nodes))
+        if shares:
+            neg_share_mean = float(np.mean(shares))
+            LOGGER.info(
+                f"  [tau={tau:g}] neg co-coarsen: mean dominant-supernode share "
+                f"{neg_share_mean:.3f} (lower = better separated)"
+            )
+
+    # 7. recall / precision / detection rate ----------------------------------
+    splits = {"train": train_patterns, "test": test_patterns, "all": patterns}
+    report = {}
+    for name, split in splits.items():
+        metrics = _alert_metrics(
+            split, coarsening.node_to_supernode, graph.y, args.threshold
+        )
+        report[name] = {
+            "detection_rate": metrics.get("detection_rate"),
+            "mean_recall": metrics.get("mean_recall"),
+            "mean_precision": metrics.get("mean_precision"),
+            "detected": metrics.get("detected"),
+            "total": metrics.get("total"),
+        }
+
+    header = f"  {'split':<6} {'recall':>8} {'precision':>10} {'detection':>10} {'det/tot':>9}"
+    LOGGER.info(header)
+    LOGGER.info("  " + "-" * (len(header) - 2))
+    for name in ("train", "test", "all"):
+        r = report[name]
+        LOGGER.info(
+            f"  {name:<6} {(r['mean_recall'] or 0):>8.3f} "
+            f"{(r['mean_precision'] or 0):>10.3f} "
+            f"{(r['detection_rate'] or 0):>10.1%} "
+            f"{r['detected']:>4}/{r['total']:<4}"
+        )
+
+    # --- persist JSON + plot --------------------------------------------------
+    json_out = out_dir / f"collective_bank_detection{suffix}.json"
+    plot_out = out_dir / f"collective_bank_detection{suffix}.png"
+    json_out.write_text(
+        json.dumps(
+            {
+                "config": vars(args) | {"output": str(out_dir), "tau": tau},
+                "learning": {
+                    "tau": tau,
+                    "lambda_min_gamma_init": fit["init_objective"],
+                    "lambda_min_gamma_final": fit["objective"],
+                    "neg_softmax_lambda_max_init": fit.get("neg_objective_init"),
+                    "neg_softmax_lambda_max_mean": fit.get("neg_objective_mean"),
+                    "theta": theta.detach().cpu().tolist(),
+                    "train_capture": train_cap,
+                    "test_capture": test_cap,
+                },
+                "coarsening": {
+                    "n_original": coarsening.n_original,
+                    "n_coarse": coarsening.n_coarse,
+                    "reduction": coarsening.reduction,
+                    "epsilon": coarsening.epsilon,
+                    "n_levels": len(coarsening.sigmas),
+                },
+                "detection": report,
+                "negatives": {
+                    "num_sets_per_epoch": args.num_neg_motifs,
+                    "resampled_each_epoch": neg_sampler is not None,
+                    "weight": args.neg_weight,
+                    "temperature": args.neg_temperature,
+                    "co_coarsen_mean_share": neg_share_mean,
+                },
+            },
+            indent=2,
+            default=str,
+        )
+        + "\n"
+    )
+    _save_plot(report, args, fit, plot_out, tau=tau)
+    LOGGER.info(f"  [tau={tau:g}] JSON: {json_out}")
+
+    return {
+        "tau": tau,
+        "lambda_min_init": fit["init_objective"],
+        "lambda_min_final": fit["objective"],
+        "train_min_capture": train_cap["min_capture"],
+        "train_mean_capture": train_cap["mean_capture"],
+        "test_min_capture": test_cap["min_capture"],
+        "test_mean_capture": test_cap["mean_capture"],
+        "n_coarse": coarsening.n_coarse,
+        "epsilon": coarsening.epsilon,
+        "neg_share_mean": neg_share_mean,
+        "report": report,
+    }
+
+
+def _log_tau_sweep(summaries: list) -> None:
+    """Print a compact comparison table across the swept ``tau`` values."""
+
+    LOGGER.info("\nM_tau sweep (comparison across tau)")
+    header = (
+        f"  {'tau':>8} {'lam_min':>9} {'train_cap':>10} {'test_cap':>9} "
+        f"{'det_all':>8} {'n_coarse':>9}"
+    )
+    LOGGER.info(header)
+    LOGGER.info("  " + "-" * (len(header) - 2))
+    for s in summaries:
+        det = s["report"]["all"]["detection_rate"] or 0.0
+        LOGGER.info(
+            f"  {s['tau']:>8.3g} {s['lambda_min_final']:>9.4f} "
+            f"{s['train_min_capture']:>10.3f} {s['test_min_capture']:>9.3f} "
+            f"{det:>8.1%} {s['n_coarse']:>9}"
+        )
+
+
+def _save_tau_sweep_plot(summaries: list, args, output: Path) -> None:
+    """Two-panel figure: collective margin/capture and detection rate vs tau."""
+
+    taus = [s["tau"] for s in summaries]
+    lam = [s["lambda_min_final"] for s in summaries]
+    train_cap = [s["train_min_capture"] for s in summaries]
+    test_cap = [s["test_min_capture"] for s in summaries]
+    det = [(s["report"]["all"]["detection_rate"] or 0.0) for s in summaries]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    ax = axes[0]
+    ax.plot(taus, lam, "o-", label=r"$\lambda_{\min}(\Gamma)$")
+    ax.plot(taus, train_cap, "s--", label="min capture (train)")
+    ax.plot(taus, test_cap, "^--", label="min capture (test)")
+    ax.set_xlabel(r"$\tau$")
+    ax.set_ylabel("energy / margin")
+    ax.set_title(r"Collective margin vs screening $\tau$")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+
+    ax = axes[1]
+    ax.plot(taus, det, "o-", color="tab:green")
+    ax.set_xlabel(r"$\tau$")
+    ax.set_ylabel("detection rate (all)")
+    ax.set_ylim(0, 1.05)
+    ax.set_title(r"Detection vs screening $\tau$")
+    ax.grid(alpha=0.3)
+
+    fig.suptitle(
+        f"{args.num_motifs}x {args.motif_type} (size {args.motif_size})  "
+        f"reduction {args.reduction:.0%}  {args.coarsening_laplacian}"
+    )
+    fig.tight_layout()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def main() -> None:
@@ -573,6 +863,14 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=1200)
     parser.add_argument("--learning-rate", type=float, default=0.05)
     parser.add_argument("--ridge", type=float, default=1e-4)
+    parser.add_argument(
+        "--tau",
+        default="0.5",
+        help="screened metric M_tau = L + tau*I; energy/objective is measured in "
+        "||x||^2_{M_tau} = ||x||_L^2 + tau*||x||_2^2 (tau=0 -> L_sym seminorm, "
+        "tau->inf -> l2). Pass one value, or a comma-separated list "
+        "(e.g. 0,0.1,0.3,1.0) to sweep and compare across tau.",
+    )
     # negative "repeller" sets (random background neighborhoods)
     parser.add_argument(
         "--num-neg-motifs",
@@ -697,7 +995,7 @@ def main() -> None:
             rng=np.random.default_rng(args.seed + 1),
         )
 
-    LOGGER.info("\nCollective learnable filter-bank detection (L_sym metric)")
+    LOGGER.info("\nCollective learnable filter-bank detection (M_tau metric)")
     _motif_desc = f"{args.motif_type}(size {args.motif_size}" + (
         f", density {args.motif_density:.2f})" if args.motif_type == "random" else ")"
     )
@@ -716,171 +1014,66 @@ def main() -> None:
         f"coarsening={args.coarsening_method}/{args.coarsening_laplacian}"
     )
 
-    # 4. learn the filter bank on the training motifs -------------------------
-    fit = fit_collective_bank(
-        normalized,
-        adjacency,
-        train_patterns,
-        X,
-        degree=args.degree,
-        epochs=args.epochs,
-        learning_rate=args.learning_rate,
-        ridge=args.ridge,
-        fit_seed=args.seed,
-        neg_sampler=neg_sampler,
-        neg_weight=args.neg_weight,
-        neg_temperature=args.neg_temperature,
-        neg_project=args.neg_project,
-        neg_sharpen=args.neg_sharpen,
-    )
-    theta = fit["theta"]
-    LOGGER.info(
-        f"  lambda_min(Gamma) train: {fit['init_objective']:.6g} -> "
-        f"{fit['objective']:.6g}"
-    )
-    if neg_sampler is not None:
-        LOGGER.info(
-            f"  neg softmax-lambda_max ({args.num_neg_motifs} sets/epoch, "
-            f"beta={args.neg_weight:g}): {fit['neg_objective_init']:.6g} -> "
-            f"{fit['neg_objective_mean']:.6g} mean (want down)"
-        )
-    train_cap = retained_energy(
-        normalized, adjacency, train_patterns, X, theta, args.ridge
-    )
-    test_cap = retained_energy(
-        normalized, adjacency, test_patterns, X, theta, args.ridge
-    )
-    LOGGER.info(
-        f"  retained L-energy  train: min={train_cap['min_capture']:.3f} "
-        f"mean={train_cap['mean_capture']:.3f}   "
-        f"test: min={test_cap['min_capture']:.3f} "
-        f"mean={test_cap['mean_capture']:.3f}"
-    )
-
-    # 5. embedding + target subspace R = span(Z) ------------------------------
-    basis = build_bank_subspace(normalized, X, theta)
-
-    # 6. Loukas RSA coarsening with the learned target ------------------------
-    if args.epsilon is not None:
-        # drive by the distortion budget: make the reduction cap non-binding
-        # (n_target = 1) so epsilon is the sole stopping criterion.
-        coarsen_budget = dict(
-            reduction=args.reduction,
-            # reduction=1.0 - 1.0 / adjacency.shape[0],
-            epsilon=args.epsilon,
-            epsilon_ramp_levels=args.epsilon_ramp_levels,
-        )
-    else:
-        coarsen_budget = dict(reduction=args.reduction)
-    coarsening = loukas_coarsen_pytorch(
-        adjacency,
-        basis,
-        method=args.coarsening_method,
-        laplacian=args.coarsening_laplacian,
-        max_levels=args.max_levels,
-        **coarsen_budget,
-    )
-    LOGGER.info(
-        f"  coarsening: N={coarsening.n_original} -> n_coarse="
-        f"{coarsening.n_coarse}  levels={len(coarsening.sigmas)}  "
-        f"epsilon={coarsening.epsilon:.4g} (RSA exact; bound "
-        f"{coarsening.epsilon_bound:.4g})"
-    )
-
-    # negative separation diagnostic on a *fresh* batch of repellers: how much
-    # each blob collapsed into one supernode (lower dominant share = better).
-    neg_share_mean = None
-    if neg_sampler is not None:
-        n2s = coarsening.node_to_supernode
-        shares = []
-        for nodes in neg_sampler():
-            sup = n2s[torch.as_tensor(nodes, dtype=torch.long)]
-            _, counts = torch.unique(sup, return_counts=True)
-            shares.append(float(counts.max()) / len(nodes))
-        if shares:
-            neg_share_mean = float(np.mean(shares))
-            LOGGER.info(
-                f"  neg co-coarsen: mean dominant-supernode share {neg_share_mean:.3f} "
-                f"(lower = better separated)"
-            )
-
-    # 7. recall / precision / detection rate ----------------------------------
-    splits = {
-        "train": train_patterns,
-        "test": test_patterns,
-        "all": patterns,
-    }
-    report = {}
-    for name, split in splits.items():
-        metrics = _alert_metrics(
-            split, coarsening.node_to_supernode, graph.y, args.threshold
-        )
-        report[name] = {
-            "detection_rate": metrics.get("detection_rate"),
-            "mean_recall": metrics.get("mean_recall"),
-            "mean_precision": metrics.get("mean_precision"),
-            "detected": metrics.get("detected"),
-            "total": metrics.get("total"),
-        }
-
-    header = f"  {'split':<6} {'recall':>8} {'precision':>10} {'detection':>10} {'det/tot':>9}"
-    LOGGER.info(header)
-    LOGGER.info("  " + "-" * (len(header) - 2))
-    for name in ("train", "test", "all"):
-        r = report[name]
-        LOGGER.info(
-            f"  {name:<6} {(r['mean_recall'] or 0):>8.3f} "
-            f"{(r['mean_precision'] or 0):>10.3f} "
-            f"{(r['detection_rate'] or 0):>10.1%} "
-            f"{r['detected']:>4}/{r['total']:<4}"
-        )
-
-    # --- persist JSON + plot --------------------------------------------------
+    # --- switch metric to M_tau = L + tau*I; optionally sweep several tau -----
+    taus = _parse_taus(args.tau)
     out_dir = Path(args.output) if args.output else Path(save_path)
     out_dir.mkdir(parents=True, exist_ok=True)
-    json_out = out_dir / "collective_bank_detection.json"
-    plot_out = out_dir / "collective_bank_detection.png"
-    json_out.write_text(
-        json.dumps(
-            {
-                "config": vars(args) | {"output": str(out_dir)},
-                "learning": {
-                    "lambda_min_gamma_init": fit["init_objective"],
-                    "lambda_min_gamma_final": fit["objective"],
-                    "neg_softmax_lambda_max_init": fit.get("neg_objective_init"),
-                    "neg_softmax_lambda_max_mean": fit.get("neg_objective_mean"),
-                    "theta": theta.detach().cpu().tolist(),
-                    "train_capture": train_cap,
-                    "test_capture": test_cap,
-                },
-                "coarsening": {
-                    "n_original": coarsening.n_original,
-                    "n_coarse": coarsening.n_coarse,
-                    "reduction": coarsening.reduction,
-                    "epsilon": coarsening.epsilon,
-                    "n_levels": len(coarsening.sigmas),
-                },
-                "detection": report,
-                "negatives": {
-                    "num_sets_per_epoch": args.num_neg_motifs,
-                    "resampled_each_epoch": neg_sampler is not None,
-                    "weight": args.neg_weight,
-                    "temperature": args.neg_temperature,
-                    "co_coarsen_mean_share": neg_share_mean,
-                },
-            },
-            indent=2,
-            default=str,
-        )
-        + "\n"
+    sweep = len(taus) > 1
+    LOGGER.info(
+        f"  metric: M_tau = L + tau*I   tau="
+        + ", ".join(f"{t:g}" for t in taus)
+        + ("  (sweep)" if sweep else "")
     )
-    _save_plot(report, args, fit, plot_out)
 
-    LOGGER.info(f"\nJSON report:  {json_out}")
-    LOGGER.info(f"Plot:         {plot_out}")
+    summaries = []
+    for tau in taus:
+        tag = f"{tau:g}".replace(".", "p").replace("-", "m") if sweep else ""
+        if sweep:
+            LOGGER.info(f"\n=== tau = {tau:g} ===")
+        summaries.append(
+            run_for_tau(
+                tau,
+                normalized=normalized,
+                adjacency=adjacency,
+                X=X,
+                graph=graph,
+                patterns=patterns,
+                train_patterns=train_patterns,
+                test_patterns=test_patterns,
+                neg_sampler=neg_sampler,
+                args=args,
+                out_dir=out_dir,
+                tag=tag,
+            )
+        )
+
+    if sweep:
+        _log_tau_sweep(summaries)
+        sweep_png = out_dir / "collective_bank_detection_tausweep.png"
+        sweep_json = out_dir / "collective_bank_detection_tausweep.json"
+        _save_tau_sweep_plot(summaries, args, sweep_png)
+        sweep_json.write_text(
+            json.dumps(
+                {
+                    "config": vars(args) | {"output": str(out_dir)},
+                    "sweep": [
+                        {k: v for k, v in s.items() if k != "report"}
+                        | {"detection": s["report"]}
+                        for s in summaries
+                    ],
+                },
+                indent=2,
+                default=str,
+            )
+            + "\n"
+        )
+        LOGGER.info(f"\nSweep JSON: {sweep_json}")
+        LOGGER.info(f"Sweep plot: {sweep_png}")
+    else:
+        LOGGER.info(f"\nOutput dir: {out_dir}")
 
 
-def _save_plot(report: dict, args, fit: dict, output: Path) -> None:
+def _save_plot(report: dict, args, fit: dict, output: Path, tau: float = 0.0) -> None:
     """Two-panel figure: detection metrics per split and the training curve."""
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
@@ -910,7 +1103,8 @@ def _save_plot(report: dict, args, fit: dict, output: Path) -> None:
     ax.set_ylabel("score")
     ax.set_title(
         f"{args.num_motifs}x {args.motif_type} (size {args.motif_size})  "
-        f"reduction {args.reduction:.0%}  {args.coarsening_laplacian}"
+        f"reduction {args.reduction:.0%}  {args.coarsening_laplacian}  "
+        rf"$\tau$={tau:g}"
     )
     ax.legend(fontsize=8)
     ax.grid(axis="y", alpha=0.3)
