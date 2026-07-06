@@ -682,14 +682,20 @@ def plot_energy_by_size_all_types(
             if std_e is not None:
                 s_sm = _smoothed(std_e, smooth_window)
                 ax.fill_between(
-                    x, np.maximum(0, e_sm - s_sm), e_sm + s_sm,
-                    alpha=0.15, color=MOTIF_COLORS[mtype],
+                    x,
+                    np.maximum(0, e_sm - s_sm),
+                    e_sm + s_sm,
+                    alpha=0.15,
+                    color=MOTIF_COLORS[mtype],
                 )
             cum = cumulative_energy(energy)
             k50 = k_threshold(cum, 0.50)
             k90 = k_threshold(cum, 0.90)
             ax.plot(
-                x, e_sm, color=MOTIF_COLORS[mtype], lw=1.6,
+                x,
+                e_sm,
+                color=MOTIF_COLORS[mtype],
+                lw=1.6,
                 label=f"{mtype} (k50={k50}, k90={k90})",
             )
             ax.axvline(k50, color=MOTIF_COLORS[mtype], ls=":", lw=1.0, alpha=0.6)
@@ -699,12 +705,16 @@ def plot_energy_by_size_all_types(
         # shared random baseline (same node-set size → essentially type-independent)
         ref = results[(present[0], size, n_reps)]
         b_sm = _smoothed(ref["baseline"], smooth_window)
-        ax.plot(np.arange(len(b_sm)), b_sm, color="grey", lw=1.2, ls="--",
-                label="random baseline")
-
-        ax.set_title(
-            f"size={size}  (planted: {ref['n_planted']})", fontsize=10
+        ax.plot(
+            np.arange(len(b_sm)),
+            b_sm,
+            color="grey",
+            lw=1.2,
+            ls="--",
+            label="random baseline",
         )
+
+        ax.set_title(f"size={size}  (planted: {ref['n_planted']})", fontsize=10)
         ax.set_xlabel("Eigenvector index  k  (sorted by eigenvalue)")
         ax.set_ylabel("Energy  (u_k^T v)²")
         ax.legend(fontsize=7, loc="upper right")
@@ -755,9 +765,7 @@ def plot_energy_compare_types(
                 f"{mtype}  (m1={m1:.3g}, σ²={sig2:.3g}, γ={gam:.1f}; "
                 f"k50={k50}, k90={k90})"
             )
-            moment_lines.append(
-                f"{mtype:<6} m1={m1:.4f}  σ²={sig2:.4f}  γ={gam:.2f}"
-            )
+            moment_lines.append(f"{mtype:<6} m1={m1:.4f}  σ²={sig2:.4f}  γ={gam:.2f}")
         else:
             lbl = f"{mtype}  (k50={k50}, k90={k90})"
         std_e = res.get("std_energy")
@@ -800,8 +808,10 @@ def plot_energy_compare_types(
 
     # ── mean / variance / skewness box (theory: m1=ϕ, σ²=2ϕ−ϕ² are type-indep.) ──
     if moment_lines:
-        any_key = next(((m, size, n_reps) for m in MOTIF_TYPES
-                        if (m, size, n_reps) in results), None)
+        any_key = next(
+            ((m, size, n_reps) for m in MOTIF_TYPES if (m, size, n_reps) in results),
+            None,
+        )
         ref = results[any_key]
         phi = ref.get("phi")
         head = "Energy moments (measured)"
@@ -1152,14 +1162,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--n_nodes",
         type=int,
-        default=5000,
+        default=2000,
         help="Number of nodes in the BA graph (default: 5000)",
     )
     p.add_argument(
         "--ba_m",
         type=int,
-        default=2,
-        help="BA model m: edges to attach per new node (default: 2)",
+        default=1,
+        help="BA model m: edges to attach per new node (default: 1)",
     )
     p.add_argument("--seed", type=int, default=42, help="Global random seed")
     p.add_argument(
@@ -1366,8 +1376,13 @@ def main() -> None:
         if size >= N:
             return None
         G_planted, motif_node_sets = plant_patterns_in_graph(
-            G_base, mtype, size, n_reps,
-            strategy=args.planting, bridges=args.bridges, seed=trial_seed + idx,
+            G_base,
+            mtype,
+            size,
+            n_reps,
+            strategy=args.planting,
+            bridges=args.bridges,
+            seed=trial_seed + idx,
         )
         n_planted = len(motif_node_sets)
         if n_planted == 0:
@@ -1384,13 +1399,21 @@ def main() -> None:
             "meas": meas,
             "theo": theo,
             "row": {
-                "trial": trial, "motif_type": mtype, "size": size, "reps": n_reps,
-                "bridges": args.bridges, "delta_br": theo["delta_br"],
-                "phi_measured": meas["phi"], "phi_theory": args.bridges / size,
+                "trial": trial,
+                "motif_type": mtype,
+                "size": size,
+                "reps": n_reps,
+                "bridges": args.bridges,
+                "delta_br": theo["delta_br"],
+                "phi_measured": meas["phi"],
+                "phi_theory": args.bridges / size,
                 "regime_ok": theo["regime_ok"],
-                "m1_measured": meas["m1"], "m1_theory": theo["m1"],
-                "sigma2_measured": meas["sigma2"], "sigma2_theory": theo["sigma2"],
-                "gamma_measured": meas["gamma"], "gamma_theory": theo["gamma"],
+                "m1_measured": meas["m1"],
+                "m1_theory": theo["m1"],
+                "sigma2_measured": meas["sigma2"],
+                "sigma2_theory": theo["sigma2"],
+                "gamma_measured": meas["gamma"],
+                "gamma_theory": theo["gamma"],
             },
             "mean_e": None,
             "baseline": None,

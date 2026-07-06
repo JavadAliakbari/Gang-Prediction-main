@@ -19,7 +19,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence
 
 import json
 import math
@@ -45,6 +45,7 @@ class LoukasCoarseningResult:
     n_original: int
     n_coarse: int
     epsilon: float
+    epsilon_bound: float
     sigmas: List[float]
     sizes: List[int]
 
@@ -115,6 +116,48 @@ def _laplacian(adjacency: torch.Tensor) -> torch.Tensor:
         (n, n),
         dtype=adjacency.dtype,
         device=adjacency.device,
+    ).coalesce()
+
+
+def _normalized_laplacian(
+    adjacency: torch.Tensor, *, add_self_loops: bool = True
+) -> torch.Tensor:
+    """Return the symmetric normalized Laplacian ``L_sym = I - A_hat``.
+
+    This is the metric the collective learnable-filter objective is derived in
+    (``L = I - A_hat`` of the analysis), as opposed to the combinatorial
+    ``L = D - W`` of :func:`_laplacian`.  With ``add_self_loops`` (the
+    renormalization trick, matching :func:`src.sgc_detection.normalized_adjacency`)
+    the operator is ``I - D_tilde^{-1/2}(W + I) D_tilde^{-1/2}`` with
+    ``D_tilde = D + I``; otherwise it is the classical
+    ``I - D^{-1/2} W D^{-1/2}``.  Off-diagonal entries are ``-A_hat_ij`` and the
+    diagonal is ``1 - A_hat_ii``, so every eigenvalue lies in ``[0, 2]``.
+    """
+
+    n = adjacency.shape[0]
+    device, dtype = adjacency.device, adjacency.dtype
+    indices = adjacency.indices()
+    values = adjacency.values()
+    off_diagonal = indices[0] != indices[1]
+    indices, values = indices[:, off_diagonal], values[off_diagonal]
+
+    if add_self_loops:
+        loop = torch.arange(n, device=device)
+        indices = torch.cat((indices, torch.stack((loop, loop))), dim=1)
+        values = torch.cat((values, torch.ones(n, dtype=dtype, device=device)))
+
+    degree = torch.zeros(n, dtype=dtype, device=device)
+    degree.scatter_add_(0, indices[0], values)
+    inv_sqrt = degree.clamp_min(torch.finfo(dtype).eps).rsqrt()
+    a_hat_values = values * inv_sqrt[indices[0]] * inv_sqrt[indices[1]]
+
+    # L = I - A_hat: negate the (self-loop-augmented) A_hat entries and add the
+    # identity on the diagonal.  Coalescing sums the +1 with any -A_hat_ii entry.
+    loop = torch.arange(n, device=device)
+    lap_indices = torch.cat((indices, torch.stack((loop, loop))), dim=1)
+    lap_values = torch.cat((-a_hat_values, torch.ones(n, dtype=dtype, device=device)))
+    return torch.sparse_coo_tensor(
+        lap_indices, lap_values, (n, n), dtype=dtype, device=device
     ).coalesce()
 
 
@@ -303,6 +346,8 @@ def _edge_partition(
     target_basis: torch.Tensor,
     n_target: int,
     sigma_max: float,
+    *,
+    laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
 ) -> tuple[torch.Tensor, float]:
     """Algorithm 2: greedy, edge-based local-variation contractions."""
 
@@ -313,7 +358,7 @@ def _edge_partition(
     if edge_i.numel() == 0:
         return torch.arange(n, device=adjacency.device), 0.0
 
-    A = _l_orthonormalize(target_basis, _laplacian(adjacency))
+    A = _l_orthonormalize(target_basis, laplacian_fn(adjacency))
     diff_sq = (A[edge_i] - A[edge_j]).square().sum(dim=1)
     degree = _degrees(adjacency)
     costs = 0.25 * degree[edge_i].add(degree[edge_j]).square() * diff_sq.square()
@@ -354,6 +399,7 @@ def _neighborhood_partition(
     sigma_max: float,
     *,
     max_set_size: int = 32,
+    laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
 ) -> tuple[torch.Tensor, float]:
     """Algorithm 2 with the *neighborhood* local-variation candidate family.
 
@@ -376,7 +422,7 @@ def _neighborhood_partition(
     if indices.numel() == 0:
         return torch.arange(n, device=adjacency.device), 0.0
 
-    A = _l_orthonormalize(target_basis, _laplacian(adjacency))
+    A = _l_orthonormalize(target_basis, laplacian_fn(adjacency))
     degree = _degrees(adjacency)
     eps = torch.finfo(A.dtype).eps
 
@@ -519,6 +565,7 @@ def _capped_partition(
     sigma_max: float,
     *,
     max_contraction_size: int = 4,
+    laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
 ) -> tuple[torch.Tensor, float]:
     """In-between candidate family: bounded contraction sets of size ``<= cap``.
 
@@ -536,7 +583,7 @@ def _capped_partition(
     if adjacency.indices().numel() == 0:
         return torch.arange(n, device=adjacency.device), 0.0
 
-    A = _l_orthonormalize(target_basis, _laplacian(adjacency))
+    A = _l_orthonormalize(target_basis, laplacian_fn(adjacency))
     degree = _degrees(adjacency)
     eps = torch.finfo(A.dtype).eps
     neighbors, weight = _adjacency_lists(adjacency)
@@ -604,6 +651,7 @@ def _star_partition(
     leaf_degree: int = 1,
     max_star_size: int = 64,
     min_spokes: int = 4,
+    laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
 ) -> tuple[torch.Tensor, float]:
     """Star-aware candidate family: a genuine-fan pre-pass, then edge matching.
 
@@ -630,7 +678,7 @@ def _star_partition(
     if indices.numel() == 0:
         return torch.arange(n, device=adjacency.device), 0.0
 
-    A = _l_orthonormalize(target_basis, _laplacian(adjacency))
+    A = _l_orthonormalize(target_basis, laplacian_fn(adjacency))
     degree = _degrees(adjacency)
     eps = torch.finfo(A.dtype).eps
     neighbors, weight = _adjacency_lists(adjacency)
@@ -717,7 +765,9 @@ def _kmeans_labels(
                 torch.randint(0, n, (1,), generator=generator, device=embedding.device)
             )
         else:
-            pick = int(torch.multinomial(dist_sq.clamp_min(0.0), 1, generator=generator))
+            pick = int(
+                torch.multinomial(dist_sq.clamp_min(0.0), 1, generator=generator)
+            )
         centers[c] = embedding[pick]
         dist_sq = torch.minimum(dist_sq, (embedding - centers[c]).square().sum(dim=1))
 
@@ -784,6 +834,7 @@ def _kmeans_partition(
     *,
     kmeans_iters: int = 10,
     kmeans_seed: int = 0,
+    laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
 ) -> tuple[torch.Tensor, float]:
     """Global, subspace-driven coarsening: k-means on the embedding + connectivity.
 
@@ -809,7 +860,7 @@ def _kmeans_partition(
     if n <= n_target or adjacency.indices().numel() == 0:
         return torch.arange(n, device=adjacency.device), 0.0
 
-    A = _l_orthonormalize(target_basis, _laplacian(adjacency))
+    A = _l_orthonormalize(target_basis, laplacian_fn(adjacency))
     k = max(1, min(int(n_target), n))
     generator = torch.Generator(device=adjacency.device)
     generator.manual_seed(int(kmeans_seed))
@@ -826,7 +877,9 @@ def _kmeans_partition(
     sigma_sq = 0.0
     for members in members_by_group.values():
         if len(members) >= 2:
-            sigma_sq += _local_variation_cost(members, A, degree, neighbors, weight, eps)
+            sigma_sq += _local_variation_cost(
+                members, A, degree, neighbors, weight, eps
+            )
     return groups, math.sqrt(sigma_sq)
 
 
@@ -837,26 +890,26 @@ def _linkage_partition(
     sigma_max: float,
     *,
     max_cluster_size: int = 0,
+    laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
 ) -> tuple[torch.Tensor, float]:
-    """Single-linkage agglomerative clustering on the local-variation cost graph.
+    """Cost-cheapest-first agglomerative clustering with a per-round ``A`` refresh.
 
-    This is the "weight the adjacency by edge cost, then cluster on the graph"
-    idea: edge cost is the Loukas single-edge local-variation cost
-    ``c_ij = w_ij ||A_i - A_j||^2`` on the ``L``-orthonormal embedding ``A``, and
-    union-find merges edge endpoints in *ascending cost* order until the component
-    count reaches ``n_target``.  Because only graph edges are ever unioned, every
-    cluster is connected **by construction** -- the connectivity guarantee that
-    plain embedding k-means lacked.
+    Edge cost is the Loukas single-edge local-variation cost
+    ``c_ij = w_ij ||A_i - A_j||^2`` on the ``L``-orthonormal embedding
+    ``A = B(B^T L B)^(-1/2)``.  Each *call* performs **one agglomeration round**:
+    a maximal cheapest-first *matching* (every node is contracted at most once)
+    in ascending cost order, subject to the per-level ``sigma_max`` RSA budget and
+    the optional ``max_cluster_size`` cap.  Only graph edges are ever unioned, so
+    every supernode is connected **by construction**.
 
-    Unlike the edge *matching* family (each node contracted at most once per
-    level, hence many levels and at most one spoke per hub), a cluster here grows
-    by accreting all of its cheap edges in a single global pass, so a hub can
-    absorb its whole star at once.  Caveat: single linkage can *chain* -- a path
-    of cheap edges links distant nodes into one large cluster -- which is its
-    classic failure mode and yields unbalanced, impure supernodes (it tanks
-    detection precision).  ``max_cluster_size > 0`` caps the merged size to curb
-    the chaining (size-constrained single linkage), keeping supernodes small and
-    pure.
+    The round boundary is the whole point: the outer level loop rebuilds
+    ``A = B_l (B_l^T L_l B_l)^(-1/2)`` (with ``B_l = P_l B_{l-1}``) on the freshly
+    coarsened graph before the next call, so merges are always scored against an
+    up-to-date embedding instead of one static ``A`` computed once for the entire
+    collapse.  Refreshing ``A`` between rounds is what curbs single-linkage
+    *chaining* -- a hub accretes at most one spoke per round rather than its whole
+    star against a stale embedding -- which keeps supernodes pure and lifts
+    detection precision.  ``max_cluster_size > 0`` further caps the merged size.
     """
 
     n = adjacency.shape[0]
@@ -866,7 +919,7 @@ def _linkage_partition(
     if edge_i.numel() == 0:
         return torch.arange(n, device=adjacency.device), 0.0
 
-    A = _l_orthonormalize(target_basis, _laplacian(adjacency))
+    A = _l_orthonormalize(target_basis, laplacian_fn(adjacency))
     weights = adjacency.values()[upper]
     cost = (weights * (A[edge_i] - A[edge_j]).square().sum(dim=1)).clamp_min(0.0)
     order = torch.argsort(cost).tolist()
@@ -874,6 +927,7 @@ def _linkage_partition(
 
     parent = list(range(n))
     size = [1] * n
+    matched = [False] * n  # each node is contracted at most once per round
     cap = max_cluster_size if (max_cluster_size and max_cluster_size > 0) else n
 
     def find(x: int) -> int:
@@ -884,12 +938,18 @@ def _linkage_partition(
             parent[x], x = root, parent[x]
         return root
 
+    # One agglomeration generation: merge disjoint cheapest edges (a maximal
+    # cheapest-first matching), then return so the outer level loop rebuilds ``A``
+    # on the freshly coarsened graph before the next round.
     n_comp, sigma_sq = n, 0.0
     sigma_limit_sq = math.inf if math.isinf(sigma_max) else sigma_max * sigma_max
     for e in order:
         if n_comp <= n_target:
             break
-        ra, rb = find(ei[e]), find(ej[e])
+        a, b = ei[e], ej[e]
+        if matched[a] or matched[b]:
+            continue
+        ra, rb = find(a), find(b)
         if ra == rb:
             continue
         if size[ra] + size[rb] > cap:
@@ -899,6 +959,7 @@ def _linkage_partition(
             break
         parent[ra] = rb
         size[rb] += size[ra]
+        matched[a] = matched[b] = True
         n_comp -= 1
         sigma_sq += c
 
@@ -933,6 +994,46 @@ def _reduce_basis(basis: torch.Tensor, groups: torch.Tensor) -> torch.Tensor:
     return reduced / counts
 
 
+def _exact_rsa_epsilon(
+    a0: torch.Tensor,
+    laplacian: torch.Tensor,
+    original_to_supernode: torch.Tensor,
+) -> float:
+    """Exact restricted-spectral-approximation constant of a coarsening.
+
+    The RSA definition (Loukas 2019, Def. 2) is the smallest ``epsilon`` with
+    ``||x - Pi x||_L <= epsilon ||x||_L`` for every ``x`` in the target subspace
+    ``R``, where ``Pi = P^+ P`` is the block-averaging projection onto vectors
+    that are constant on each supernode.  This is the *exact* worst-case
+    distortion of the cumulative coarsening -- not the looser per-level product
+    bound ``prod_l (1 + sigma_l) - 1``.
+
+    With ``a0`` an ``L``-orthonormal basis of ``R`` (``a0^T L a0 = I``), any
+    ``x = a0 c`` has ``||x||_L = ||c||``, so
+
+        epsilon^2 = max_c (c^T Y^T L Y c) / (c^T c) = lambda_max(Y^T L Y),
+
+    with ``Y = (I - Pi) a0`` -- each row of ``a0`` minus its supernode mean.
+    ``laplacian`` and ``a0`` are those of the *original* graph; only the
+    partition ``original_to_supernode`` changes across levels.
+    """
+
+    n_super = int(original_to_supernode.max().item()) + 1
+    counts = (
+        torch.bincount(original_to_supernode, minlength=n_super)
+        .to(dtype=a0.dtype)
+        .clamp_min(1.0)
+        .unsqueeze(1)
+    )
+    sums = torch.zeros(n_super, a0.shape[1], dtype=a0.dtype, device=a0.device)
+    sums.index_add_(0, original_to_supernode, a0)
+    residual = a0 - (sums / counts)[original_to_supernode]  # (I - Pi) a0
+    gram = residual.T @ torch.sparse.mm(laplacian, residual)
+    gram = 0.5 * (gram + gram.T)
+    top = torch.linalg.eigvalsh(gram)[-1].clamp_min(0.0)
+    return float(top.sqrt())
+
+
 def loukas_coarsen_pytorch(
     adjacency: torch.Tensor,
     target_basis: torch.Tensor,
@@ -949,6 +1050,7 @@ def loukas_coarsen_pytorch(
     kmeans_seed: int = 0,
     max_cluster_size: int = 8,
     epsilon_ramp_levels: int | None = None,
+    laplacian: str = "combinatorial",
 ) -> LoukasCoarseningResult:
     """Loukas Algorithm 1 using the supplied ``R=span(target_basis)``.
 
@@ -968,12 +1070,21 @@ def loukas_coarsen_pytorch(
       ``L``-orthonormal embedding (a bounded sub-optimal solver for the partition
       that best preserves ``R``), then connectivity splitting so supernodes stay
       connected.  See :func:`_kmeans_partition`.
-    * ``"linkage"`` -- single-linkage union-find on the cost-weighted graph: merge
-      edge endpoints cheapest-first until ``n_target`` components, connected by
-      construction (no fragmentation, hits the target in one pass).  See
-      :func:`_linkage_partition`.
+    * ``"linkage"`` -- cost-cheapest-first agglomerative matching on the
+      cost-weighted graph: one round per level, with ``A`` refreshed between
+      rounds so merges never chain against a stale embedding (connected by
+      construction).  See :func:`_linkage_partition`.
 
-    The cumulative RSA bound is ``prod_l (1 + sigma_l) - 1``.
+    ``laplacian`` chooses the metric the RSA distortion is measured in:
+    ``"combinatorial"`` (default) uses ``L = D - W`` (:func:`_laplacian`), while
+    ``"symmetric"`` (aliases ``"normalized"``, ``"sym"``) uses the symmetric
+    normalized ``L = I - A_hat`` (:func:`_normalized_laplacian`) -- the metric the
+    collective learnable-filter objective is derived in.
+
+    The cumulative distortion is the exact restricted-spectral-approximation
+    constant ``epsilon = max_{x in R} ||x - Pi x||_L / ||x||_L`` of the final
+    coarsening (:func:`_exact_rsa_epsilon`); the looser product estimate
+    ``prod_l (1 + sigma_l) - 1`` is kept as ``epsilon_bound`` for reference.
     """
 
     if not 0.0 <= reduction < 1.0:
@@ -983,15 +1094,27 @@ def loukas_coarsen_pytorch(
             "method must be 'edges', 'neighborhood', 'capped', 'star', 'kmeans', "
             "or 'linkage'"
         )
+    if laplacian in ("combinatorial", "comb"):
+        laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian
+    elif laplacian in ("symmetric", "normalized", "sym", "norm"):
+        laplacian_fn = _normalized_laplacian
+    else:
+        raise ValueError("laplacian must be 'combinatorial' or 'symmetric'")
     if method == "edges":
-        partition = _edge_partition
+        partition = partial(_edge_partition, laplacian_fn=laplacian_fn)
     elif method == "neighborhood":
-        partition = _neighborhood_partition
+        partition = partial(_neighborhood_partition, laplacian_fn=laplacian_fn)
     elif method == "linkage":
-        partition = partial(_linkage_partition, max_cluster_size=max_cluster_size)
+        partition = partial(
+            _linkage_partition,
+            max_cluster_size=max_cluster_size,
+            laplacian_fn=laplacian_fn,
+        )
     elif method == "capped":
         partition = partial(
-            _capped_partition, max_contraction_size=max_contraction_size
+            _capped_partition,
+            max_contraction_size=max_contraction_size,
+            laplacian_fn=laplacian_fn,
         )
     elif method == "star":
         partition = partial(
@@ -999,16 +1122,26 @@ def loukas_coarsen_pytorch(
             leaf_degree=leaf_degree,
             max_star_size=max_star_size,
             min_spokes=min_spokes,
+            laplacian_fn=laplacian_fn,
         )
     else:
         partition = partial(
-            _kmeans_partition, kmeans_iters=kmeans_iters, kmeans_seed=kmeans_seed
+            _kmeans_partition,
+            kmeans_iters=kmeans_iters,
+            kmeans_seed=kmeans_seed,
+            laplacian_fn=laplacian_fn,
         )
     n_original = adjacency.shape[0]
     n_target = max(1, int(round((1.0 - reduction) * n_original)))
     current_adjacency, basis = adjacency, target_basis
     original_to_current = torch.arange(n_original, device=adjacency.device)
-    epsilon_current = 0.0
+    # Exact RSA is measured against the *original* graph: ``a0`` is an
+    # ``L0``-orthonormal basis of ``R`` and ``l0`` its Laplacian, both fixed
+    # across levels (see :func:`_exact_rsa_epsilon`).
+    l0 = laplacian_fn(adjacency)
+    a0 = _l_orthonormalize(target_basis, l0)
+    epsilon_current = 0.0  # exact RSA(R) of the cumulative coarsening
+    epsilon_bound = 0.0  # legacy product estimate prod_l (1 + sigma_l) - 1
     sigmas: List[float] = []
     sizes = [n_original]
 
@@ -1034,7 +1167,9 @@ def loukas_coarsen_pytorch(
         # to cheap edge matching to refine the leftover fragments down to target
         # (re-clustering instead would inflate the RSA epsilon).
         level_partition = (
-            _edge_partition if (method == "kmeans" and level > 0) else partition
+            partial(_edge_partition, laplacian_fn=laplacian_fn)
+            if (method == "kmeans" and level > 0)
+            else partition
         )
         groups, sigma = level_partition(current_adjacency, basis, n_target, sigma_max)
         n_new = int(groups.max().item()) + 1
@@ -1044,7 +1179,8 @@ def loukas_coarsen_pytorch(
         original_to_current = groups[original_to_current]
         current_adjacency = _reduce_adjacency(current_adjacency, groups)
         basis = _reduce_basis(basis, groups)
-        epsilon_current = (1.0 + epsilon_current) * (1.0 + sigma) - 1.0
+        epsilon_current = _exact_rsa_epsilon(a0, l0, original_to_current)
+        epsilon_bound = (1.0 + epsilon_bound) * (1.0 + sigma) - 1.0
         sigmas.append(sigma)
         sizes.append(n_new)
 
@@ -1054,6 +1190,7 @@ def loukas_coarsen_pytorch(
         n_original=n_original,
         n_coarse=int(dense_ids.max().item()) + 1,
         epsilon=epsilon_current,
+        epsilon_bound=epsilon_bound,
         sigmas=sigmas,
         sizes=sizes,
     )
