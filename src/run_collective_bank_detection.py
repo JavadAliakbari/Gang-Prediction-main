@@ -79,7 +79,6 @@ from src.utils.utils import *
 from src.sgc_detection import propagation_stack
 from src.loukas_sgc_detection import (
     _degrees,
-    _orthonormal_range,
     evaluate_loukas_patterns,
     graph_operators,
     loukas_coarsen_pytorch,
@@ -147,6 +146,7 @@ def build_synthetic_graph(
     feature_dim: int,
     rng_seed: int,
     motif_density: float = 1.0,
+    motif_conductance: float = -1.0,
 ) -> tuple[Data, list]:
     """Erdos-Renyi background + ``num_motifs`` disjoint planted motifs.
 
@@ -154,6 +154,10 @@ def build_synthetic_graph(
     :class:`Pattern` objects (label ``"alert"``) for evaluation.  Node labels
     ``y`` mark every motif node as class 1 so the coarsening evaluation can pool
     pseudo-labels.
+
+    ``motif_conductance`` (when ``>= 0``) tunes each motif's conductance
+    ``Phi = cut/vol`` by adding random motif->host edges; a negative value leaves
+    the motifs as planted (disjoint, minimal conductance).
     """
 
     if num_motifs * motif_size > num_nodes:
@@ -186,6 +190,51 @@ def build_synthetic_graph(
         patterns.append(
             create_pattern(f"{motif_type}_{m}", nodes, motif_type, label="alert")
         )
+
+    # --- optional: tune each motif's conductance by wiring it to host nodes ---
+    # Phi(S) = cut(S)/vol(S).  Each added random motif->host edge raises both cut
+    # and vol by 1, so to hit a target Phi we solve k = (Phi*vol - cut)/(1 - Phi)
+    # from the motif's *current* (background + internal) cut/vol.  A negative
+    # target leaves the motifs as planted (disjoint, minimal conductance).
+    if motif_conductance is not None and motif_conductance >= 0.0:
+        if motif_conductance >= 1.0:
+            raise ValueError("motif_conductance must be < 1 (a conductance in [0, 1))")
+        motif_of = -np.ones(num_nodes, dtype=np.int64)
+        for m in range(num_motifs):
+            motif_of[motif_nodes[m]] = m
+        host_nodes = np.nonzero(motif_of < 0)[0]
+        if host_nodes.size == 0:
+            raise ValueError("no host nodes available to tune motif conductance")
+        cut = np.zeros(num_motifs, dtype=np.int64)
+        vol = np.zeros(num_motifs, dtype=np.int64)
+        for u, v in edges:
+            mu, mv = motif_of[u], motif_of[v]
+            if mu >= 0:
+                vol[mu] += 1
+            if mv >= 0:
+                vol[mv] += 1
+            if mu != mv:
+                if mu >= 0:
+                    cut[mu] += 1
+                if mv >= 0:
+                    cut[mv] += 1
+        for m in range(num_motifs):
+            k = int(
+                round((motif_conductance * vol[m] - cut[m]) / (1.0 - motif_conductance))
+            )
+            if k <= 0:  # already at/above target -- we only add, never cut
+                continue
+            nodes = motif_nodes[m]
+            added, attempts, cap = 0, 0, 20 * k + 100
+            while added < k and attempts < cap:
+                attempts += 1
+                u = int(rng.choice(nodes))
+                w = int(rng.choice(host_nodes))
+                e = (min(u, w), max(u, w))
+                if e in edges:
+                    continue
+                edges.add(e)
+                added += 1
 
     # --- undirected edge_index ----------------------------------------------
     edge_array = np.array(sorted(edges), dtype=np.int64).T  # (2, E)
@@ -530,13 +579,46 @@ def fit_collective_bank(
 
 
 def build_bank_subspace(
-    a_hat: torch.Tensor, X: torch.Tensor, theta: torch.Tensor
+    a_hat: torch.Tensor,
+    adjacency: torch.Tensor,
+    train_patterns: list,
+    X: torch.Tensor,
+    theta: torch.Tensor,
+    ridge: float,
+    tau: float = 0.0,
 ) -> torch.Tensor:
-    """Embedding ``Z = g_Theta(A_hat) X`` and orthonormal basis of ``R = span(Z)``."""
+    """Target handed to the coarsener: the ``M_tau``-projected gang indicators.
+
+    Per Remark C.18 the coarsener should preserve the *reconstructable* part of
+    each normalized gang indicator, ``z_hat_j = Pi^{M_tau}_{span Z} v_hat_{S_j}``,
+    not the whole embedding ``span(Z)``.  ``span(Z)`` (dimension ``d``) drags in
+    within-gang-varying directions that never carry a full indicator and only
+    waste the RSA budget; the ``m`` projected indicators (one per training gang)
+    are exactly the columns whose retained ``M_tau``-energy the learner drove up,
+    so they are the cheap, on-target thing to keep together.
+
+    ``Pi^{M_tau}_{span Z} = Z (Z^T M_tau Z)^+ Z^T M_tau`` is the ``M_tau``-orthogonal
+    projector onto ``span(Z)``; applied to ``v_hat_j`` it returns the same
+    reconstruction whose ``M_tau``-Gram is the ``Gamma`` the bank optimizes.  The
+    coarsener then ``M_tau``-orthonormalizes these columns internally.
+    """
+
+    eps = torch.finfo(a_hat.dtype).eps
+    V = degree_weighted_indicators(adjacency, train_patterns)  # (N, m)
+    l_v = _l_apply(a_hat, V)
+    phi = (V * l_v).sum(0).clamp_min(eps)  # Phi_j = ||v_j||_L^2
+    m_norm = (phi + tau).sqrt().unsqueeze(0)  # ||v_j||_{M_tau}
+    m_vhat = (l_v + tau * V) / m_norm  # M_tau v_hat_j                     (N, m)
 
     propagated = propagation_stack(a_hat, X, theta.shape[0] - 1)
-    Z = _filtered_bank(propagated, theta)
-    return _orthonormal_range(Z)
+    Z = _filtered_bank(propagated, theta)  # (N, d)
+    m_z = _m_apply(a_hat, Z, tau)  # M_tau Z                               (N, d)
+    g_z = Z.T @ m_z  # Z^T M_tau Z                                         (d, d)
+    g_z = 0.5 * (g_z + g_z.T)
+    rhs = Z.T @ m_vhat  # Z^T M_tau v_hat                                  (d, m)
+    eye = torch.eye(g_z.shape[0], dtype=g_z.dtype, device=g_z.device)
+    coeffs = torch.linalg.solve(g_z + ridge * eye, rhs)  # (Z^T M Z)^+ Z^T M v_hat
+    return Z @ coeffs  # Pi^{M_tau}_{span Z} v_hat                         (N, m)
 
 
 def retained_energy(
@@ -605,10 +687,11 @@ def run_for_tau(
     """Steps 4-7 for one screening level ``tau``: learn, coarsen, detect, persist.
 
     Everything is measured in the screened metric ``M_tau = L + tau*I``.  The
-    target subspace ``span(Z)`` handed to the coarsener is itself tau-independent
-    (the paper's observation), but the learned filter ``theta*`` -- and therefore
-    ``Z`` and the detection outcome -- does change with ``tau``.  Returns a compact
-    summary consumed by the multi-``tau`` comparison.
+    target handed to the coarsener is the ``M_tau``-projected gang indicators
+    ``z_hat_j = Pi^{M_tau}_{span Z} v_hat_{S_j}`` (Remark C.18), which *do* depend
+    on ``tau`` -- both through the learned filter ``theta*`` and through the
+    screened projector -- and the coarsening RSA is itself measured in ``M_tau``,
+    so the whole detection path is consistently screened.
     """
 
     suffix = f"_tau{tag}" if tag else ""
@@ -655,8 +738,10 @@ def run_for_tau(
         f"mean={test_cap['mean_capture']:.3f}"
     )
 
-    # 5. embedding + target subspace R = span(Z) (tau-independent) ------------
-    basis = build_bank_subspace(normalized, X, theta)
+    # 5. embedding + target R = M_tau-projected indicators (tau-dependent) ----
+    basis = build_bank_subspace(
+        normalized, adjacency, train_patterns, X, theta, args.ridge, tau
+    )
 
     # 6. Loukas RSA coarsening with the learned target ------------------------
     if args.epsilon is not None:
@@ -673,6 +758,7 @@ def run_for_tau(
         method=args.coarsening_method,
         laplacian=args.coarsening_laplacian,
         max_levels=args.max_levels,
+        tau=tau,
         **coarsen_budget,
     )
     LOGGER.info(
@@ -855,17 +941,25 @@ def main() -> None:
         help="edge density for --motif-type random (fraction of s(s-1)/2 possible "
         "edges; a spanning path is always added so the motif stays connected)",
     )
+    parser.add_argument(
+        "--motif-conductance",
+        type=float,
+        default=-1,
+        help="target conductance Phi=cut/vol per planted motif; adds random "
+        "motif->host edges to reach it (Phi in [0,1)). Negative = no extra edges "
+        "(leave motifs disjoint / minimal conductance).",
+    )
     parser.add_argument("--motif-size", type=int, default=25)
     parser.add_argument("--avg-degree", type=float, default=5.0)
     parser.add_argument("--feature-dim", type=int, default=64)
     parser.add_argument("--train-ratio", type=float, default=0.4)
     parser.add_argument("--degree", type=int, default=10, help="polynomial degree K")
-    parser.add_argument("--epochs", type=int, default=1200)
+    parser.add_argument("--epochs", type=int, default=1500)
     parser.add_argument("--learning-rate", type=float, default=0.05)
     parser.add_argument("--ridge", type=float, default=1e-4)
     parser.add_argument(
         "--tau",
-        default="0.5",
+        default="1.0",
         help="screened metric M_tau = L + tau*I; energy/objective is measured in "
         "||x||^2_{M_tau} = ||x||_L^2 + tau*||x||_2^2 (tau=0 -> L_sym seminorm, "
         "tau->inf -> l2). Pass one value, or a comma-separated list "
@@ -929,7 +1023,7 @@ def main() -> None:
         "--epsilon",
         type=float,
         # default=None,
-        default=5.0,
+        default=1,
         help="target RSA distortion budget prod_l(1+sigma_l)-1; when set it drives "
         "the coarsening (contract as much as possible until this bound is hit) and "
         "OVERRIDES --reduction",
@@ -969,6 +1063,7 @@ def main() -> None:
         feature_dim=args.feature_dim,
         rng_seed=args.seed,
         motif_density=args.motif_density,
+        motif_conductance=args.motif_conductance,
     )
     normalized, adjacency = graph_operators(graph)  # A_hat (sym-norm) and raw W
     X = graph.x.to(device=normalized.device, dtype=normalized.dtype)
@@ -996,9 +1091,12 @@ def main() -> None:
         )
 
     LOGGER.info("\nCollective learnable filter-bank detection (M_tau metric)")
-    _motif_desc = f"{args.motif_type}(size {args.motif_size}" + (
-        f", density {args.motif_density:.2f})" if args.motif_type == "random" else ")"
-    )
+    _motif_attrs = f"size {args.motif_size}"
+    if args.motif_type == "random":
+        _motif_attrs += f", density {args.motif_density:.2f}"
+    if args.motif_conductance is not None and args.motif_conductance >= 0.0:
+        _motif_attrs += f", phi~{args.motif_conductance:.2f}"
+    _motif_desc = f"{args.motif_type}({_motif_attrs})"
     # epsilon (RSA distortion budget) overrides the reduction-rate stopping rule
     if args.epsilon is not None:
         _budget_desc = f"epsilon<={args.epsilon:g}"

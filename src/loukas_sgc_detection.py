@@ -161,6 +161,33 @@ def _normalized_laplacian(
     ).coalesce()
 
 
+def _screened_metric(operator: torch.Tensor, tau: float) -> torch.Tensor:
+    """Return the screened metric ``M_tau = operator + tau I`` (Eq. 8/9).
+
+    ``operator`` is the base Laplacian (combinatorial ``L = D - W`` or symmetric
+    normalized ``L = I - A_hat``); adding ``tau`` on the diagonal turns the
+    ``L``-seminorm into the positive-definite screened norm
+    ``||x||^2_{M_tau} = ||x||^2_L + tau ||x||^2_2``.  ``tau = 0`` returns the
+    operator unchanged, so every RSA quantity reduces to the plain-``L`` metric.
+    """
+
+    if not tau:
+        return operator
+    n = operator.shape[0]
+    device, dtype = operator.device, operator.dtype
+    loop = torch.arange(n, device=device)
+    indices = torch.cat((operator.indices(), torch.stack((loop, loop))), dim=1)
+    values = torch.cat(
+        (
+            operator.values(),
+            torch.full((n,), float(tau), dtype=dtype, device=device),
+        )
+    )
+    return torch.sparse_coo_tensor(
+        indices, values, operator.shape, dtype=dtype, device=device
+    ).coalesce()
+
+
 def build_sgc_subspace(
     normalized_adjacency_: torch.Tensor,
     theta: torch.Tensor,
@@ -348,6 +375,7 @@ def _edge_partition(
     sigma_max: float,
     *,
     laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
+    tau: float = 0.0,
 ) -> tuple[torch.Tensor, float]:
     """Algorithm 2: greedy, edge-based local-variation contractions."""
 
@@ -362,6 +390,10 @@ def _edge_partition(
     diff_sq = (A[edge_i] - A[edge_j]).square().sum(dim=1)
     degree = _degrees(adjacency)
     costs = 0.25 * degree[edge_i].add(degree[edge_j]).square() * diff_sq.square()
+    if tau:
+        d_sum = degree[edge_i].add(degree[edge_j])
+        frob = (degree[edge_i].square() + degree[edge_j].square()) / d_sum.square()
+        costs = costs + tau * frob * diff_sq
     order = torch.argsort(costs)
 
     marked = torch.zeros(n, dtype=torch.bool, device=adjacency.device)
@@ -400,6 +432,7 @@ def _neighborhood_partition(
     *,
     max_set_size: int = 32,
     laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
+    tau: float = 0.0,
 ) -> tuple[torch.Tensor, float]:
     """Algorithm 2 with the *neighborhood* local-variation candidate family.
 
@@ -465,7 +498,10 @@ def _neighborhood_partition(
 
         p_vec = (d_C / d_C.sum().clamp_min(eps)).unsqueeze(1)
         residual = A_C - (p_vec * A_C).sum(dim=0, keepdim=True)
-        cost = torch.trace(residual.T @ (local_laplacian @ residual)) / (size - 1)
+        energy = torch.trace(residual.T @ (local_laplacian @ residual))
+        if tau:
+            energy = energy + tau * residual.square().sum()
+        cost = energy / (size - 1)
         candidate_sets.append(members)
         candidate_costs.append(float(cost.clamp_min(0.0)))
 
@@ -526,6 +562,7 @@ def _local_variation_cost(
     neighbors: List[List[int]],
     weight: Dict[tuple[int, int], float],
     eps: float,
+    tau: float = 0.0,
 ) -> float:
     """Loukas local-variation cost ``c(C) = trace(R.T L_C R) / (|C| - 1)``.
 
@@ -554,7 +591,12 @@ def _local_variation_cost(
             local_laplacian[b, a] -= w
     p_vec = (d_C / d_C.sum().clamp_min(eps)).unsqueeze(1)
     residual = A_C - (p_vec * A_C).sum(dim=0, keepdim=True)
-    cost = torch.trace(residual.T @ (local_laplacian @ residual)) / max(size - 1, 1)
+    # Remark C.30: screened local-variation cost is the L-Dirichlet energy of the
+    # discarded residual plus ``tau`` times its squared Frobenius (l2) norm.
+    energy = torch.trace(residual.T @ (local_laplacian @ residual))
+    if tau:
+        energy = energy + tau * residual.square().sum()
+    cost = energy / max(size - 1, 1)
     return float(cost.clamp_min(0.0))
 
 
@@ -566,6 +608,7 @@ def _capped_partition(
     *,
     max_contraction_size: int = 4,
     laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
+    tau: float = 0.0,
 ) -> tuple[torch.Tensor, float]:
     """In-between candidate family: bounded contraction sets of size ``<= cap``.
 
@@ -607,7 +650,7 @@ def _capped_partition(
             continue
         candidate_sets.append(members)
         candidate_costs.append(
-            _local_variation_cost(members, A, degree, neighbors, weight, eps)
+            _local_variation_cost(members, A, degree, neighbors, weight, eps, tau)
         )
 
     if not candidate_sets:
@@ -652,6 +695,7 @@ def _star_partition(
     max_star_size: int = 64,
     min_spokes: int = 4,
     laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
+    tau: float = 0.0,
 ) -> tuple[torch.Tensor, float]:
     """Star-aware candidate family: a genuine-fan pre-pass, then edge matching.
 
@@ -706,7 +750,7 @@ def _star_partition(
         if len(spokes) < max(2, min_spokes):
             continue
         members = [hub, *dict.fromkeys(spokes)][:max_star_size]
-        cost = _local_variation_cost(members, A, degree, neighbors, weight, eps)
+        cost = _local_variation_cost(members, A, degree, neighbors, weight, eps, tau)
         if sigma_sq + cost > sigma_limit_sq:
             continue
         for member in members:
@@ -722,6 +766,10 @@ def _star_partition(
     if edge_i.numel() > 0:
         diff_sq = (A[edge_i] - A[edge_j]).square().sum(dim=1)
         costs = 0.25 * degree[edge_i].add(degree[edge_j]).square() * diff_sq.square()
+        if tau:
+            d_sum = degree[edge_i].add(degree[edge_j])
+            frob = (degree[edge_i].square() + degree[edge_j].square()) / d_sum.square()
+            costs = costs + tau * frob * diff_sq
         for edge in torch.argsort(costs).tolist():
             if n_current <= n_target:
                 break
@@ -835,6 +883,7 @@ def _kmeans_partition(
     kmeans_iters: int = 10,
     kmeans_seed: int = 0,
     laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
+    tau: float = 0.0,
 ) -> tuple[torch.Tensor, float]:
     """Global, subspace-driven coarsening: k-means on the embedding + connectivity.
 
@@ -878,7 +927,7 @@ def _kmeans_partition(
     for members in members_by_group.values():
         if len(members) >= 2:
             sigma_sq += _local_variation_cost(
-                members, A, degree, neighbors, weight, eps
+                members, A, degree, neighbors, weight, eps, tau
             )
     return groups, math.sqrt(sigma_sq)
 
@@ -891,6 +940,7 @@ def _linkage_partition(
     *,
     max_cluster_size: int = 0,
     laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
+    tau: float = 0.0,
 ) -> tuple[torch.Tensor, float]:
     """Cost-cheapest-first agglomerative clustering with a per-round ``A`` refresh.
 
@@ -921,7 +971,13 @@ def _linkage_partition(
 
     A = _l_orthonormalize(target_basis, laplacian_fn(adjacency))
     weights = adjacency.values()[upper]
-    cost = (weights * (A[edge_i] - A[edge_j]).square().sum(dim=1)).clamp_min(0.0)
+    diff_sq = (A[edge_i] - A[edge_j]).square().sum(dim=1)
+    cost = (weights * diff_sq).clamp_min(0.0)
+    if tau:
+        degree = _degrees(adjacency)
+        d_sum = degree[edge_i].add(degree[edge_j])
+        frob = (degree[edge_i].square() + degree[edge_j].square()) / d_sum.square()
+        cost = (cost + tau * frob * diff_sq).clamp_min(0.0)
     order = torch.argsort(cost).tolist()
     ei, ej, cst = edge_i.tolist(), edge_j.tolist(), cost.tolist()
 
@@ -1051,6 +1107,7 @@ def loukas_coarsen_pytorch(
     max_cluster_size: int = 8,
     epsilon_ramp_levels: int | None = None,
     laplacian: str = "combinatorial",
+    tau: float = 0.0,
 ) -> LoukasCoarseningResult:
     """Loukas Algorithm 1 using the supplied ``R=span(target_basis)``.
 
@@ -1081,40 +1138,61 @@ def loukas_coarsen_pytorch(
     normalized ``L = I - A_hat`` (:func:`_normalized_laplacian`) -- the metric the
     collective learnable-filter objective is derived in.
 
+    ``tau`` screens that metric into ``M_tau = L + tau I`` (Eq. 8/9): the target
+    is ``M_tau``-orthonormalized, each greedy contraction pays the Remark C.30
+    screened cost ``||(I - Pi_C) A||^2_{L,loc} + tau ||(I - Pi_C) A||^2_F``, and
+    the exact epsilon is the worst-case ``M_tau`` distortion.  ``tau = 0``
+    recovers the plain-``L`` RSA exactly, so existing callers are unaffected.
+
     The cumulative distortion is the exact restricted-spectral-approximation
-    constant ``epsilon = max_{x in R} ||x - Pi x||_L / ||x||_L`` of the final
-    coarsening (:func:`_exact_rsa_epsilon`); the looser product estimate
+    constant ``epsilon = max_{x in R} ||x - Pi x||_{M_tau} / ||x||_{M_tau}`` of the
+    final coarsening (:func:`_exact_rsa_epsilon`); the looser product estimate
     ``prod_l (1 + sigma_l) - 1`` is kept as ``epsilon_bound`` for reference.
     """
 
     if not 0.0 <= reduction < 1.0:
         raise ValueError("reduction must be in [0, 1)")
+    if tau < 0.0:
+        raise ValueError("tau must be non-negative")
     if method not in ("edges", "neighborhood", "capped", "star", "kmeans", "linkage"):
         raise ValueError(
             "method must be 'edges', 'neighborhood', 'capped', 'star', 'kmeans', "
             "or 'linkage'"
         )
     if laplacian in ("combinatorial", "comb"):
-        laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian
+        base_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian
     elif laplacian in ("symmetric", "normalized", "sym", "norm"):
-        laplacian_fn = _normalized_laplacian
+        base_fn = _normalized_laplacian
     else:
         raise ValueError("laplacian must be 'combinatorial' or 'symmetric'")
+
+    # Screen the RSA metric with ``tau``: every partition orthonormalizes and
+    # scores its target against ``M_tau = base_fn(A) + tau I`` (Eq. 8/9), and the
+    # exact epsilon below is measured in the same screened norm.  ``tau = 0``
+    # leaves ``laplacian_fn`` equal to the base Laplacian, so all RSA quantities
+    # collapse to the plain-``L`` metric and legacy callers are unaffected.
+    def laplacian_fn(
+        adj: torch.Tensor, _base: Callable[[torch.Tensor], torch.Tensor] = base_fn
+    ) -> torch.Tensor:
+        return _screened_metric(_base(adj), tau)
+
     if method == "edges":
-        partition = partial(_edge_partition, laplacian_fn=laplacian_fn)
+        partition = partial(_edge_partition, laplacian_fn=laplacian_fn, tau=tau)
     elif method == "neighborhood":
-        partition = partial(_neighborhood_partition, laplacian_fn=laplacian_fn)
+        partition = partial(_neighborhood_partition, laplacian_fn=laplacian_fn, tau=tau)
     elif method == "linkage":
         partition = partial(
             _linkage_partition,
             max_cluster_size=max_cluster_size,
             laplacian_fn=laplacian_fn,
+            tau=tau,
         )
     elif method == "capped":
         partition = partial(
             _capped_partition,
             max_contraction_size=max_contraction_size,
             laplacian_fn=laplacian_fn,
+            tau=tau,
         )
     elif method == "star":
         partition = partial(
@@ -1123,6 +1201,7 @@ def loukas_coarsen_pytorch(
             max_star_size=max_star_size,
             min_spokes=min_spokes,
             laplacian_fn=laplacian_fn,
+            tau=tau,
         )
     else:
         partition = partial(
@@ -1130,6 +1209,7 @@ def loukas_coarsen_pytorch(
             kmeans_iters=kmeans_iters,
             kmeans_seed=kmeans_seed,
             laplacian_fn=laplacian_fn,
+            tau=tau,
         )
     n_original = adjacency.shape[0]
     n_target = max(1, int(round((1.0 - reduction) * n_original)))
@@ -1167,7 +1247,7 @@ def loukas_coarsen_pytorch(
         # to cheap edge matching to refine the leftover fragments down to target
         # (re-clustering instead would inflate the RSA epsilon).
         level_partition = (
-            partial(_edge_partition, laplacian_fn=laplacian_fn)
+            partial(_edge_partition, laplacian_fn=laplacian_fn, tau=tau)
             if (method == "kmeans" and level > 0)
             else partition
         )
