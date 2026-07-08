@@ -69,11 +69,18 @@ from src.sgc_detection import (
     fit_joint_encoder,
     fit_node_discriminant_map,
     fit_residual_encoder,
+    propagation_stack,
     score_feature_patterns,
 )
 from scipy.sparse import csr_matrix
 from src.pattern_models import create_pattern
 from src.run_elliptic_gang_conductance import random_connected_set
+from src.run_collective_bank_detection import (
+    _filtered_bank,
+    build_bank_subspace,
+    fit_collective_bank,
+    make_negative_sampler,
+)
 
 
 def sample_random_connected_negatives(
@@ -496,6 +503,58 @@ def main() -> None:
         help="L2 penalty on the residual feature map W (larger -> stronger pull "
         "to W=0, i.e. fall back to the pure structural channel)",
     )
+    # collective M_tau filter-bank encoder (from run_collective_bank_detection)
+    parser.add_argument(
+        "--include-bank",
+        action="store_true",
+        default=True,
+        help="include the collective M_tau filter-bank encoder: per-channel "
+        "polynomial filters learned by ascending lambda_min(Gamma) in the "
+        "screened metric M_tau = L + tau*I; target = M_tau-projected gang "
+        "indicators (Remark C.18)",
+    )
+    parser.add_argument("--no-bank", dest="include_bank", action="store_false")
+    parser.add_argument(
+        "--bank-tau",
+        type=float,
+        default=1.0,
+        help="screening tau for the collective-bank encoder (M_tau = L + tau*I)",
+    )
+    parser.add_argument(
+        "--bank-epochs",
+        type=int,
+        default=400,
+        help="Adam epochs for the collective-bank filter fit",
+    )
+    parser.add_argument(
+        "--bank-learning-rate",
+        type=float,
+        default=0.05,
+        help="learning rate for the collective-bank filter fit",
+    )
+    parser.add_argument(
+        "--bank-structural-width",
+        type=int,
+        default=0,
+        help="if >0, concatenate a class-agnostic structural range finder "
+        "g_theta_bar(A_hat) Omega of this width to the bank's projected-indicator "
+        "target (preserves the low-frequency subspace where sparse motifs live)",
+    )
+    parser.add_argument(
+        "--bank-num-neg",
+        type=int,
+        default=0,
+        help="number of random background negative sets resampled each epoch for "
+        "the collective bank's softmax-lambda_max repeller (0 = pure retention)",
+    )
+    parser.add_argument(
+        "--bank-neg-weight",
+        type=float,
+        default=1.0,
+        help="weight of the collective bank's negative softmax-lambda_max penalty",
+    )
+    parser.add_argument("--bank-neg-size-min", type=int, default=3)
+    parser.add_argument("--bank-neg-size-max", type=int, default=10)
     parser.add_argument("--reduction", type=float, default=0.7)
     # parser.add_argument("--epsilon", type=float, default=50)
     parser.add_argument("--epsilon", type=float, default=float("inf"))
@@ -790,6 +849,60 @@ def main() -> None:
             f"->{residual.margin:.4g}"
         )
 
+    # --- collective M_tau filter-bank encoder (run_collective_bank_detection) --
+    # One polynomial filter per feature channel, learned by ascending
+    # lambda_min(Gamma) in the screened metric M_tau = L + tau*I; the coarsener
+    # is handed the M_tau-projected gang indicators (Remark C.18), optionally
+    # augmented with a class-agnostic structural range finder.
+    bank_basis = bank_embed = None
+    if args.include_bank and alert_train_patterns:
+        bank_neg_sampler = None
+        if args.bank_num_neg > 0:
+            bank_avoid = torch.nonzero(graph.y == 1, as_tuple=False).flatten().tolist()
+            bank_neg_sampler = make_negative_sampler(
+                graph.edge_index,
+                int(graph.num_nodes),
+                num_sets=args.bank_num_neg,
+                size_min=args.bank_neg_size_min,
+                size_max=args.bank_neg_size_max,
+                avoid=bank_avoid,
+                rng=np.random.default_rng(seed + 1),
+            )
+        bank_fit = fit_collective_bank(
+            normalized,
+            adjacency,
+            alert_train_patterns,
+            X,
+            degree=args.degree,
+            epochs=args.bank_epochs,
+            learning_rate=args.bank_learning_rate,
+            ridge=args.ridge,
+            fit_seed=seed,
+            tau=args.bank_tau,
+            neg_sampler=bank_neg_sampler,
+            neg_weight=args.bank_neg_weight if bank_neg_sampler is not None else 0.0,
+        )
+        bank_theta = bank_fit["theta"]
+        bank_basis = build_bank_subspace(
+            normalized,
+            adjacency,
+            alert_train_patterns,
+            X,
+            bank_theta,
+            args.ridge,
+            args.bank_tau,
+            structural_width=args.bank_structural_width,
+            seed=seed,
+        )
+        bank_embed = _filtered_bank(
+            propagation_stack(normalized, X, bank_theta.shape[0] - 1), bank_theta
+        )
+        LOGGER.info(
+            f"  collective bank (tau={args.bank_tau:g}): lambda_min(Gamma) "
+            f"{bank_fit['init_objective']:.4g}->{bank_fit['objective']:.4g}  "
+            f"target_dim={bank_basis.shape[1]}"
+        )
+
     encoders = [
         ("laplacian", laplacian_basis, laplacian_embed),
         ("structural", structural_basis, structural_embed),
@@ -803,6 +916,8 @@ def main() -> None:
         encoders.append(("struct+lda", lda_concat_basis, lda_embed))
     if residual_basis is not None:
         encoders.append(("residual", residual_basis, residual_embed))
+    if bank_basis is not None:
+        encoders.append(("collective-bank", bank_basis, bank_embed))
     rows = [
         _coarsen_and_score(
             name,

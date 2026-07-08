@@ -76,14 +76,17 @@ import torch
 from torch_geometric.data import Data
 
 from src.utils.utils import *
-from src.sgc_detection import propagation_stack
+from src.sgc_detection import fit_collective_sgc, propagation_stack
 from src.loukas_sgc_detection import (
     _degrees,
+    build_laplacian_subspace,
+    build_sgc_subspace,
     evaluate_loukas_patterns,
     graph_operators,
     loukas_coarsen_pytorch,
 )
 from src.pattern_models import create_pattern
+from src.bank_visualize import save_rich_plots
 
 
 # --------------------------------------------------------------------------- #
@@ -436,6 +439,36 @@ def _soft_lambda_max(
     return (weights * eigs).sum()
 
 
+def _soft_lambda_min(
+    gamma: torch.Tensor, temperature: float, *, relative: bool = False
+) -> torch.Tensor:
+    """Smooth surrogate for ``lambda_min(gamma)``: ``sum_i softmax(-lam/T)_i lam_i``.
+
+    The Boltzmann *soft-min* of the eigenvalues: weights ``w_i = softmax((lam_0 -
+    lam_i)/T)`` put the most mass on the smallest eigenvalues and decay upward, so
+    the surrogate ``-> lambda_min`` as ``T -> 0`` and ``-> mean(lam)`` as
+    ``T -> inf``.  Unlike the hard ``lambda_min`` (whose gradient sees only the
+    single worst eigenvector and is non-smooth at spectral crossings), the
+    soft-min spreads the ascent pressure over *all* poorly-reconstructed gang
+    directions at once -- a smoother, better-conditioned objective that lifts the
+    whole low end of the spectrum rather than chasing one eigenvalue.
+
+    ``relative=True`` scales the temperature by the spectral spread
+    (``T_eff = T * (lam_max - lam_min)``) so the softness is invariant to the
+    absolute energy scale; the default uses an absolute ``T`` (mirroring
+    :func:`_soft_lambda_max`).
+    """
+
+    eigs = torch.linalg.eigvalsh(gamma)  # ascending
+    if relative:
+        spread = (eigs[-1] - eigs[0]).detach().clamp_min(1e-12)
+        tau = max(float(temperature), 1e-8) * spread
+    else:
+        tau = max(float(temperature), 1e-8)
+    weights = torch.softmax((eigs[0] - eigs) / tau, dim=0)
+    return (weights * eigs).sum()
+
+
 def fit_collective_bank(
     a_hat: torch.Tensor,
     adjacency: torch.Tensor,
@@ -453,6 +486,8 @@ def fit_collective_bank(
     neg_temperature: float = 0.1,
     neg_project: bool = False,
     neg_sharpen: bool = False,
+    snapshot_interval: int = 20,
+    softmin_temperature: float = 0.0,
 ) -> dict:
     """Ascend ``lambda_min(Gamma(Theta))`` over the per-channel unit spheres.
 
@@ -524,15 +559,25 @@ def fit_collective_bank(
     best_obj, best_neg = init_obj, init_neg
     history: list[float] = []
     neg_history: list[float] = []
-    for _ in range(epochs):
+    energy_history: list[float] = []
+    snapshots: list = []
+    snap_interval = max(1, epochs // 20) if snapshot_interval > 0 else 0
+    for _ep in range(epochs):
         theta = _unit(raw)
         Z = _filtered_bank(propagated, theta)
         gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau)
         lam_min = torch.linalg.eigvalsh(gamma)[0]
+        # objective ascended by the optimizer: the hard lambda_min (T=0) or a
+        # differentiable soft-min over the whole low end of the spectrum (T>0).
+        pos_obj = (
+            _soft_lambda_min(gamma, softmin_temperature)
+            if softmin_temperature > 0.0
+            else lam_min
+        )
 
         if not neg_active:
             optimizer.zero_grad(set_to_none=True)
-            (-lam_min).backward()
+            (-pos_obj).backward()
             optimizer.step()
             soft_neg_val = 0.0
         else:
@@ -542,8 +587,8 @@ def fit_collective_bank(
             # Take the two gradients separately so the negative step can be made
             # non-conflicting with the positive margin (gradient surgery).
             optimizer.zero_grad(set_to_none=True)
-            lam_min.backward(retain_graph=True)
-            grad_pos = raw.grad.detach().clone()  # ascent dir for lambda_min
+            pos_obj.backward(retain_graph=True)
+            grad_pos = raw.grad.detach().clone()  # ascent dir for the positive obj
             optimizer.zero_grad(set_to_none=True)
             soft_neg.backward()
             desc_neg = -raw.grad.detach().clone()  # descent dir for the negatives
@@ -560,6 +605,16 @@ def fit_collective_bank(
         value = float(lam_min.detach())
         history.append(value)
         neg_history.append(soft_neg_val)
+        energy_history.append(float(torch.diagonal(gamma.detach()).clamp(0, 1).mean()))
+        if snap_interval > 0 and (_ep % snap_interval == 0 or _ep == epochs - 1):
+            snapshots.append(
+                {
+                    "epoch": _ep,
+                    "theta": theta.detach().clone(),
+                    "lam_min": value,
+                    "gamma_diag": torch.diagonal(gamma.detach()).clamp(0, 1).tolist(),
+                }
+            )
         # snapshot by the (stable) positive margin; the negatives are a stochastic
         # regularizer resampled each step, so their per-epoch value is noisy.
         if value > best_obj:
@@ -575,6 +630,9 @@ def fit_collective_bank(
         "neg_objective": best_neg,
         "neg_objective_mean": float(np.mean(neg_history)) if neg_history else 0.0,
         "history": history,
+        "neg_history": neg_history,
+        "energy_history": energy_history,
+        "snapshots": snapshots,
     }
 
 
@@ -586,6 +644,8 @@ def build_bank_subspace(
     theta: torch.Tensor,
     ridge: float,
     tau: float = 0.0,
+    structural_width: int = 0,
+    seed: int | None = None,
 ) -> torch.Tensor:
     """Target handed to the coarsener: the ``M_tau``-projected gang indicators.
 
@@ -601,6 +661,16 @@ def build_bank_subspace(
     projector onto ``span(Z)``; applied to ``v_hat_j`` it returns the same
     reconstruction whose ``M_tau``-Gram is the ``Gamma`` the bank optimizes.  The
     coarsener then ``M_tau``-orthonormalizes these columns internally.
+
+    ``structural_width > 0`` concatenates a *class-agnostic* low-frequency range
+    finder ``g_theta_bar(A_hat) Omega`` (random Gaussian ``Omega``, shared filter
+    ``theta_bar = mean_channel(theta)``) alongside the projected indicators -- the
+    ``build_joint_subspace`` "indicator channel + structural channel" trick.  The
+    projected indicators only cover the *train* gangs the filter learned; a wide
+    low-frequency structural target additionally preserves the bottom-Laplacian
+    subspace where *sparse* low-conductance motifs (cycles / stars / fans) live,
+    so held-out gangs survive RSA coarsening even when the learned filter did not
+    reconstruct them.  ``structural_width = 0`` leaves the target unchanged.
     """
 
     eps = torch.finfo(a_hat.dtype).eps
@@ -618,7 +688,28 @@ def build_bank_subspace(
     rhs = Z.T @ m_vhat  # Z^T M_tau v_hat                                  (d, m)
     eye = torch.eye(g_z.shape[0], dtype=g_z.dtype, device=g_z.device)
     coeffs = torch.linalg.solve(g_z + ridge * eye, rhs)  # (Z^T M Z)^+ Z^T M v_hat
-    return Z @ coeffs  # Pi^{M_tau}_{span Z} v_hat                         (N, m)
+    target = Z @ coeffs  # Pi^{M_tau}_{span Z} v_hat                       (N, m)
+
+    if structural_width and structural_width > 0:
+        # Class-agnostic structural channel g_theta_bar(A_hat) Omega. The shared
+        # scalar filter theta_bar = mean over the learned feature channels keeps
+        # the same low-pass shape the bank learned, applied to a random range
+        # finder that does *not* depend on which nodes are gangs.
+        gen = torch.Generator(device=a_hat.device)
+        if seed is not None:
+            gen.manual_seed(int(seed))
+        omega = torch.randn(
+            a_hat.shape[0],
+            int(structural_width),
+            dtype=a_hat.dtype,
+            device=a_hat.device,
+            generator=gen,
+        )
+        theta_bar = theta.mean(dim=1) if theta.dim() > 1 else theta  # (K+1,)
+        prop_struct = propagation_stack(a_hat, omega, theta_bar.shape[0] - 1)
+        z_struct = _filtered_bank(prop_struct, theta_bar)  # (N, structural_width)
+        target = torch.cat([target, z_struct], dim=1)  # (N, m + structural_width)
+    return target
 
 
 def retained_energy(
@@ -658,6 +749,128 @@ def _alert_metrics(patterns: list, node_to_supernode, node_labels, threshold: fl
         patterns, node_to_supernode, node_labels, threshold=threshold
     )
     return by_label.get("alert", {})
+
+
+def _basis_retained_energy(a_hat, adjacency, patterns, basis, ridge, tau):
+    """Mean/min retained ``M_tau``-energy of the gang indicators under ``span(basis)``.
+
+    ``C_S = Gamma_jj`` with ``Gamma = Vhat^T M R (R^T M R)^+ R^T M Vhat`` for the
+    coarsening *target subspace* ``R = span(basis)`` -- i.e. the fraction of each
+    gang indicator's ``M_tau``-energy that the target subspace preserves (exactly
+    the quantity the RSA coarsening is asked to keep together).  Because it is
+    computed straight from the handed-in ``basis``, every encoder (collective
+    bank, ``structural``, ``laplacian``) is measured on the same footing.
+    """
+
+    if not patterns:
+        return {"mean": None, "min": None}
+    V = degree_weighted_indicators(adjacency, patterns)
+    l_v = _l_apply(a_hat, V)
+    phi = (V * l_v).sum(0).clamp_min(torch.finfo(a_hat.dtype).eps)
+    m_vhat = (l_v + tau * V) / (phi + tau).sqrt().unsqueeze(0)  # M_tau Vhat
+    gamma = _collective_gamma(a_hat, basis, m_vhat, ridge, tau)
+    diag = torch.diagonal(gamma).clamp(0.0, 1.0)
+    return {"mean": float(diag.mean()), "min": float(diag.min())}
+
+
+def _coarsen_and_detect(normalized, adjacency, basis, splits, node_labels, args, tau):
+    """Coarsen with ``basis`` and score alert recall/precision/detection per split.
+
+    Shared by the collective-bank target and the ``laplacian`` / ``structural``
+    baselines so every encoder is coarsened by the *identical* Loukas RSA
+    procedure (same method, laplacian, budget, and screening ``tau``) and only
+    the target subspace ``R = span(basis)`` differs.  Each split also gets the
+    retained ``M_tau``-energy of its gang indicators under ``span(basis)``.
+    """
+
+    if args.epsilon is not None:
+        budget = dict(
+            reduction=args.reduction,
+            epsilon=args.epsilon,
+            epsilon_ramp_levels=args.epsilon_ramp_levels,
+        )
+    else:
+        budget = dict(reduction=args.reduction)
+    coarsening = loukas_coarsen_pytorch(
+        adjacency,
+        basis,
+        method=args.coarsening_method,
+        laplacian=args.coarsening_laplacian,
+        max_levels=args.max_levels,
+        tau=tau,
+        **budget,
+    )
+    report = {}
+    for name, split in splits.items():
+        metrics = _alert_metrics(
+            split, coarsening.node_to_supernode, node_labels, args.threshold
+        )
+        energy = _basis_retained_energy(
+            normalized, adjacency, split, basis, args.ridge, tau
+        )
+        report[name] = {
+            "detection_rate": metrics.get("detection_rate"),
+            "mean_recall": metrics.get("mean_recall"),
+            "mean_precision": metrics.get("mean_precision"),
+            "retained_energy": energy["mean"],
+            "retained_energy_min": energy["min"],
+            "detected": metrics.get("detected"),
+            "total": metrics.get("total"),
+        }
+    return coarsening, report
+
+
+def _baseline_encoder_reports(
+    normalized, adjacency, train_patterns, splits, node_labels, args, tau
+):
+    """Coarsening reports for the ``structural`` and ``laplacian`` baselines.
+
+    Ported from :mod:`run_joint_encoder_comparison`: both are *learning-free of
+    the bank* target subspaces handed to the same coarsener.
+
+    * ``structural`` -- ``theta`` fit on the structural Gram (``Sigma_X = I``),
+      then ``R = span(g_theta(A_hat) Omega)`` (random range finder).
+    * ``laplacian``  -- ``R = span(U_K)``, the bottom-``K`` combinatorial
+      Laplacian eigenvectors (classical Loukas target, no learning).
+    """
+
+    reports = {}
+    if not args.baselines or args.baseline_width <= 0:
+        return reports
+
+    structural_fit = fit_collective_sgc(
+        normalized,
+        train_patterns,
+        features=None,
+        mode="lambda_min",
+        degree=args.degree,
+        epochs=args.baseline_epochs,
+        learning_rate=args.learning_rate,
+    )
+    structural_basis = build_sgc_subspace(
+        normalized,
+        structural_fit.theta,
+        None,
+        width=args.baseline_width,
+        seed=args.seed,
+    )
+    _, reports["structural"] = _coarsen_and_detect(
+        normalized, adjacency, structural_basis, splits, node_labels, args, tau
+    )
+
+    n_nodes = normalized.shape[0]
+    if n_nodes <= args.baseline_laplacian_max_nodes:
+        laplacian_basis = build_laplacian_subspace(adjacency, width=args.baseline_width)
+        _, reports["laplacian"] = _coarsen_and_detect(
+            normalized, adjacency, laplacian_basis, splits, node_labels, args, tau
+        )
+    else:
+        LOGGER.info(
+            f"  [tau={tau:g}] laplacian baseline skipped (N={n_nodes} > "
+            f"{args.baseline_laplacian_max_nodes}; dense eigh too costly -- raise "
+            "--baseline-laplacian-max-nodes to force it)"
+        )
+    return reports
 
 
 def _parse_taus(spec: str) -> list:
@@ -713,6 +926,7 @@ def run_for_tau(
         neg_temperature=args.neg_temperature,
         neg_project=args.neg_project,
         neg_sharpen=args.neg_sharpen,
+        softmin_temperature=args.softmin_temperature,
     )
     theta = fit["theta"]
     LOGGER.info(
@@ -740,26 +954,21 @@ def run_for_tau(
 
     # 5. embedding + target R = M_tau-projected indicators (tau-dependent) ----
     basis = build_bank_subspace(
-        normalized, adjacency, train_patterns, X, theta, args.ridge, tau
+        normalized,
+        adjacency,
+        train_patterns,
+        X,
+        theta,
+        args.ridge,
+        tau,
+        structural_width=args.structural_width,
+        seed=args.seed,
     )
 
     # 6. Loukas RSA coarsening with the learned target ------------------------
-    if args.epsilon is not None:
-        coarsen_budget = dict(
-            reduction=args.reduction,
-            epsilon=args.epsilon,
-            epsilon_ramp_levels=args.epsilon_ramp_levels,
-        )
-    else:
-        coarsen_budget = dict(reduction=args.reduction)
-    coarsening = loukas_coarsen_pytorch(
-        adjacency,
-        basis,
-        method=args.coarsening_method,
-        laplacian=args.coarsening_laplacian,
-        max_levels=args.max_levels,
-        tau=tau,
-        **coarsen_budget,
+    splits = {"train": train_patterns, "test": test_patterns, "all": patterns}
+    coarsening, report = _coarsen_and_detect(
+        normalized, adjacency, basis, splits, graph.y, args, tau
     )
     LOGGER.info(
         f"  [tau={tau:g}] coarsening: N={coarsening.n_original} -> n_coarse="
@@ -785,21 +994,10 @@ def run_for_tau(
             )
 
     # 7. recall / precision / detection rate ----------------------------------
-    splits = {"train": train_patterns, "test": test_patterns, "all": patterns}
-    report = {}
-    for name, split in splits.items():
-        metrics = _alert_metrics(
-            split, coarsening.node_to_supernode, graph.y, args.threshold
-        )
-        report[name] = {
-            "detection_rate": metrics.get("detection_rate"),
-            "mean_recall": metrics.get("mean_recall"),
-            "mean_precision": metrics.get("mean_precision"),
-            "detected": metrics.get("detected"),
-            "total": metrics.get("total"),
-        }
-
-    header = f"  {'split':<6} {'recall':>8} {'precision':>10} {'detection':>10} {'det/tot':>9}"
+    header = (
+        f"  {'split':<6} {'recall':>8} {'precision':>10} {'ret_energy':>11} "
+        f"{'detection':>10} {'det/tot':>9}"
+    )
     LOGGER.info(header)
     LOGGER.info("  " + "-" * (len(header) - 2))
     for name in ("train", "test", "all"):
@@ -807,9 +1005,33 @@ def run_for_tau(
         LOGGER.info(
             f"  {name:<6} {(r['mean_recall'] or 0):>8.3f} "
             f"{(r['mean_precision'] or 0):>10.3f} "
+            f"{(r['retained_energy'] or 0):>11.3f} "
             f"{(r['detection_rate'] or 0):>10.1%} "
             f"{r['detected']:>4}/{r['total']:<4}"
         )
+
+    # --- baseline encoders (laplacian / structural) on the SAME coarsener -----
+    baseline_reports = _baseline_encoder_reports(
+        normalized, adjacency, train_patterns, splits, graph.y, args, tau
+    )
+    encoder_reports = {"collective-bank": report, **baseline_reports}
+    if baseline_reports:
+        LOGGER.info(f"  [tau={tau:g}] encoder comparison (all motifs, same coarsener):")
+        cmp_header = (
+            f"    {'encoder':<16} {'recall':>8} {'precision':>10} "
+            f"{'ret_energy':>11} {'detection':>10} {'det/tot':>9}"
+        )
+        LOGGER.info(cmp_header)
+        LOGGER.info("    " + "-" * (len(cmp_header) - 4))
+        for enc_name, rep in encoder_reports.items():
+            r = rep["all"]
+            LOGGER.info(
+                f"    {enc_name:<16} {(r['mean_recall'] or 0):>8.3f} "
+                f"{(r['mean_precision'] or 0):>10.3f} "
+                f"{(r['retained_energy'] or 0):>11.3f} "
+                f"{(r['detection_rate'] or 0):>10.1%} "
+                f"{r['detected']:>4}/{r['total']:<4}"
+            )
 
     # --- persist JSON + plot --------------------------------------------------
     json_out = out_dir / f"collective_bank_detection{suffix}.json"
@@ -836,6 +1058,7 @@ def run_for_tau(
                     "n_levels": len(coarsening.sigmas),
                 },
                 "detection": report,
+                "encoder_comparison": encoder_reports,
                 "negatives": {
                     "num_sets_per_epoch": args.num_neg_motifs,
                     "resampled_each_epoch": neg_sampler is not None,
@@ -850,6 +1073,29 @@ def run_for_tau(
         + "\n"
     )
     _save_plot(report, args, fit, plot_out, tau=tau)
+    try:
+        save_rich_plots(
+            normalized=normalized,
+            adjacency=adjacency,
+            X=X,
+            graph=graph,
+            patterns=patterns,
+            train_patterns=train_patterns,
+            test_patterns=test_patterns,
+            theta=theta,
+            fit=fit,
+            coarsening=coarsening,
+            basis=basis,
+            report=report,
+            train_cap=train_cap,
+            test_cap=test_cap,
+            args=args,
+            out_dir=out_dir,
+            tau=tau,
+            suffix=suffix,
+        )
+    except Exception as _viz_exc:
+        LOGGER.warning(f"  [viz] rich plots failed: {_viz_exc}")
     LOGGER.info(f"  [tau={tau:g}] JSON: {json_out}")
 
     return {
@@ -864,6 +1110,7 @@ def run_for_tau(
         "epsilon": coarsening.epsilon,
         "neg_share_mean": neg_share_mean,
         "report": report,
+        "encoder_comparison": encoder_reports,
     }
 
 
@@ -927,7 +1174,7 @@ def _save_tau_sweep_plot(summaries: list, args, output: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     # graph / motifs
-    parser.add_argument("--num-nodes", type=int, default=10000)
+    parser.add_argument("--num-nodes", type=int, default=4000)
     parser.add_argument("--num-motifs", type=int, default=50)
     parser.add_argument(
         "--motif-type",
@@ -937,33 +1184,74 @@ def main() -> None:
     parser.add_argument(
         "--motif-density",
         type=float,
-        default=0.5,
+        default=0.65,
         help="edge density for --motif-type random (fraction of s(s-1)/2 possible "
         "edges; a spanning path is always added so the motif stays connected)",
     )
     parser.add_argument(
         "--motif-conductance",
         type=float,
-        default=-1,
+        default=-1.0,
         help="target conductance Phi=cut/vol per planted motif; adds random "
         "motif->host edges to reach it (Phi in [0,1)). Negative = no extra edges "
         "(leave motifs disjoint / minimal conductance).",
     )
-    parser.add_argument("--motif-size", type=int, default=25)
+    parser.add_argument("--motif-size", type=int, default=10)
     parser.add_argument("--avg-degree", type=float, default=5.0)
     parser.add_argument("--feature-dim", type=int, default=64)
     parser.add_argument("--train-ratio", type=float, default=0.4)
     parser.add_argument("--degree", type=int, default=10, help="polynomial degree K")
-    parser.add_argument("--epochs", type=int, default=1500)
+    parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--learning-rate", type=float, default=0.05)
     parser.add_argument("--ridge", type=float, default=1e-4)
     parser.add_argument(
         "--tau",
-        default="1.0",
+        default="0.0",
         help="screened metric M_tau = L + tau*I; energy/objective is measured in "
         "||x||^2_{M_tau} = ||x||_L^2 + tau*||x||_2^2 (tau=0 -> L_sym seminorm, "
         "tau->inf -> l2). Pass one value, or a comma-separated list "
         "(e.g. 0,0.1,0.3,1.0) to sweep and compare across tau.",
+    )
+    parser.add_argument(
+        "--structural-width",
+        type=int,
+        default=0,
+        help="if >0, concatenate a class-agnostic low-frequency structural channel "
+        "g_theta_bar(A_hat) Omega (random Omega of this width, shared filter) to the "
+        "M_tau-projected gang indicators handed to the coarsener. Preserves the "
+        "bottom-Laplacian subspace where sparse motifs (cycles/stars/fans) live, so "
+        "held-out gangs survive coarsening even if the learned filter missed them "
+        "(0 = target unchanged: train-gang projected indicators only).",
+    )
+    # baseline encoders ported from run_joint_encoder_comparison
+    parser.add_argument(
+        "--baselines",
+        action="store_true",
+        default=True,
+        help="also coarsen with the 'structural' (theta on the structural Gram, "
+        "R = span(g_theta(A_hat) Omega)) and 'laplacian' (R = span(U_K), bottom-K "
+        "combinatorial Laplacian eigenvectors) baseline targets on the SAME "
+        "coarsener, and print a per-encoder comparison",
+    )
+    parser.add_argument("--no-baselines", dest="baselines", action="store_false")
+    parser.add_argument(
+        "--baseline-width",
+        type=int,
+        default=64,
+        help="target subspace width for the laplacian / structural baselines",
+    )
+    parser.add_argument(
+        "--baseline-epochs",
+        type=int,
+        default=200,
+        help="Adam epochs for the structural-baseline theta fit",
+    )
+    parser.add_argument(
+        "--baseline-laplacian-max-nodes",
+        type=int,
+        default=4000,
+        help="skip the laplacian baseline above this N (its dense NxN eigh is "
+        "O(N^3); raise to force it on larger graphs)",
     )
     # negative "repeller" sets (random background neighborhoods)
     parser.add_argument(
@@ -1011,6 +1299,14 @@ def main() -> None:
         "blob (true lambda_max) instead of the mean retained energy",
     )
     parser.add_argument(
+        "--softmin-temperature",
+        type=float,
+        default=0.2,
+        help="temperature for a differentiable soft-min objective over the Gamma "
+        "spectrum instead of the hard lambda_min (0 = hard min; larger -> closer to "
+        "the mean retained energy, spreading ascent over all weak gang directions)",
+    )
+    parser.add_argument(
         "--max-levels",
         type=int,
         default=10000,
@@ -1043,7 +1339,7 @@ def main() -> None:
     parser.add_argument(
         "--coarsening-laplacian",
         choices=["symmetric", "combinatorial"],
-        default="symmetric",
+        default="combinatorial",
         help="RSA metric for coarsening: 'symmetric' (L = I - A_hat, matches the "
         "algorithm, default) or 'combinatorial' (L = D - W, the legacy metric)",
     )
