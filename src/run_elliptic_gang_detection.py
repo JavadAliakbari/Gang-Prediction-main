@@ -86,6 +86,11 @@ from src.sgc_detection import (
     fit_collective_sgc,
     fit_joint_encoder,
 )
+from src.run_collective_bank_detection import (
+    fit_collective_bank,
+    build_bank_subspace,
+    make_negative_sampler,
+)
 
 # ---------------------------------------------------------------------------
 # Feature matrix aligned to the build_graph node ordering
@@ -112,12 +117,19 @@ def load_node_features(
     num = num.select_dtypes(include=[np.number])
     X = num.to_numpy(dtype=np.float64)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    # z-score (drop zero-variance columns so they don't blow up)
+    # column z-score (drop zero-variance columns so they don't blow up)
     mu = X.mean(axis=0)
     sd = X.std(axis=0)
     keep = sd > 1e-12
     X = (X[:, keep] - mu[keep]) / sd[keep]
-    print(f"  Feature matrix X: {X.shape[0]:,} x {X.shape[1]} (standardised)")
+    # row L2-normalisation: makes each node's feature vector unit length,
+    # removing inter-node magnitude differences after column standardisation.
+    row_norm = np.linalg.norm(X, axis=1, keepdims=True).clip(min=1e-12)
+    X = X / row_norm
+    print(
+        f"  Feature matrix X: {X.shape[0]:,} x {X.shape[1]} "
+        "(col z-scored + row L2-normalised)"
+    )
     return torch.from_numpy(X).to(torch.float64)
 
 
@@ -297,7 +309,7 @@ def main() -> None:
     ap.add_argument("--structural-width", type=int, default=32)
     ap.add_argument("--embed-dim", type=int, default=16)
     ap.add_argument("--epochs", type=int, default=200)
-    ap.add_argument("--learning-rate", type=float, default=0.01)
+    ap.add_argument("--learning-rate", type=float, default=0.05)
     ap.add_argument("--ridge", type=float, default=1e-3)
     ap.add_argument(
         "--reduction",
@@ -320,7 +332,7 @@ def main() -> None:
     ap.add_argument(
         "--max-levels",
         type=int,
-        default=1,
+        default=3,
         help="option 2 collapses gangs hierarchically over many levels "
         "(a size-k gang needs ~log2(k) edge-matching levels)",
     )
@@ -342,7 +354,7 @@ def main() -> None:
     ap.add_argument(
         "--coarsening-method",
         choices=["edges", "neighborhood", "capped", "star", "kmeans", "linkage"],
-        default="linkage",
+        default="edges",
         help="local-variation candidate family. 'edges' (default, option 2) is "
         "canonical Loukas Algorithm 2: one cheapest-first matching per level, so "
         "per-level cap = 2 and gangs collapse multiplicatively across levels under "
@@ -363,6 +375,55 @@ def main() -> None:
         default=4,
         help="super-node size cap for --coarsening-method linkage (curbs single-"
         "linkage chaining so a collapsed gang stays pure; 0 = uncapped)",
+    )
+    # collective-bank encoder hyper-parameters
+    ap.add_argument(
+        "--bank-tau",
+        type=float,
+        default=0.3,
+        help="M_tau screening level for the collective-bank encoder (tau=0 -> L_sym)",
+    )
+    ap.add_argument(
+        "--bank-epochs",
+        type=int,
+        default=700,
+        help="training epochs for the bank (defaults to --epochs when not set)",
+    )
+    ap.add_argument(
+        "--bank-neg-weight",
+        type=float,
+        default=0.0,
+        help="weight of the negative repeller term in the bank objective",
+    )
+    ap.add_argument(
+        "--bank-neg-temperature",
+        type=float,
+        default=0.1,
+        help="softmax temperature for the negative lambda_max surrogate",
+    )
+    ap.add_argument(
+        "--bank-softmin-temperature",
+        type=float,
+        default=0.0,
+        help="soft-min temperature for the bank positive objective (0 = hard lambda_min)",
+    )
+    ap.add_argument(
+        "--bank-num-neg",
+        type=int,
+        default=0,
+        help="number of negative repeller sets sampled per epoch (0 = no negatives)",
+    )
+    ap.add_argument(
+        "--bank-neg-size-min",
+        type=int,
+        default=3,
+        help="minimum size of a sampled negative neighborhood",
+    )
+    ap.add_argument(
+        "--bank-neg-size-max",
+        type=int,
+        default=10,
+        help="maximum size of a sampled negative neighborhood",
     )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="results/elliptic_gang_detection", type=Path)
@@ -452,10 +513,65 @@ def main() -> None:
         per_hop=joint.per_hop_features,
     )
 
+    print(
+        "  Fitting collective-bank encoder (per-channel filter bank on gang indicators) …"
+    )
+    bank_epochs = args.bank_epochs if args.bank_epochs is not None else args.epochs
+    bank_neg_sampler = None
+    if args.bank_num_neg > 0:
+        avoid_nodes = np.where(cls == 1)[0]
+        bank_neg_sampler = make_negative_sampler(
+            graph.edge_index,
+            graph.num_nodes,
+            num_sets=args.bank_num_neg,
+            size_min=args.bank_neg_size_min,
+            size_max=args.bank_neg_size_max,
+            avoid=avoid_nodes,
+            rng=np.random.default_rng(args.seed + 99),
+        )
+
+    gen = torch.Generator().manual_seed(args.seed)
+    X2 = torch.randn(
+        graph.num_nodes, args.structural_width, dtype=torch.float64, generator=gen
+    )
+    X2 = (X2 - X2.mean(0, keepdim=True)) / X2.std(0, keepdim=True).clamp_min(1e-8)
+    bank_fit = fit_collective_bank(
+        normalized,
+        adjacency,
+        gang_train,
+        X2,
+        # Xf,
+        degree=args.degree,
+        epochs=bank_epochs,
+        learning_rate=args.learning_rate,
+        ridge=args.ridge,
+        fit_seed=args.seed,
+        tau=args.bank_tau,
+        neg_sampler=bank_neg_sampler,
+        neg_weight=args.bank_neg_weight,
+        neg_temperature=args.bank_neg_temperature,
+        softmin_temperature=args.bank_softmin_temperature,
+    )
+    print(
+        f"    lambda_min(Gamma): {bank_fit['init_objective']:.4g} -> "
+        f"{bank_fit['objective']:.4g}"
+    )
+    bank_basis = build_bank_subspace(
+        normalized,
+        adjacency,
+        gang_train,
+        X2,
+        # Xf,
+        bank_fit["theta"],
+        args.ridge,
+        tau=args.bank_tau,
+    )
+
     encoders = [
         ("structural", structural_basis),
         ("raw-feature", feature_basis),
         ("joint", joint_basis),
+        ("collective-bank", bank_basis),
     ]
     eps_desc = "inf" if args.epsilon == float("inf") else f"{args.epsilon:g}"
     print(

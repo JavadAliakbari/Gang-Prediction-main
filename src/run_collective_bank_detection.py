@@ -646,16 +646,26 @@ def build_bank_subspace(
     tau: float = 0.0,
     structural_width: int = 0,
     seed: int | None = None,
+    coarsen_target: str = "bank",
 ) -> torch.Tensor:
-    """Target handed to the coarsener: the ``M_tau``-projected gang indicators.
+    """Target ``R`` handed to the coarsener.
 
-    Per Remark C.18 the coarsener should preserve the *reconstructable* part of
-    each normalized gang indicator, ``z_hat_j = Pi^{M_tau}_{span Z} v_hat_{S_j}``,
-    not the whole embedding ``span(Z)``.  ``span(Z)`` (dimension ``d``) drags in
-    within-gang-varying directions that never carry a full indicator and only
-    waste the RSA budget; the ``m`` projected indicators (one per training gang)
-    are exactly the columns whose retained ``M_tau``-energy the learner drove up,
-    so they are the cheap, on-target thing to keep together.
+    Two choices of ``R``, selected by ``coarsen_target``:
+
+    * ``"bank"`` (default) -- the *whole learned filter-bank subspace* ``span(Z)``
+      (``d`` columns, ``Z = g_Theta(A_hat) X``).  This is the subspace the filter
+      actually generates; it is *not* built from any particular gang, so it treats
+      train and test gangs identically -- a held-out gang the filter can reach
+      (e.g. a clique) is captured by ``span(Z)`` just as well as a training one.
+      Its per-gang retained ``M_tau``-energy is exactly the capture ``C_S = Gamma_jj``
+      the learner optimizes, so the reported energy now matches the objective.
+
+    * ``"indicators"`` -- the ``M_tau``-projected gang indicators of Remark C.18,
+      ``z_hat_j = Pi^{M_tau}_{span Z} v_hat_{S_j}`` (``m`` columns).  This is the
+      *cheaper* RSA target (``span(Z)`` drags in within-gang-varying directions
+      that never carry a full indicator and only spend RSA budget), but it is
+      assembled from the *training* gangs, so a held-out indicator is ~0 inside it
+      by construction -- its per-split energy is not a generalization diagnostic.
 
     ``Pi^{M_tau}_{span Z} = Z (Z^T M_tau Z)^+ Z^T M_tau`` is the ``M_tau``-orthogonal
     projector onto ``span(Z)``; applied to ``v_hat_j`` it returns the same
@@ -682,13 +692,19 @@ def build_bank_subspace(
 
     propagated = propagation_stack(a_hat, X, theta.shape[0] - 1)
     Z = _filtered_bank(propagated, theta)  # (N, d)
-    m_z = _m_apply(a_hat, Z, tau)  # M_tau Z                               (N, d)
-    g_z = Z.T @ m_z  # Z^T M_tau Z                                         (d, d)
-    g_z = 0.5 * (g_z + g_z.T)
-    rhs = Z.T @ m_vhat  # Z^T M_tau v_hat                                  (d, m)
-    eye = torch.eye(g_z.shape[0], dtype=g_z.dtype, device=g_z.device)
-    coeffs = torch.linalg.solve(g_z + ridge * eye, rhs)  # (Z^T M Z)^+ Z^T M v_hat
-    target = Z @ coeffs  # Pi^{M_tau}_{span Z} v_hat                       (N, m)
+
+    if coarsen_target == "bank":
+        target = Z  # R = span(Z), the full learned filter-bank subspace     (N, d)
+    elif coarsen_target == "indicators":
+        m_z = _m_apply(a_hat, Z, tau)  # M_tau Z                             (N, d)
+        g_z = Z.T @ m_z  # Z^T M_tau Z                                       (d, d)
+        g_z = 0.5 * (g_z + g_z.T)
+        rhs = Z.T @ m_vhat  # Z^T M_tau v_hat                                (d, m)
+        eye = torch.eye(g_z.shape[0], dtype=g_z.dtype, device=g_z.device)
+        coeffs = torch.linalg.solve(g_z + ridge * eye, rhs)  # (Z^T M Z)^+ Z^T M v_hat
+        target = Z @ coeffs  # Pi^{M_tau}_{span Z} v_hat                     (N, m)
+    else:
+        raise ValueError("coarsen_target must be 'bank' or 'indicators'")
 
     if structural_width and structural_width > 0:
         # Class-agnostic structural channel g_theta_bar(A_hat) Omega. The shared
@@ -720,13 +736,14 @@ def retained_energy(
     theta: torch.Tensor,
     ridge: float,
     tau: float = 0.0,
+    indicator: str = "degree_weighted",
 ) -> dict:
-    """Per-gang retained ``M_tau``-energy ``C_S = Gamma_jj`` and the collective margin."""
+    """Per-gang retained ``M_tau``-energy ``C_S = Gamma_jj`` and the collective margin.
 
-    V = degree_weighted_indicators(adjacency, patterns)
-    l_v = _l_apply(a_hat, V)
-    phi = (V * l_v).sum(0).clamp_min(torch.finfo(a_hat.dtype).eps)
-    m_vhat = (l_v + tau * V) / (phi + tau).sqrt().unsqueeze(0)
+    ``indicator`` selects the gang signal (see :func:`_make_indicators`).
+    """
+
+    _, m_vhat = _make_indicators(a_hat, adjacency, patterns, tau, indicator)
     propagated = propagation_stack(a_hat, X, theta.shape[0] - 1)
     Z = _filtered_bank(propagated, theta)
     gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau)
@@ -751,7 +768,54 @@ def _alert_metrics(patterns: list, node_to_supernode, node_labels, threshold: fl
     return by_label.get("alert", {})
 
 
-def _basis_retained_energy(a_hat, adjacency, patterns, basis, ridge, tau):
+def _make_indicators(
+    a_hat: torch.Tensor,
+    adjacency: torch.Tensor,
+    patterns: list,
+    tau: float,
+    indicator: str = "degree_weighted",
+) -> tuple:
+    """Build ``V`` and the precomputed ``M_tau Vhat`` for the chosen indicator.
+
+    ``indicator='degree_weighted'`` uses ``v_S = D_tilde^{1/2} 1_S / sqrt(vol(S))``
+    (conductance-normalized, matches the training objective).
+
+    ``indicator='plain'`` uses the raw 0/1 membership vector ``1_S`` normalized
+    to unit ``M_tau``-energy: ``||1_S||_{M_tau}^2 = 1_S^T L 1_S + tau*|S|``.
+    Both choices yield ``||vhat||_{M_tau} = 1``; the difference is what notion
+    of "which nodes belong to the gang" is privileged.
+
+    Returns ``(V, m_vhat)`` where ``V`` is ``(N, m)`` unnormalized and
+    ``m_vhat = M_tau Vhat`` is ``(N, m)``.
+    """
+    n = a_hat.shape[0]
+    eps = torch.finfo(a_hat.dtype).eps
+    if indicator == "plain":
+        V = torch.zeros(n, len(patterns), dtype=a_hat.dtype, device=a_hat.device)
+        for j, p in enumerate(patterns):
+            V[list(p.node_indices), j] = 1.0
+        l_v = _l_apply(a_hat, V)
+        phi = (V * l_v).sum(0)  # 1_S^T L 1_S
+        sq = (V * V).sum(0)  # |S|
+        denom = (phi + tau * sq).clamp_min(eps)
+        m_vhat = (l_v + tau * V) / denom.sqrt().unsqueeze(0)
+    else:  # degree_weighted (default)
+        V = degree_weighted_indicators(adjacency, patterns)
+        l_v = _l_apply(a_hat, V)
+        phi = (V * l_v).sum(0).clamp_min(eps)
+        m_vhat = (l_v + tau * V) / (phi + tau).sqrt().unsqueeze(0)
+    return V, m_vhat
+
+
+def _basis_retained_energy(
+    a_hat,
+    adjacency,
+    patterns,
+    basis,
+    ridge,
+    tau,
+    indicator: str = "degree_weighted",
+):
     """Mean/min retained ``M_tau``-energy of the gang indicators under ``span(basis)``.
 
     ``C_S = Gamma_jj`` with ``Gamma = Vhat^T M R (R^T M R)^+ R^T M Vhat`` for the
@@ -760,14 +824,16 @@ def _basis_retained_energy(a_hat, adjacency, patterns, basis, ridge, tau):
     the quantity the RSA coarsening is asked to keep together).  Because it is
     computed straight from the handed-in ``basis``, every encoder (collective
     bank, ``structural``, ``laplacian``) is measured on the same footing.
+
+    ``indicator`` selects the gang signal whose energy is measured:
+    ``'degree_weighted'`` uses the conductance-normalized ``v_S = D_tilde^{1/2}
+    1_S / sqrt(vol(S))``;  ``'plain'`` uses the raw 0/1 membership vector
+    ``1_S`` normalized to unit ``M_tau``-energy.
     """
 
     if not patterns:
         return {"mean": None, "min": None}
-    V = degree_weighted_indicators(adjacency, patterns)
-    l_v = _l_apply(a_hat, V)
-    phi = (V * l_v).sum(0).clamp_min(torch.finfo(a_hat.dtype).eps)
-    m_vhat = (l_v + tau * V) / (phi + tau).sqrt().unsqueeze(0)  # M_tau Vhat
+    _, m_vhat = _make_indicators(a_hat, adjacency, patterns, tau, indicator)
     gamma = _collective_gamma(a_hat, basis, m_vhat, ridge, tau)
     diag = torch.diagonal(gamma).clamp(0.0, 1.0)
     return {"mean": float(diag.mean()), "min": float(diag.min())}
@@ -806,7 +872,13 @@ def _coarsen_and_detect(normalized, adjacency, basis, splits, node_labels, args,
             split, coarsening.node_to_supernode, node_labels, args.threshold
         )
         energy = _basis_retained_energy(
-            normalized, adjacency, split, basis, args.ridge, tau
+            normalized,
+            adjacency,
+            split,
+            basis,
+            args.ridge,
+            tau,
+            indicator=args.indicator,
         )
         report[name] = {
             "detection_rate": metrics.get("detection_rate"),
@@ -940,10 +1012,24 @@ def run_for_tau(
             f"{fit['neg_objective_mean']:.6g} mean (want down)"
         )
     train_cap = retained_energy(
-        normalized, adjacency, train_patterns, X, theta, args.ridge, tau
+        normalized,
+        adjacency,
+        train_patterns,
+        X,
+        theta,
+        args.ridge,
+        tau,
+        indicator=args.indicator,
     )
     test_cap = retained_energy(
-        normalized, adjacency, test_patterns, X, theta, args.ridge, tau
+        normalized,
+        adjacency,
+        test_patterns,
+        X,
+        theta,
+        args.ridge,
+        tau,
+        indicator=args.indicator,
     )
     LOGGER.info(
         f"  [tau={tau:g}] retained M_tau-energy  train: min={train_cap['min_capture']:.3f} "
@@ -963,6 +1049,7 @@ def run_for_tau(
         tau,
         structural_width=args.structural_width,
         seed=args.seed,
+        coarsen_target=args.coarsen_target,
     )
 
     # 6. Loukas RSA coarsening with the learned target ------------------------
@@ -1184,7 +1271,7 @@ def main() -> None:
     parser.add_argument(
         "--motif-density",
         type=float,
-        default=0.65,
+        default=0.5,
         help="edge density for --motif-type random (fraction of s(s-1)/2 possible "
         "edges; a spanning path is always added so the motif stays connected)",
     )
@@ -1197,12 +1284,12 @@ def main() -> None:
         "(leave motifs disjoint / minimal conductance).",
     )
     parser.add_argument("--motif-size", type=int, default=10)
-    parser.add_argument("--avg-degree", type=float, default=5.0)
+    parser.add_argument("--avg-degree", type=float, default=2.0)
     parser.add_argument("--feature-dim", type=int, default=64)
     parser.add_argument("--train-ratio", type=float, default=0.4)
-    parser.add_argument("--degree", type=int, default=10, help="polynomial degree K")
-    parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--learning-rate", type=float, default=0.05)
+    parser.add_argument("--degree", type=int, default=5, help="polynomial degree K")
+    parser.add_argument("--epochs", type=int, default=1500)
+    parser.add_argument("--learning-rate", type=float, default=0.02)
     parser.add_argument("--ridge", type=float, default=1e-4)
     parser.add_argument(
         "--tau",
@@ -1222,6 +1309,16 @@ def main() -> None:
         "bottom-Laplacian subspace where sparse motifs (cycles/stars/fans) live, so "
         "held-out gangs survive coarsening even if the learned filter missed them "
         "(0 = target unchanged: train-gang projected indicators only).",
+    )
+    parser.add_argument(
+        "--coarsen-target",
+        choices=["bank", "indicators"],
+        default="bank",
+        help="which R to hand the coarsener (and to score retained energy against): "
+        "'bank' = the full learned filter-bank subspace span(Z) (d columns; treats "
+        "train/test symmetrically, energy == the capture C_S the learner optimizes); "
+        "'indicators' = the M_tau-projected TRAIN-gang indicators of Remark C.18 "
+        "(m columns; cheaper RSA target but held-out energy is ~0 by construction).",
     )
     # baseline encoders ported from run_joint_encoder_comparison
     parser.add_argument(
@@ -1257,7 +1354,7 @@ def main() -> None:
     parser.add_argument(
         "--num-neg-motifs",
         type=int,
-        default=50,
+        default=0,
         help="number of negative repeller sets: random connected background "
         "neighborhoods that should NOT coarsen together; the fit also minimizes a "
         "softmax lambda_max of their Gamma (0 disables the negative term)",
@@ -1277,7 +1374,7 @@ def main() -> None:
     parser.add_argument(
         "--neg-weight",
         type=float,
-        default=1.0,
+        default=0.0,
         help="beta: weight of the negative softmax-lambda_max penalty in the fit",
     )
     parser.add_argument(
@@ -1307,9 +1404,20 @@ def main() -> None:
         "the mean retained energy, spreading ascent over all weak gang directions)",
     )
     parser.add_argument(
+        "--indicator",
+        choices=["degree_weighted", "plain"],
+        # default="plain",
+        default="degree_weighted",
+        help="gang indicator used for retained-energy reporting: "
+        "'degree_weighted' (default) uses v_S = D_tilde^{1/2} 1_S / sqrt(vol(S)) "
+        "(conductance-normalized, matches the training objective); "
+        "'plain' uses the raw 0/1 membership vector 1_S normalized to unit "
+        "M_tau-energy (||1_S||_{M_tau}^2 = 1_S^T L 1_S + tau*|S|).",
+    )
+    parser.add_argument(
         "--max-levels",
         type=int,
-        default=10000,
+        default=1000,
         help="option 2 collapses gangs hierarchically over many levels "
         "(a size-k gang needs ~log2(k) edge-matching levels)",
     )
@@ -1319,7 +1427,7 @@ def main() -> None:
         "--epsilon",
         type=float,
         # default=None,
-        default=1,
+        default=5,
         help="target RSA distortion budget prod_l(1+sigma_l)-1; when set it drives "
         "the coarsening (contract as much as possible until this bound is hit) and "
         "OVERRIDES --reduction",
@@ -1327,7 +1435,7 @@ def main() -> None:
     parser.add_argument(
         "--epsilon-ramp-levels",
         type=int,
-        default=1,
+        default=5,
         help="optional: ration the --epsilon budget as a linear ramp over this many "
         "levels instead of offering it all at level 0 (only used with --epsilon)",
     )
@@ -1339,7 +1447,7 @@ def main() -> None:
     parser.add_argument(
         "--coarsening-laplacian",
         choices=["symmetric", "combinatorial"],
-        default="combinatorial",
+        default="symmetric",
         help="RSA metric for coarsening: 'symmetric' (L = I - A_hat, matches the "
         "algorithm, default) or 'combinatorial' (L = D - W, the legacy metric)",
     )
