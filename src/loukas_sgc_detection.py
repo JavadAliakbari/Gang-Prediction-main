@@ -10,7 +10,10 @@ Loukas paper:
    are both strictly greater than the supplied threshold.
 
 All graph algebra and the Loukas Algorithm 1/2 implementation below are
-PyTorch based.  No NumPy/SciPy coarsening path is used.
+PyTorch based.  No NumPy/SciPy coarsening path is used, with a single
+exception: ``method="ward"`` (:func:`_ward_partition`) lazily imports
+scikit-learn and SciPy for connectivity-constrained Ward agglomeration --
+those packages are optional and only required when that method is selected.
 """
 
 from __future__ import annotations
@@ -422,6 +425,105 @@ def _edge_partition(
         groups[vertex] = n_groups
         n_groups += 1
     return groups, math.sqrt(sigma_sq)
+
+
+def _chained_edge_partition(
+    adjacency: torch.Tensor,
+    target_basis: torch.Tensor,
+    n_target: int,
+    sigma_max: float,
+    *,
+    laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
+    tau: float = 0.0,
+    max_cluster_size: int = 0,
+) -> tuple[torch.Tensor, float, List[tuple[int, int]]]:
+    r"""Cheapest-first *chained* edge contraction (no matching constraint).
+
+    This is :func:`_edge_partition`'s twin, but it drops the ``marked`` rule that
+    lets each vertex be contracted at most once per level.  Edge costs are the
+    same static Loukas edge local-variation costs
+
+        c_ij = (1/4) (d_i + d_j)^2 ||A_i - A_j||^4   ( + tau screening term ),
+
+    computed **once** on the level's ``L``-orthonormal embedding
+    ``A = B(B^T L B)^{+1/2}``.  Edges are then contracted cheapest-first with a
+    union-find, and a vertex may take part in *many* contractions in the same
+    level: contracting ``(a, b)`` when ``a`` already sits in a growing supernode
+    simply unions ``b`` into it (agglomerative chaining, like Ward, but scored
+    against the fixed level embedding rather than recomputed centroids).
+
+    Exactly ``n - n_target`` merges are performed -- one per edge that joins two
+    *distinct* current groups -- so the graph is reduced from ``n`` to
+    ``n_target`` nodes in a single level (as long as that many inter-group edges
+    exist), instead of the ``<= n/2`` a matching can reach.  The outer loop then
+    recomputes the exact RSA epsilon, rebuilds ``L`` and ``B`` on the coarsened
+    graph, and calls this again for the next level.
+
+    Returns ``(groups, sigma, merges)`` where ``groups`` maps each of the ``n``
+    current nodes to a contiguous supernode id ``0..n_target-1``, ``sigma`` is the
+    root of the summed accepted edge costs (the per-level product-bound
+    contribution; the tight distortion is the exact epsilon measured outside),
+    and ``merges`` is the dendrogram for this level: the ordered list of
+    ``(a, b)`` current-node endpoints actually contracted.  ``sigma_max`` caps the
+    cumulative per-level cost and ``max_cluster_size > 0`` caps a supernode's
+    membership (``0`` = unlimited).
+    """
+
+    n = adjacency.shape[0]
+    indices = adjacency.indices()
+    upper = indices[0] < indices[1]
+    edge_i, edge_j = indices[0, upper], indices[1, upper]
+    if edge_i.numel() == 0:
+        return torch.arange(n, device=adjacency.device), 0.0, []
+
+    A = _l_orthonormalize(target_basis, laplacian_fn(adjacency))
+    diff_sq = (A[edge_i] - A[edge_j]).square().sum(dim=1)
+    degree = _degrees(adjacency)
+    costs = 0.25 * degree[edge_i].add(degree[edge_j]).square() * diff_sq.square()
+    if tau:
+        d_sum = degree[edge_i].add(degree[edge_j])
+        frob = (degree[edge_i].square() + degree[edge_j].square()) / d_sum.square()
+        costs = costs + tau * frob * diff_sq
+    order = torch.argsort(costs).tolist()
+    ei, ej, cst = edge_i.tolist(), edge_j.tolist(), costs.tolist()
+
+    parent = list(range(n))
+    size = [1] * n
+    cap = max_cluster_size if (max_cluster_size and max_cluster_size > 0) else n
+
+    def find(x: int) -> int:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:  # path compression
+            parent[x], x = root, parent[x]
+        return root
+
+    # Union-find, cheapest edge first, chaining allowed (no ``marked`` guard).
+    merges: List[tuple[int, int]] = []
+    n_comp, sigma_sq = n, 0.0
+    sigma_limit_sq = math.inf if math.isinf(sigma_max) else sigma_max * sigma_max
+    for e in order:
+        if n_comp <= n_target:
+            break
+        a, b = ei[e], ej[e]
+        ra, rb = find(a), find(b)
+        if ra == rb:  # already in the same supernode
+            continue
+        if size[ra] + size[rb] > cap:
+            continue
+        c = cst[e]
+        if sigma_sq + c > sigma_limit_sq:
+            break
+        parent[ra] = rb
+        size[rb] += size[ra]
+        n_comp -= 1
+        sigma_sq += c
+        merges.append((a, b))
+
+    roots = torch.tensor([find(i) for i in range(n)], device=adjacency.device)
+    _, groups = torch.unique(roots, sorted=True, return_inverse=True)
+    return groups, math.sqrt(sigma_sq), merges
 
 
 def _neighborhood_partition(
@@ -932,6 +1034,570 @@ def _kmeans_partition(
     return groups, math.sqrt(sigma_sq)
 
 
+def _ward_partition(
+    adjacency: torch.Tensor,
+    target_basis: torch.Tensor,
+    n_target: int,
+    sigma_max: float,
+    *,
+    laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
+    tau: float = 0.0,
+) -> tuple[torch.Tensor, float]:
+    r"""Contiguity-constrained Ward agglomeration on the rows of the target embedding.
+
+    The greedy families above fix each merge's cost from *pairwise* differences,
+    which is a property of pairwise decisions, not of coarsening per se: once an
+    early merge is wrong, every later cost derived from it is contaminated, and
+    the contamination compounds.  This method replaces the pairwise cost with
+    the *global* Ward objective on ``A = _l_orthonormalize(target_basis, L)``: it
+    maintains a partition into connected clusters (initially singletons, only
+    ``adjacency``-adjacent clusters are ever merged) and repeatedly merges the
+    pair minimizing the Ward increment
+
+        Delta(C1, C2) = |C1||C2| / (|C1|+|C2|) * || abar_C1 - abar_C2 ||^2,
+        abar_C = (1/|C|) sum_{i in C} A[i, :],
+
+    which is *exactly* the increase of ``||A - Pi_P A||_F^2`` (the Frobenius
+    relaxation of the RSA objective) caused by the merge.  Three properties make
+    this the right replacement for pairwise greedy costs:
+
+    (i) *Validity*: restricting merges to graph-adjacent clusters keeps every
+        contraction set connected, so the output is a legal Laplacian-consistent
+        coarsening (unlike unconstrained k-means on the embedding, whose
+        clusters need not be connected -- see :func:`_kmeans_partition`, which
+        needs a separate connectivity-splitting pass to repair this).
+    (ii) *Strictly generalizes the edge greedy*: at the singleton stage
+        ``Delta(a,b) = 0.5 ||A[a] - A[b]||^2`` is exactly the edge family's
+        local-variation cost (:func:`_edge_partition`) -- Loukas' greedy *is*
+        Ward's first level -- but thereafter Ward compares *centroids over all
+        absorbed original rows*, whereas the edge greedy re-derives pairwise
+        costs from scratch on the coarse graph each level.
+    (iii) *Noise annealing*: once a cluster has absorbed ``m`` rows, its
+        boundary decision statistic aggregates ``m`` rows and its noise shrinks
+        by ``1/sqrt(m)``; correct early merges make later boundary decisions
+        progressively sharper -- the opposite of the greedy's compounding
+        contamination.
+
+    This is a *global*, one-shot solve (the whole merge tree is built once by
+    ``scipy``/``scikit-learn`` and cut directly to ``n_target`` clusters), so
+    -- like :func:`_kmeans_partition` -- it does not consume the per-level
+    ``sigma_max`` RSA budget incrementally; ``sigma_max`` is accepted for
+    signature compatibility with the other partition families but ignored, and
+    the returned ``sigma`` is the *realized* Loukas local-variation cost summed
+    over the resulting supernodes (comparable to the other methods'). Requires
+    ``scikit-learn`` and ``scipy`` (only imported when this method is used).
+    """
+
+    n = adjacency.shape[0]
+    if n <= n_target or adjacency.indices().numel() == 0:
+        return torch.arange(n, device=adjacency.device), 0.0
+
+    try:
+        import numpy as np
+        from scipy.sparse import csr_matrix
+        from sklearn.cluster import AgglomerativeClustering
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "method='ward' requires scikit-learn and scipy "
+            "(pip install scikit-learn scipy)"
+        ) from exc
+
+    A = _l_orthonormalize(target_basis, laplacian_fn(adjacency))
+    A_np = A.detach().cpu().numpy()
+
+    indices = adjacency.indices().cpu().numpy()
+    # connectivity = original adjacency sparsity -> every merge stays connected
+    conn = csr_matrix(
+        (np.ones(indices.shape[1], dtype=np.float64), (indices[0], indices[1])),
+        shape=(n, n),
+    )
+
+    k = max(1, min(int(n_target), n))
+    # model = custom_ward_coarsen(
+    #     target_basis=A, n_target=k, adjacency=adjacency, volume_weighted=False, tau=tau, epsilon_budget=sigma_max,
+    # )
+    # model = custom_ward(
+    #     A, n_clusters=k, connectivity=adjacency, distance_threshold=None
+    # )
+    model = AgglomerativeClustering(
+        n_clusters=k, linkage="ward", connectivity=conn,  distance_threshold=1,
+    ).fit(A_np)
+
+    groups = torch.as_tensor(model.labels_, dtype=torch.long, device=adjacency.device)
+    # groups = model[0]
+    _, groups = torch.unique(groups, sorted=True, return_inverse=True)
+
+    # Realized RSA cost: sum the Loukas local-variation cost over each supernode
+    # (same accounting as _kmeans_partition, for comparability across methods).
+    neighbors, weight = _adjacency_lists(adjacency)
+    degree = _degrees(adjacency)
+    eps = torch.finfo(A.dtype).eps
+    members_by_group: Dict[int, List[int]] = defaultdict(list)
+    for node, group in enumerate(groups.tolist()):
+        members_by_group[group].append(node)
+    sigma_sq = 0.0
+    for members in members_by_group.values():
+        if len(members) >= 2:
+            sigma_sq += _local_variation_cost(
+                members, A, degree, neighbors, weight, eps, tau
+            )
+    return groups, math.sqrt(sigma_sq)
+
+
+@dataclass
+class CustomWardResult:
+    """Result of :func:`custom_ward` -- a full agglomeration tree, cuttable anywhere.
+
+    Attributes mirror scikit-learn's ``AgglomerativeClustering`` so the tree can be
+    used interchangeably:
+
+    * ``children`` -- ``(m, 2)`` long tensor; row ``t`` holds the two cluster ids
+      merged at step ``t`` to form the new cluster ``n_leaves + t`` (leaves are
+      ``0..n_leaves-1``).  Identical id convention to sklearn's ``children_``.
+    * ``distances`` -- ``(m,)`` tensor; ``distances[t]`` is the Ward increment of
+      merge ``t`` (the increase in within-cluster sum of squares
+      ``||A - Pi_P A||_F^2``, i.e. the merged pair's Loukas Frobenius cost).
+    * ``sizes`` -- ``(n_leaves + m,)`` tensor with the size of every cluster id.
+    * ``labels_`` -- the fitted partition (contiguous ids), cut at ``n_clusters``
+      / ``distance_threshold`` if given, else the full collapse (one cluster per
+      connected component).
+    * ``n_leaves`` / ``n_clusters_`` -- number of original nodes / fitted clusters.
+
+    Because the whole tree is retained, :meth:`labels_at` and
+    :meth:`labels_at_threshold` recut it at any granularity without re-fitting.
+    """
+
+    children: torch.Tensor
+    distances: torch.Tensor
+    sizes: torch.Tensor
+    n_leaves: int
+    labels_: torch.Tensor
+    n_clusters_: int
+
+    def _cut(self, n_merges_to_apply: int) -> torch.Tensor:
+        """Apply the first ``n_merges_to_apply`` merges -> contiguous leaf labels."""
+        n = self.n_leaves
+        m = int(self.children.shape[0])
+        apply = max(0, min(int(n_merges_to_apply), m))
+        parent = list(range(n + m))
+
+        def find(x: int) -> int:
+            root = x
+            while parent[root] != root:
+                root = parent[root]
+            while parent[x] != root:  # path compression
+                parent[x], x = root, parent[x]
+            return root
+
+        pairs = self.children.tolist()
+        for t in range(apply):
+            a, b = pairs[t]
+            parent[find(int(a))] = n + t
+            parent[find(int(b))] = n + t
+
+        roots: dict[int, int] = {}
+        labels = [0] * n
+        for leaf in range(n):
+            r = find(leaf)
+            labels[leaf] = roots.setdefault(r, len(roots))
+        return torch.tensor(labels, dtype=torch.long, device=self.children.device)
+
+    def labels_at(self, n_clusters: int) -> torch.Tensor:
+        """Contiguous labels for the horizontal cut yielding ``n_clusters`` clusters."""
+        return self._cut(self.n_leaves - int(n_clusters))
+
+    def labels_at_threshold(self, threshold: float) -> torch.Tensor:
+        """Labels after every leading merge with increment ``< threshold``.
+
+        Stops at the first merge whose Ward increment reaches ``threshold`` -- the
+        same prefix semantics as sklearn's ``distance_threshold`` (a distortion
+        budget rather than a fixed cluster count).
+        """
+        d = self.distances.tolist()
+        apply = 0
+        for x in d:
+            if x < threshold:
+                apply += 1
+            else:
+                break
+        return self._cut(apply)
+
+
+def _custom_ward_edges(connectivity, n: int):
+    """Normalize a connectivity argument to deduped undirected edges ``(ei < ej)``.
+
+    Returns two ``int64`` numpy arrays ``(ei, ej)`` with ``ei < ej`` and no
+    duplicates.  Accepts a sparse ``torch`` adjacency, a ``(2, E)`` edge-index
+    tensor/array, a SciPy sparse matrix, or ``None`` (fully connected --
+    unconstrained Ward).  The dedup is vectorized (``i*n + j`` key) rather than a
+    per-edge Python set.
+    """
+    import numpy as np
+
+    if connectivity is None:
+        ii, jj = np.triu_indices(n, k=1)
+        return ii.astype(np.int64), jj.astype(np.int64)
+
+    if torch.is_tensor(connectivity):
+        if connectivity.is_sparse:
+            idx = connectivity.coalesce().indices()
+            rows, cols = idx[0].cpu().numpy(), idx[1].cpu().numpy()
+        elif connectivity.dim() == 2 and connectivity.shape[0] == 2:
+            rows, cols = connectivity[0].cpu().numpy(), connectivity[1].cpu().numpy()
+        else:  # dense adjacency
+            idx = connectivity.nonzero(as_tuple=False)
+            rows, cols = idx[:, 0].cpu().numpy(), idx[:, 1].cpu().numpy()
+    elif hasattr(connectivity, "tocoo"):  # SciPy sparse
+        coo = connectivity.tocoo()
+        rows, cols = np.asarray(coo.row), np.asarray(coo.col)
+    else:  # array-like (2, E)
+        rows, cols = np.asarray(connectivity[0]), np.asarray(connectivity[1])
+
+    rows = rows.astype(np.int64, copy=False)
+    cols = cols.astype(np.int64, copy=False)
+    lo = np.minimum(rows, cols)
+    hi = np.maximum(rows, cols)
+    keep = lo != hi
+    lo, hi = lo[keep], hi[keep]
+    keys = np.unique(lo * n + hi)  # dedup undirected edges in one pass
+    return keys // n, keys % n
+
+
+def custom_ward(
+    X: torch.Tensor,
+    connectivity=None,
+    *,
+    n_clusters: int | None = None,
+    distance_threshold: float | None = None,
+    full_tree: bool = True,
+    merge_cost: Callable[[torch.Tensor, int, torch.Tensor, int], float] | None = None,
+    node_weights: torch.Tensor | None = None,
+) -> CustomWardResult:
+    r"""Self-contained connectivity-constrained Ward agglomeration (no scikit-learn).
+
+    A from-scratch reimplementation of ``AgglomerativeClustering(linkage="ward")``
+    that exposes every piece of the algorithm so it can be inspected and extended
+    (custom merge cost, distortion-threshold stopping, arbitrary re-cuts) -- the
+    things sklearn's one-shot ``fit`` hides.
+
+    The rows of ``X`` are the objects clustered; in the coarsening pipeline these
+    are the ``L``-orthonormal embedding rows ``A = B(B^T L B)^{-1/2}``, so squared
+    Euclidean distance on ``X`` **is** the ``L``-metric (RSA) distortion -- feeding
+    that ``A`` here is what makes Euclidean Ward an ``L_sym`` clustering (no metric
+    swap needed; the metric lives in the whitening of ``X``).
+
+    Algorithm (exact Ward via centroids, lazy-deletion heap):
+
+    * every node starts as a singleton cluster (centroid = its row, size 1);
+    * only ``connectivity``-adjacent clusters are merge candidates, so every
+      supernode stays a connected subgraph (a legal Laplacian-consistent
+      coarsening) -- pass the graph adjacency as ``connectivity``;
+    * the globally cheapest admissible merge is taken, where the cost is the Ward
+      increment ``Delta(a,b) = (n_a n_b)/(n_a + n_b) ||mu_a - mu_b||^2``; centroid
+      and neighbour sets update in place and the merged cluster's new candidate
+      costs are pushed to the heap.  Cluster ids are immutable, so a heap entry is
+      valid exactly while both its endpoints are still active -- no stale-key
+      bookkeeping is needed beyond an ``active`` check.
+
+    Parameters mirror sklearn: ``n_clusters`` and/or ``distance_threshold`` set the
+    fitted cut in ``labels_``; ``full_tree`` (default ``True``, like
+    ``compute_full_tree``) builds the entire dendrogram so
+    :meth:`CustomWardResult.labels_at` can recut at any ``k`` afterwards, whereas
+    ``full_tree=False`` stops the agglomeration as soon as the cut is reached.
+    ``merge_cost`` overrides the Ward increment with any
+    ``f(centroid_a, size_a, centroid_b, size_b) -> float`` (e.g. a different metric
+    on centroids); the default is exact Ward.  With ``connectivity=None`` every
+    pair is a candidate (unconstrained Ward, ``O(n^2)`` edges).
+
+    ``node_weights`` (default ``None`` = all ones = standard cardinality Ward)
+    turns this into **weighted** Ward: cluster weight ``W_C = sum_{i in C} w_i``,
+    the centroid becomes the ``w``-weighted mean, and the increment becomes
+    ``(W_a W_b)/(W_a + W_b) ||mu_a - mu_b||^2``.  Passing the node degrees makes it
+    *volume*-weighted -- the natural weighting for graph coarsening, matching
+    Loukas' degree-weighted contraction.  Caveat: that only stays consistent with
+    the RSA distortion if the epsilon is also degree-weighted;
+    :func:`_exact_rsa_epsilon` uses *uniform* block-averaging, which the default
+    (uniform) Ward already matches, so leave ``node_weights=None`` unless you have
+    switched the RSA metric to match.
+    """
+    import heapq
+
+    import numpy as np
+
+    Xt = (
+        X.detach().to(torch.float64)
+        if torch.is_tensor(X)
+        else torch.as_tensor(X, dtype=torch.float64)
+    )
+    n = int(Xt.shape[0])
+    device = Xt.device
+    if n == 0:
+        empty = torch.empty((0, 2), dtype=torch.long, device=device)
+        return CustomWardResult(
+            empty,
+            torch.empty(0, device=device),
+            torch.empty(0, device=device),
+            0,
+            torch.empty(0, dtype=torch.long, device=device),
+            0,
+        )
+
+    ei, ej = _custom_ward_edges(connectivity, n)
+
+    # Cluster state in preallocated arrays indexed by (immutable) cluster id.
+    # A merge only allocates a new id, so at most ``2n - 1`` ids ever exist.
+    max_ids = 2 * n
+    d_dim = int(Xt.shape[1]) if Xt.dim() == 2 else 1
+    C = np.zeros((max_ids, d_dim), dtype=np.float64)  # centroids
+    C[:n] = Xt.detach().cpu().numpy().reshape(n, d_dim)
+    w = np.ones(max_ids, dtype=np.float64)  # cluster weights
+    size_arr = np.ones(max_ids, dtype=np.int64)  # cluster cardinalities
+    if node_weights is not None:
+        wv = np.asarray([float(x) for x in node_weights], dtype=np.float64)
+        if wv.shape[0] != n:
+            raise ValueError("node_weights must have one entry per row of X")
+        w[:n] = wv
+
+    neighbors: Dict[int, set] = defaultdict(set)
+    use_custom = merge_cost is not None
+
+    def cost_scalar(a: int, b: int) -> float:  # custom-cost fallback only
+        return float(
+            merge_cost(
+                torch.from_numpy(C[a]),
+                int(size_arr[a]),
+                torch.from_numpy(C[b]),
+                int(size_arr[b]),
+            )
+        )
+
+    # ---- initial candidate costs, vectorized over all connectivity edges ----
+    n_edges = int(ei.shape[0])
+    if n_edges:
+        ei_l, ej_l = ei.tolist(), ej.tolist()
+        for i, j in zip(ei_l, ej_l):
+            neighbors[i].add(j)
+            neighbors[j].add(i)
+        if use_custom:
+            init = [cost_scalar(i, j) for i, j in zip(ei_l, ej_l)]
+        else:
+            diff = C[ei] - C[ej]
+            d2 = np.einsum("ij,ij->i", diff, diff)
+            init = ((w[ei] * w[ej] / (w[ei] + w[ej])) * d2).tolist()
+        heap: list[tuple[float, int, int]] = [
+            (init[t], ei_l[t], ej_l[t]) for t in range(n_edges)
+        ]
+        heapq.heapify(heap)
+    else:
+        heap = []
+
+    active = set(range(n))
+    children: List[tuple[int, int]] = []
+    distances: List[float] = []
+    sizes: List[int] = [1] * n  # indexed by cluster id (leaves + internals)
+    next_id = n
+
+    def stop_now() -> bool:
+        if full_tree:
+            return False
+        return n_clusters is not None and len(active) <= int(n_clusters)
+
+    while heap and len(active) > 1 and not stop_now():
+        d, a, b = heapq.heappop(heap)
+        if a not in active or b not in active:
+            continue  # a stale candidate: one endpoint already merged away
+        if not full_tree and distance_threshold is not None and d >= distance_threshold:
+            break
+
+        new = next_id  # always the largest id so far, so new > every neighbour k
+        next_id += 1
+        wa, wb = w[a], w[b]
+        C[new] = (wa * C[a] + wb * C[b]) / (wa + wb)
+        w[new] = wa + wb
+        size_arr[new] = size_arr[a] + size_arr[b]
+        sizes.append(int(size_arr[new]))
+        children.append((a, b))
+        distances.append(d)
+
+        merged_neighbors = (neighbors[a] | neighbors[b]) - {a, b}
+        active.discard(a)
+        active.discard(b)
+        active.add(new)
+        nbr_list = [k for k in merged_neighbors if k in active]
+        neighbors[new] = set(nbr_list)
+        for k in nbr_list:
+            nk = neighbors[k]
+            nk.discard(a)
+            nk.discard(b)
+            nk.add(new)
+        # ---- costs from the merged cluster to all its neighbours, batched ----
+        if nbr_list:
+            if use_custom:
+                for k in nbr_list:
+                    heapq.heappush(heap, (cost_scalar(new, k), k, new))
+            else:
+                karr = np.fromiter(nbr_list, dtype=np.int64, count=len(nbr_list))
+                diff = C[karr] - C[new]
+                d2 = np.einsum("ij,ij->i", diff, diff)
+                costs = (w[karr] * w[new] / (w[karr] + w[new])) * d2
+                cl = costs.tolist()
+                for t, k in enumerate(nbr_list):
+                    heapq.heappush(heap, (cl[t], k, new))
+
+    children_t = (
+        torch.tensor(children, dtype=torch.long, device=device)
+        if children
+        else torch.empty((0, 2), dtype=torch.long, device=device)
+    )
+    distances_t = torch.tensor(distances, dtype=torch.float64, device=device)
+    sizes_t = torch.tensor(sizes, dtype=torch.long, device=device)
+
+    result = CustomWardResult(
+        children=children_t,
+        distances=distances_t,
+        sizes=sizes_t,
+        n_leaves=n,
+        labels_=torch.empty(0, dtype=torch.long, device=device),
+        n_clusters_=0,
+    )
+    if n_clusters is not None:
+        labels = result.labels_at(int(n_clusters))
+    elif distance_threshold is not None:
+        labels = result.labels_at_threshold(float(distance_threshold))
+    else:  # full collapse -> one cluster per connected component
+        labels = result._cut(len(children))
+    result.labels_ = labels
+    result.n_clusters_ = int(labels.max().item()) + 1
+    return result
+
+
+def custom_ward_coarsen(
+    adjacency: torch.Tensor,
+    target_basis: torch.Tensor,
+    *,
+    n_target: int = 1,
+    epsilon_budget: float = float("inf"),
+    refresh_every: int | None = None,
+    laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _normalized_laplacian,
+    tau: float = 0.0,
+    self_loop_aware: bool = False,
+    volume_weighted: bool = False,
+    return_history: bool = False,
+):
+    r"""Ward coarsening with a *refreshed* embedding and exact-RSA stopping.
+
+    Plain :func:`custom_ward` (like scikit-learn) builds one tree from the
+    embedding ``A = B(B^T L B)^{-1/2}`` computed *once* on the original graph, so
+    deep merges are scored against a stale metric.  This driver instead coarsens
+    in levels: it runs one Ward pass that reduces the node count by
+    ``refresh_every``, rebuilds ``L``, ``B`` and ``A`` on the *coarsened* graph,
+    and repeats -- so every level's merges are scored against an up-to-date
+    embedding (the same fix the sequential edge method uses, applied to Ward).
+
+    * ``refresh_every=None`` -- one global Ward pass cut to ``n_target`` (the
+      static behaviour, equivalent to sklearn); no refresh.
+    * ``refresh_every=b`` -- rebuild the embedding every ``b`` contractions; small
+      ``b`` = fresher metric, more cost.  ``b=1`` refreshes after every merge.
+
+    Stopping uses the **exact** RSA constant (:func:`_exact_rsa_epsilon` against
+    the original ``a0``/``L0``, formed once): coarsening halts at ``n_target`` or
+    as soon as the exact epsilon would exceed ``epsilon_budget``.
+
+    ``self_loop_aware`` uses the volume-preserving ``W_c = S^T W S`` reduction and
+    the self-loop-aware normalized Laplacian; ``volume_weighted`` runs *degree*-
+    weighted Ward each level (see ``node_weights`` in :func:`custom_ward` -- pair
+    it with a degree-weighted RSA to stay consistent).
+
+    Returns ``(groups, coarse_adjacency, epsilon_exact)`` -- ``groups`` maps each
+    original node to a contiguous supernode id -- plus a per-level ``history`` list
+    when ``return_history`` is set.
+    """
+
+    base_laplacian = _weighted_normalized_laplacian if self_loop_aware else laplacian_fn
+
+    def metric(adj: torch.Tensor) -> torch.Tensor:
+        return _screened_metric(base_laplacian(adj), tau)
+
+    n_original = int(adjacency.shape[0])
+    current_adjacency = adjacency.coalesce()
+    basis = target_basis
+    original_to_current = torch.arange(
+        n_original, device=current_adjacency.device, dtype=torch.long
+    )
+
+    # Exact-RSA reference on the original graph (partition is all that changes).
+    original_laplacian = metric(current_adjacency)
+    try:
+        a0 = _l_orthonormalize(basis, original_laplacian)
+    except ValueError:
+        a0 = None
+
+    history: List[dict] = []
+    epsilon_exact = 0.0
+
+    while int(current_adjacency.shape[0]) > max(1, n_target):
+        n_current = int(current_adjacency.shape[0])
+        want = (
+            (n_current - n_target)
+            if refresh_every is None
+            else min(int(refresh_every), n_current - n_target)
+        )
+        if want <= 0:
+            break
+
+        try:
+            A = _l_orthonormalize(basis, metric(current_adjacency))
+        except ValueError:
+            break
+        if A.shape[1] == 0:
+            break
+
+        weights = _degrees(current_adjacency) if volume_weighted else None
+        res = custom_ward(
+            A,
+            current_adjacency,
+            n_clusters=n_current - want,
+            full_tree=False,
+            node_weights=weights,
+        )
+        groups = res.labels_.to(dtype=torch.long)
+        n_new = int(groups.max().item()) + 1
+        if n_new >= n_current:
+            break  # no admissible merge (e.g. disconnected below n_target)
+
+        original_to_current = groups[original_to_current]
+        current_adjacency = _reduce_adjacency(
+            current_adjacency, groups, keep_self_loops=self_loop_aware
+        ).coalesce()
+        basis = _reduce_basis(basis, groups)
+
+        _, dense_ids = torch.unique(
+            original_to_current, sorted=True, return_inverse=True
+        )
+        if a0 is not None:
+            epsilon_exact = _exact_rsa_epsilon(a0, original_laplacian, dense_ids)
+
+        if return_history:
+            history.append(
+                {
+                    "n_after": n_new,
+                    "epsilon_exact": epsilon_exact,
+                    "ward_increment_max": (
+                        float(res.distances.max()) if res.distances.numel() else 0.0
+                    ),
+                }
+            )
+        if math.isfinite(epsilon_budget) and epsilon_exact >= epsilon_budget:
+            break
+
+    _, groups_final = torch.unique(
+        original_to_current, sorted=True, return_inverse=True
+    )
+    if return_history:
+        return groups_final, current_adjacency, epsilon_exact, history
+    return groups_final, current_adjacency, epsilon_exact
+
+
 def _linkage_partition(
     adjacency: torch.Tensor,
     target_basis: torch.Tensor,
@@ -1024,19 +1690,83 @@ def _linkage_partition(
     return groups, math.sqrt(sigma_sq)
 
 
-def _reduce_adjacency(adjacency: torch.Tensor, groups: torch.Tensor) -> torch.Tensor:
-    """Apply the Laplacian-consistent Loukas reduction to a sparse adjacency."""
+def _reduce_adjacency(
+    adjacency: torch.Tensor,
+    groups: torch.Tensor,
+    *,
+    keep_self_loops: bool = False,
+) -> torch.Tensor:
+    """Apply the Laplacian-consistent Loukas reduction to a sparse adjacency.
+
+    This is exactly ``W_c = S^T W S`` with ``S`` the 0/1 assignment matrix
+    (``S[i, r] = 1`` iff original node ``i`` is in supernode ``r``): the
+    contraction sums every original edge weight into its supernode pair.
+
+    ``keep_self_loops`` controls the diagonal of ``W_c``:
+
+    * ``False`` (default) drops it, so ``_degrees(W_c)`` is the *cut* degree and
+      the combinatorial ``L = D - W`` is unchanged (self-loops cancel there).
+      This preserves the historical behaviour of every caller.
+    * ``True`` keeps ``(W_c)_{rr} = sum_{i, j in C_r} W_{ij}``, i.e. the total
+      internal weight of the supernode (each internal undirected edge counted
+      twice).  A single merge ``u, v -> s`` then satisfies the volume-preserving
+      rules ``(W_c)_{ss} = W_{uu} + W_{vv} + 2 W_{uv}`` and ``d_s = d_u + d_v``
+      automatically, because the two off-diagonal ``(u, v)`` / ``(v, u)`` entries
+      collapse onto ``(s, s)`` and add.  Use this with
+      :func:`_weighted_normalized_laplacian`, which reads the stored diagonal.
+    """
 
     n_new = int(groups.max().item()) + 1
     old_indices = adjacency.indices()
     new_indices = groups[old_indices]
-    keep = new_indices[0] != new_indices[1]
+    if keep_self_loops:
+        keep = slice(None)
+    else:
+        keep = new_indices[0] != new_indices[1]
     return torch.sparse_coo_tensor(
         new_indices[:, keep],
         adjacency.values()[keep],
         (n_new, n_new),
         dtype=adjacency.dtype,
         device=adjacency.device,
+    ).coalesce()
+
+
+def _weighted_normalized_laplacian(adjacency: torch.Tensor) -> torch.Tensor:
+    r"""Self-loop-aware symmetric normalized Laplacian ``L_sym = I - D^{-1/2} W D^{-1/2}``.
+
+    Unlike :func:`_normalized_laplacian` (which discards any stored diagonal and
+    applies the renormalization trick ``W + I``, ``D_tilde = D + I``), this reads
+    the diagonal ``W_{ii}`` that :func:`_reduce_adjacency` (``keep_self_loops=True``)
+    stores as a supernode's internal weight.  With ``D = diag(W \mathbf 1)`` the
+    full row sum (diagonal included),
+
+        (L_sym)_{ii} = 1 - W_{ii} / d_i,
+        (L_sym)_{ij} = - W_{ij} / sqrt(d_i d_j)   (i != j),
+
+    so a dense supernode with large internal weight has a *smaller* normalized
+    diagonal, reflecting that more of its volume stays inside it.  On a graph
+    with no self-loops (``W_{ii} = 0``) this is the classical
+    ``I - D^{-1/2} W D^{-1/2}`` and eigenvalues still lie in ``[0, 2]``.
+    """
+
+    n = adjacency.shape[0]
+    device, dtype = adjacency.device, adjacency.dtype
+    indices = adjacency.indices()
+    values = adjacency.values()
+
+    degree = torch.zeros(n, dtype=dtype, device=device)
+    degree.scatter_add_(0, indices[0], values)
+    inv_sqrt = degree.clamp_min(torch.finfo(dtype).eps).rsqrt()
+    a_hat_values = values * inv_sqrt[indices[0]] * inv_sqrt[indices[1]]
+
+    # L = I - A_hat: negate every A_hat entry (diagonal included) and add the
+    # identity.  Coalescing sums the +1 with the -W_ii / d_i diagonal term.
+    loop = torch.arange(n, device=device)
+    lap_indices = torch.cat((indices, torch.stack((loop, loop))), dim=1)
+    lap_values = torch.cat((-a_hat_values, torch.ones(n, dtype=dtype, device=device)))
+    return torch.sparse_coo_tensor(
+        lap_indices, lap_values, (n, n), dtype=dtype, device=device
     ).coalesce()
 
 
@@ -1131,6 +1861,15 @@ def loukas_coarsen_pytorch(
       cost-weighted graph: one round per level, with ``A`` refreshed between
       rounds so merges never chain against a stale embedding (connected by
       construction).  See :func:`_linkage_partition`.
+    * ``"ward"`` -- global, non-greedy contiguity-constrained Ward agglomeration
+      on the ``L``-orthonormal embedding: repeatedly merges the *adjacent*
+      cluster pair minimizing the Ward increment (the Frobenius-exact cost of
+      the merge), which strictly generalizes the edge greedy (its first level)
+      while comparing centroids over all absorbed rows thereafter, so early
+      correct merges anneal later boundary decisions instead of compounding
+      their errors.  One-shot (like ``"kmeans"``) and connected by construction
+      (unlike ``"kmeans"``, no post-hoc connectivity split is needed).  Requires
+      scikit-learn and scipy.  See :func:`_ward_partition`.
 
     ``laplacian`` chooses the metric the RSA distortion is measured in:
     ``"combinatorial"`` (default) uses ``L = D - W`` (:func:`_laplacian`), while
@@ -1154,10 +1893,18 @@ def loukas_coarsen_pytorch(
         raise ValueError("reduction must be in [0, 1)")
     if tau < 0.0:
         raise ValueError("tau must be non-negative")
-    if method not in ("edges", "neighborhood", "capped", "star", "kmeans", "linkage"):
+    if method not in (
+        "edges",
+        "neighborhood",
+        "capped",
+        "star",
+        "kmeans",
+        "linkage",
+        "ward",
+    ):
         raise ValueError(
             "method must be 'edges', 'neighborhood', 'capped', 'star', 'kmeans', "
-            "or 'linkage'"
+            "'linkage', or 'ward'"
         )
     if laplacian in ("combinatorial", "comb"):
         base_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian
@@ -1203,6 +1950,12 @@ def loukas_coarsen_pytorch(
             laplacian_fn=laplacian_fn,
             tau=tau,
         )
+    elif method == "ward":
+        partition = partial(
+            _ward_partition,
+            laplacian_fn=laplacian_fn,
+            tau=tau,
+        )
     else:
         partition = partial(
             _kmeans_partition,
@@ -1245,7 +1998,10 @@ def loukas_coarsen_pytorch(
         # k-means is a one-shot global partition; connectivity splitting leaves it
         # well above n_target, so the first level clusters and later levels switch
         # to cheap edge matching to refine the leftover fragments down to target
-        # (re-clustering instead would inflate the RSA epsilon).
+        # (re-clustering instead would inflate the RSA epsilon).  Ward is also
+        # one-shot but connectivity-constrained by construction, so it lands
+        # exactly on n_target after its single call -- no refinement fallback
+        # is needed.
         level_partition = (
             partial(_edge_partition, laplacian_fn=laplacian_fn, tau=tau)
             if (method == "kmeans" and level > 0)

@@ -87,6 +87,16 @@ from src.loukas_sgc_detection import (
 )
 from src.pattern_models import create_pattern
 from src.bank_visualize import save_rich_plots
+from src.propagation_encoders import GCN2Encoder, fit_encoder
+
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -257,6 +267,55 @@ def build_synthetic_graph(
         num_nodes=num_nodes,
     )
     return graph, patterns
+
+
+def inject_gang_features(
+    X: torch.Tensor,
+    patterns: list,
+    *,
+    shared: float = 0.0,
+    signature: float = 0.0,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Add *class-consistent, block-aligned* feature structure on the gang nodes.
+
+    Implements the "when do features help" analysis (Theorem 5.6 / Prop 6.8): the
+    capture ceiling is *reachability*, so features raise ``C_S^tau`` exactly when
+    they carry a component *along* ``v_S`` (roughly constant inside the gang and
+    offset from the host).  Two additive block-constant components are injected on
+    each gang's member nodes:
+
+    * ``shared`` -- a single unit direction ``u_shared`` common to *every* gang (a
+      class-consistent "gangness" signature).  This is what generalizes train->test
+      and drives *union* detection / the node head (Q2): the same statistic recurs
+      on held-out gangs.
+    * ``signature`` -- a *fresh* random unit direction per gang.  Distinct
+      per-gang signatures give the *collective* objective linearly independent
+      feature signatures within the shared conductance band, lifting
+      ``rank(Psi|_c)`` so ``lambda_min(Gamma)`` does not collapse (Prop 6.8).
+
+    Host nodes are untouched (mean 0), so the injected mass is offset from the
+    host.  ``shared = signature = 0`` returns ``X`` unchanged (isotropic baseline).
+    """
+
+    if shared <= 0.0 and signature <= 0.0:
+        return X
+    N, d = X.shape
+    gen = torch.Generator().manual_seed(int(seed) + 777)
+    Xg = X.clone()
+    u_shared = torch.randn(d, generator=gen, dtype=X.dtype)
+    u_shared = u_shared / u_shared.norm().clamp_min(1e-12)
+    for p in patterns:
+        idx = torch.as_tensor(p.node_indices, dtype=torch.long)
+        offset = torch.zeros(d, dtype=X.dtype)
+        if shared > 0.0:
+            offset = offset + shared * u_shared
+        if signature > 0.0:
+            sig = torch.randn(d, generator=gen, dtype=X.dtype)
+            sig = sig / sig.norm().clamp_min(1e-12)
+            offset = offset + signature * sig
+        Xg[idx] = Xg[idx] + offset.unsqueeze(0)
+    return Xg
 
 
 def make_negative_sampler(
@@ -566,13 +625,14 @@ def fit_collective_bank(
         theta = _unit(raw)
         Z = _filtered_bank(propagated, theta)
         gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau)
-        lam_min = torch.linalg.eigvalsh(gamma)[0]
+        # lam_min = torch.linalg.eigvalsh(gamma)[0]
         # objective ascended by the optimizer: the hard lambda_min (T=0) or a
         # differentiable soft-min over the whole low end of the spectrum (T>0).
         pos_obj = (
             _soft_lambda_min(gamma, softmin_temperature)
+            # torch.trace(gamma) / gamma.shape[0]
             if softmin_temperature > 0.0
-            else lam_min
+            else torch.linalg.eigvalsh(gamma)[0]
         )
 
         if not neg_active:
@@ -602,7 +662,7 @@ def fit_collective_bank(
             optimizer.step()
             soft_neg_val = float(soft_neg.detach())
 
-        value = float(lam_min.detach())
+        value = float(torch.linalg.eigvalsh(gamma)[0].detach())
         history.append(value)
         neg_history.append(soft_neg_val)
         energy_history.append(float(torch.diagonal(gamma.detach()).clamp(0, 1).mean()))
@@ -954,6 +1014,372 @@ def _parse_taus(spec: str) -> list:
     return vals
 
 
+# --------------------------------------------------------------------------- #
+# 8.  supervised node-level classification: linear head on Z  vs.  a GNN
+# --------------------------------------------------------------------------- #
+def _binary_metrics(y_true: np.ndarray, prob: np.ndarray, thr: float = 0.5) -> dict:
+    """Accuracy / precision / recall / AUC for the gang (positive) class."""
+
+    pred = (prob >= thr).astype(np.int64)
+    try:
+        auc = (
+            float(roc_auc_score(y_true, prob)) if len(set(y_true)) > 1 else float("nan")
+        )
+    except ValueError:
+        auc = float("nan")
+    return {
+        "accuracy": float(accuracy_score(y_true, pred)),
+        "precision": float(precision_score(y_true, pred, zero_division=0)),
+        "recall": float(recall_score(y_true, pred, zero_division=0)),
+        "auc": auc,
+    }
+
+
+def build_node_split(
+    train_patterns: list,
+    test_patterns: list,
+    num_nodes: int,
+    gang_mask: torch.Tensor,
+    *,
+    neg_per_pos: float,
+    seed: int,
+) -> tuple:
+    """Node-level gang(1)/non-gang(0) labels with disjoint train/test node indices.
+
+    Positives are the *train* / *test* gang nodes (the same gang split used for
+    detection, so the head is scored on *held-out* gangs).  Negatives are random
+    non-gang (host) nodes -- the conductance-matched benign background of
+    Definition 8.4 -- split disjointly into train and test so no host node is
+    shared.  Returns ``(y, train_idx, test_idx)``.
+    """
+
+    rng = np.random.default_rng(int(seed) + 99)
+    y = gang_mask.to(torch.long).clone()
+    pos_tr = torch.cat(
+        [torch.as_tensor(p.node_indices, dtype=torch.long) for p in train_patterns]
+    )
+    pos_te = torch.cat(
+        [torch.as_tensor(p.node_indices, dtype=torch.long) for p in test_patterns]
+    )
+
+    host = np.nonzero(gang_mask.cpu().numpy() == 0)[0]
+    rng.shuffle(host)
+    n_neg_tr = int(round(neg_per_pos * len(pos_tr)))
+    n_neg_te = int(round(neg_per_pos * len(pos_te)))
+    n_neg_tr = min(n_neg_tr, len(host))
+    neg_tr = host[:n_neg_tr]
+    neg_te = host[n_neg_tr : n_neg_tr + min(n_neg_te, len(host) - n_neg_tr)]
+
+    train_idx = torch.cat([pos_tr, torch.as_tensor(neg_tr, dtype=torch.long)])
+    test_idx = torch.cat([pos_te, torch.as_tensor(neg_te, dtype=torch.long)])
+    return y, train_idx, test_idx
+
+
+def train_linear_head(
+    Z: torch.Tensor,
+    y: torch.Tensor,
+    train_idx: torch.Tensor,
+    test_idx: torch.Tensor,
+    *,
+    epochs: int,
+    learning_rate: float,
+    seed: int,
+) -> dict:
+    """Class-weighted logistic head on the frozen collective embedding ``Z``.
+
+    This is the operational form of the union-detection / Definition 8.4 head: a
+    *linear* probe on ``Z`` suffices exactly when the union indicator is captured
+    (``v_union approx Z w``).  Metrics are reported on the held-out gang nodes.
+    """
+
+    torch.manual_seed(int(seed))
+    d = Z.shape[1]
+    head = nn.Linear(d, 2).to(dtype=Z.dtype)
+    opt = torch.optim.Adam(head.parameters(), lr=learning_rate, weight_decay=5e-4)
+    yl = y.to(torch.long)
+    counts = torch.bincount(yl[train_idx], minlength=2).to(dtype=Z.dtype)
+    w = (counts.sum() / counts.clamp_min(1.0)) / 2.0
+    for _ in range(epochs):
+        head.train()
+        opt.zero_grad(set_to_none=True)
+        logits = head(Z[train_idx])
+        loss = F.cross_entropy(logits, yl[train_idx], weight=w.to(Z.dtype))
+        loss.backward()
+        opt.step()
+    head.eval()
+    with torch.no_grad():
+        prob = torch.softmax(head(Z[test_idx]), dim=1)[:, 1].cpu().numpy()
+    return _binary_metrics(yl[test_idx].cpu().numpy(), prob)
+
+
+def _train_gang_m_vhat(
+    a_hat: torch.Tensor, adjacency: torch.Tensor, patterns: list, tau: float
+) -> torch.Tensor:
+    """``M_tau v_hat_S`` for the training gangs -- the RHS of the collective Gram."""
+
+    eps = torch.finfo(a_hat.dtype).eps
+    V = degree_weighted_indicators(adjacency, patterns)  # (N, m)
+    l_v = _l_apply(a_hat, V)
+    phi = (V * l_v).sum(0).clamp_min(eps)  # Phi_j = ||v_j||_L^2
+    return (l_v + tau * V) / (phi + tau).sqrt().unsqueeze(0)  # M_tau v_hat_j
+
+
+def _class_weights(y: torch.Tensor, train_idx: torch.Tensor, dtype) -> torch.Tensor:
+    counts = torch.bincount(y[train_idx].to(torch.long), minlength=2).to(dtype=dtype)
+    return (counts.sum() / counts.clamp_min(1.0)) / 2.0
+
+
+def fit_joint_bank_head(
+    a_hat: torch.Tensor,
+    adjacency: torch.Tensor,
+    X: torch.Tensor,
+    y: torch.Tensor,
+    train_patterns: list,
+    train_idx: torch.Tensor,
+    test_idx: torch.Tensor,
+    *,
+    degree: int,
+    epochs: int,
+    learning_rate: float,
+    ridge: float,
+    tau: float,
+    label_weight: float,
+    seed: int,
+) -> tuple:
+    """Filter bank trained on the **two-term** objective (coarsening + labels).
+
+    ``loss = -lambda_min(Gamma(Z)) + label_weight * CE(head(Z), y)``.  The first
+    term is the *same* collective capture objective that makes ``Z`` a good RSA
+    coarsening target (so the embedding still detects gangs); the second is a label
+    regularizer that flows into **both** the head and the per-channel filter
+    coefficients.  The single learned ``Z`` therefore serves coarsening *and*
+    prediction.  Returns ``(theta, Z, metrics, lam_min_final)``.
+    """
+
+    torch.manual_seed(int(seed))
+    dtype = X.dtype
+    eps = torch.finfo(dtype).eps
+    m_vhat = _train_gang_m_vhat(a_hat, adjacency, train_patterns, tau)
+    propagated = propagation_stack(a_hat, X, degree)  # [A_hat^k X], k=0..K
+    d = X.shape[1]
+    raw = nn.Parameter(torch.ones(degree + 1, d, dtype=dtype))
+    head = nn.Linear(d, 2).to(dtype=dtype)
+    opt = torch.optim.Adam(
+        [raw, *head.parameters()], lr=learning_rate, weight_decay=5e-4
+    )
+    yl = y.to(torch.long)
+    w = _class_weights(yl, train_idx, dtype)
+
+    def _unit(t: torch.Tensor) -> torch.Tensor:
+        return t / t.norm(dim=0, keepdim=True).clamp_min(eps)
+
+    lam_min = torch.zeros((), dtype=dtype)
+    for _ in range(epochs):
+        head.train()
+        Z = _filtered_bank(propagated, _unit(raw))
+        gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau)
+        lam_min = torch.linalg.eigvalsh(gamma)[0]
+        ce = F.cross_entropy(head(Z[train_idx]), yl[train_idx], weight=w.to(dtype))
+        loss = -lam_min + label_weight * ce
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+    head.eval()
+    with torch.no_grad():
+        theta = _unit(raw).detach()
+        Z = _filtered_bank(propagated, theta).detach()
+        prob = torch.softmax(head(Z), dim=1)[:, 1]
+    metrics = _binary_metrics(yl[test_idx].cpu().numpy(), prob[test_idx].cpu().numpy())
+    return theta, Z, metrics, float(lam_min.detach())
+
+
+def fit_gnn_encoder(
+    a_hat: torch.Tensor,
+    adjacency: torch.Tensor,
+    X: torch.Tensor,
+    y: torch.Tensor,
+    train_patterns: list,
+    train_idx: torch.Tensor,
+    test_idx: torch.Tensor,
+    *,
+    embed_dim: int,
+    epochs: int,
+    learning_rate: float,
+    ridge: float,
+    tau: float,
+    label_weight: float,
+    seed: int,
+) -> tuple:
+    """2-layer GCN trained on the **same two-term** objective as the joint bank.
+
+    ``loss = -lambda_min(Gamma(H)) + label_weight * CE(logits, y)`` where ``H`` is
+    the GCN's hidden embedding.  The collective term shapes ``H`` into a coarsening
+    target (so the GNN's embedding detects gangs), while the label term trains the
+    GNN's classifier head.  Returns ``(H, metrics, lam_min_final)``.
+    """
+
+    torch.manual_seed(int(seed))
+    dtype = X.dtype
+    m_vhat = _train_gang_m_vhat(a_hat, adjacency, train_patterns, tau)
+    enc = GCN2Encoder(in_dim=X.shape[1], embed_dim=embed_dim, num_classes=2).to(
+        dtype=dtype
+    )
+    opt = torch.optim.Adam(enc.parameters(), lr=learning_rate, weight_decay=5e-4)
+    yl = y.to(torch.long)
+    w = _class_weights(yl, train_idx, dtype)
+
+    lam_min = torch.zeros((), dtype=dtype)
+    for _ in range(epochs):
+        enc.train()
+        H, logits = enc(a_hat, X)
+        gamma = _collective_gamma(a_hat, H, m_vhat, ridge, tau)
+        lam_min = torch.linalg.eigvalsh(gamma)[0]
+        ce = F.cross_entropy(logits[train_idx], yl[train_idx], weight=w.to(dtype))
+        loss = -lam_min + label_weight * ce
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+    enc.eval()
+    with torch.no_grad():
+        H, logits = enc(a_hat, X)
+        prob = torch.softmax(logits, dim=1)[:, 1]
+    metrics = _binary_metrics(yl[test_idx].cpu().numpy(), prob[test_idx].cpu().numpy())
+    return H.detach(), metrics, float(lam_min.detach())
+
+
+def run_classification_comparison(
+    normalized: torch.Tensor,
+    adjacency: torch.Tensor,
+    X: torch.Tensor,
+    theta: torch.Tensor,
+    graph,
+    train_patterns: list,
+    test_patterns: list,
+    splits: dict,
+    collective_report: dict,
+    args,
+    tau: float,
+) -> dict:
+    """Compare three encoders on BOTH tasks -- coarsening detection and labels.
+
+    Each supervised encoder produces one embedding ``Z`` that is *both* handed to
+    the same RSA coarsener (detection) *and* read by a label head (classification):
+
+    * ``collective`` -- the unsupervised lambda_min bank (detection already done in
+      :func:`run_for_tau`); a frozen linear probe supplies its label scores.
+    * ``joint``      -- filter bank + head trained end-to-end on the label loss
+      (Update 1): the labels shape ``Z``, and that same ``Z`` drives coarsening.
+    * ``gnn``        -- a 2-layer GCN whose hidden ``H`` is the coarsening embedding
+      and whose second layer predicts labels (Update 2).
+
+    All see the same ``X`` and the same train/test node split, so the comparison is
+    apples-to-apples on held-out gangs.
+    """
+
+    y, train_idx, test_idx = build_node_split(
+        train_patterns,
+        test_patterns,
+        graph.num_nodes,
+        graph.y,
+        neg_per_pos=args.neg_per_pos,
+        seed=args.seed,
+    )
+
+    # --- collective bank: frozen linear probe for labels; detection reused -----
+    propagated = propagation_stack(normalized, X, theta.shape[0] - 1)
+    Z_coll = _filtered_bank(propagated, theta)
+    coll_cls = train_linear_head(
+        Z_coll,
+        y,
+        train_idx,
+        test_idx,
+        epochs=args.head_epochs,
+        learning_rate=args.head_lr,
+        seed=args.seed,
+    )
+
+    # --- joint bank: -lambda_min(Gamma) + label CE (both shape Z) --------------
+    _, Z_joint, joint_cls, joint_lam = fit_joint_bank_head(
+        normalized,
+        adjacency,
+        X,
+        y,
+        train_patterns,
+        train_idx,
+        test_idx,
+        degree=args.degree,
+        epochs=args.head_epochs,
+        learning_rate=args.head_lr,
+        ridge=args.ridge,
+        tau=tau,
+        label_weight=args.label_reg_weight,
+        seed=args.seed,
+    )
+    _, joint_det = _coarsen_and_detect(
+        normalized, adjacency, Z_joint, splits, graph.y, args, tau
+    )
+
+    # --- GNN: -lambda_min(Gamma(H)) + label CE (both shape H) ------------------
+    H_gnn, gnn_cls, gnn_lam = fit_gnn_encoder(
+        normalized,
+        adjacency,
+        X,
+        y,
+        train_patterns,
+        train_idx,
+        test_idx,
+        embed_dim=args.gnn_embed_dim,
+        epochs=args.gnn_epochs,
+        learning_rate=args.gnn_lr,
+        ridge=args.ridge,
+        tau=tau,
+        label_weight=args.label_reg_weight,
+        seed=args.seed,
+    )
+    _, gnn_det = _coarsen_and_detect(
+        normalized, adjacency, H_gnn, splits, graph.y, args, tau
+    )
+
+    rows = {
+        "collective": {
+            "detection": collective_report,
+            "classification": coll_cls,
+            "lambda_min": None,
+        },
+        "joint": {
+            "detection": joint_det,
+            "classification": joint_cls,
+            "lambda_min": joint_lam,
+        },
+        "gnn": {"detection": gnn_det, "classification": gnn_cls, "lambda_min": gnn_lam},
+    }
+
+    LOGGER.info(
+        f"  [tau={tau:g}] encoder comparison -- coarsening detection + node labels "
+        f"(held-out: {len(test_patterns)} gangs, "
+        f"{int((graph.y[test_idx] == 1).sum())}/{len(test_idx)} test nodes)"
+    )
+    hdr = (
+        f"  {'encoder':<12}{'det_all':>8}{'det_test':>9}{'ret_E':>7}"
+        f"{'acc':>7}{'prec':>7}{'recall':>8}{'auc':>7}"
+    )
+    LOGGER.info(hdr)
+    LOGGER.info("  " + "-" * (len(hdr) - 2))
+    for name, r in rows.items():
+        det, cls = r["detection"], r["classification"]
+        da = det["all"]["detection_rate"] or 0.0
+        dt = det["test"]["detection_rate"] or 0.0
+        re = det["all"]["retained_energy"] or 0.0
+        LOGGER.info(
+            f"  {name:<12}{da:>8.1%}{dt:>9.1%}{re:>7.3f}"
+            f"{cls['accuracy']:>7.3f}{cls['precision']:>7.3f}"
+            f"{cls['recall']:>8.3f}{cls['auc']:>7.3f}"
+        )
+    return rows
+
+
 def run_for_tau(
     tau: float,
     *,
@@ -1120,6 +1546,23 @@ def run_for_tau(
                 f"{r['detected']:>4}/{r['total']:<4}"
             )
 
+    # 8. supervised node classification: collective Z + head  vs.  GNN --------
+    classification = None
+    if args.classify:
+        classification = run_classification_comparison(
+            normalized,
+            adjacency,
+            X,
+            theta,
+            graph,
+            train_patterns,
+            test_patterns,
+            splits,
+            report,
+            args,
+            tau,
+        )
+
     # --- persist JSON + plot --------------------------------------------------
     json_out = out_dir / f"collective_bank_detection{suffix}.json"
     plot_out = out_dir / f"collective_bank_detection{suffix}.png"
@@ -1146,6 +1589,7 @@ def run_for_tau(
                 },
                 "detection": report,
                 "encoder_comparison": encoder_reports,
+                "classification": classification,
                 "negatives": {
                     "num_sets_per_epoch": args.num_neg_motifs,
                     "resampled_each_epoch": neg_sampler is not None,
@@ -1287,7 +1731,7 @@ def main() -> None:
     parser.add_argument("--avg-degree", type=float, default=2.0)
     parser.add_argument("--feature-dim", type=int, default=64)
     parser.add_argument("--train-ratio", type=float, default=0.4)
-    parser.add_argument("--degree", type=int, default=5, help="polynomial degree K")
+    parser.add_argument("--degree", type=int, default=10, help="polynomial degree K")
     parser.add_argument("--epochs", type=int, default=1500)
     parser.add_argument("--learning-rate", type=float, default=0.02)
     parser.add_argument("--ridge", type=float, default=1e-4)
@@ -1320,6 +1764,46 @@ def main() -> None:
         "'indicators' = the M_tau-projected TRAIN-gang indicators of Remark C.18 "
         "(m columns; cheaper RSA target but held-out energy is ~0 by construction).",
     )
+    # gang-aligned features (Logic 1): class-consistent block-aligned structure
+    parser.add_argument(
+        "--gang-feat-shared",
+        type=float,
+        default=0.0,
+        help="strength of a single class-consistent 'gangness' direction added "
+        "(block-constant) to every gang's nodes; generalizes train->test and drives "
+        "union detection / the node head (0 = isotropic features).",
+    )
+    parser.add_argument(
+        "--gang-feat-signature",
+        type=float,
+        default=0.0,
+        help="strength of a fresh per-gang block-constant signature; gives the "
+        "collective objective linearly independent per-gang feature directions "
+        "(band resolution, Prop 6.8).",
+    )
+    # supervised node classification (Logic 2/3): linear head on Z vs. a GNN
+    parser.add_argument("--classify", action="store_true", default=True)
+    parser.add_argument("--no-classify", dest="classify", action="store_false")
+    parser.add_argument(
+        "--neg-per-pos",
+        type=float,
+        default=1.0,
+        help="host (non-gang) nodes sampled per gang node as the negative class "
+        "for the node-classification head/GNN (Definition 8.4 benign negatives).",
+    )
+    parser.add_argument(
+        "--label-reg-weight",
+        type=float,
+        default=100.0,
+        help="beta: weight of the label cross-entropy regularizer added to the "
+        "collective -lambda_min(Gamma) objective when training the joint bank and "
+        "the GNN (both encoders optimize coarsening capture + label prediction).",
+    )
+    parser.add_argument("--head-epochs", type=int, default=500)
+    parser.add_argument("--head-lr", type=float, default=0.01)
+    parser.add_argument("--gnn-epochs", type=int, default=300)
+    parser.add_argument("--gnn-lr", type=float, default=0.01)
+    parser.add_argument("--gnn-embed-dim", type=int, default=64)
     # baseline encoders ported from run_joint_encoder_comparison
     parser.add_argument(
         "--baselines",
@@ -1422,12 +1906,17 @@ def main() -> None:
         "(a size-k gang needs ~log2(k) edge-matching levels)",
     )
     # coarsening
-    parser.add_argument("--reduction", type=float, default=0.95)
+    parser.add_argument(
+        "--reduction",
+        type=float,
+        default=0.7,
+        help="stop coarsening when n_coarse/n_original <= this fraction",
+    )
     parser.add_argument(
         "--epsilon",
         type=float,
         # default=None,
-        default=5,
+        default=0.5,
         help="target RSA distortion budget prod_l(1+sigma_l)-1; when set it drives "
         "the coarsening (contract as much as possible until this bound is hit) and "
         "OVERRIDES --reduction",
@@ -1441,8 +1930,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--coarsening-method",
-        choices=["edges", "neighborhood", "capped", "star", "kmeans", "linkage"],
-        default="edges",
+        choices=[
+            "edges",
+            "neighborhood",
+            "capped",
+            "star",
+            "kmeans",
+            "linkage",
+            "ward",
+        ],
+        default="ward",
     )
     parser.add_argument(
         "--coarsening-laplacian",
@@ -1471,6 +1968,15 @@ def main() -> None:
     )
     normalized, adjacency = graph_operators(graph)  # A_hat (sym-norm) and raw W
     X = graph.x.to(device=normalized.device, dtype=normalized.dtype)
+    # Logic 1: inject class-consistent block-aligned gang features (no-op if 0).
+    X = inject_gang_features(
+        X,
+        patterns,
+        shared=args.gang_feat_shared,
+        signature=args.gang_feat_signature,
+        seed=args.seed,
+    )
+    graph.x = X  # the GNN baseline reads graph features through X too
 
     # 3. train / test split of the motifs -------------------------------------
     rng = np.random.default_rng(args.seed)

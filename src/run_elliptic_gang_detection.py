@@ -314,7 +314,7 @@ def main() -> None:
     ap.add_argument(
         "--reduction",
         type=float,
-        default=0.99,
+        default=0.8,
         help="count-based stop (1 - n_coarse/N). In option 2 keep this "
         "high so the *epsilon* RSA cost gate governs the stop instead",
     )
@@ -353,8 +353,8 @@ def main() -> None:
     )
     ap.add_argument(
         "--coarsening-method",
-        choices=["edges", "neighborhood", "capped", "star", "kmeans", "linkage"],
-        default="edges",
+        choices=["edges", "neighborhood", "capped", "star", "kmeans", "linkage", "ward"],
+        default="ward",
         help="local-variation candidate family. 'edges' (default, option 2) is "
         "canonical Loukas Algorithm 2: one cheapest-first matching per level, so "
         "per-level cap = 2 and gangs collapse multiplicatively across levels under "
