@@ -552,6 +552,401 @@ def _soft_lambda_min(
     return (weights * eigs).sum()
 
 
+# --------------------------------------------------------------------------- #
+# confusability regularizer (Prop 6.8 / eq. 36; margin objective eq. 40)
+# --------------------------------------------------------------------------- #
+def build_confusability_tables(
+    a_hat: torch.Tensor,
+    adjacency: torch.Tensor,
+    patterns: list,
+    X: torch.Tensor,
+    *,
+    tau: float,
+    degree: int,
+    basis: str = "chebyshev",
+    delta: float = 0.0,
+    halo_hops: int = 1,
+) -> list:
+    """Precompute the per-gang, ``Theta``-independent pieces of the confusability.
+
+    With ``delta == 0`` (the default, hard confusability eq. 36) each gang ``S``
+    gets the S-localized Chebyshev table ``Y_S in R^{(K+1) x s x d}``,
+    ``(Y_S)_{k,i,a} = (M_tau T_k(A_hat) x_a)_i sqrt(d_tilde_i)``, the exact local
+    ``M_tau``-form ``Q_S^tau = L^int_S + diag(d_partial) + tau * D_tilde_S``, and
+    ``d_tilde|_S`` for the mean-zero constraint ``sum_i d_tilde_i z_i = 0``.
+
+    With ``delta > 0`` (the delta-leaky cone, Definitions 4.4/4.6) the confuser may
+    place up to a ``delta`` fraction of its ell2 mass *outside* ``S`` -- in the
+    ``halo_hops``-hop halo ``H = S union boundary(S)`` (the r-hop confuser of Remark
+    4.12).  Each gang then gets the *halo*-localized table ``Y_H`` (no degree
+    weighting -- ``w``-coordinates), the local ``M_tau`` form on the halo
+    ``B_H = (1+tau) I - A_hat[H,H]`` (so ``w^T B_H w = ||w||^2_{M_tau}`` for signals
+    supported on ``H``), the ell2 orthogonality vector ``c`` (``c_i = sqrt(d_tilde_i)``
+    on ``S``, ``0`` on the halo so that ``c^T w = <w, v_S>_{l2}``), and a boolean
+    ``leak_mask`` marking the halo (outside-``S``) coordinates.  None depend on the
+    learned filter, so they are built once and reused every epoch.
+    """
+
+    dtype, device = a_hat.dtype, a_hat.device
+    # M_tau phi_k(A_hat) X for k=0..K, shared across gangs (Theta-independent).
+    propagated = _basis_stack(a_hat, X, degree, basis)
+    m_prop = [_m_apply(a_hat, propagated[k], tau) for k in range(degree + 1)]
+
+    d_total = _degrees(adjacency)  # (N,) weighted degree (no self-loops in W)
+    d_tilde_all = d_total + 1.0  # self-loop augmented degree D_tilde = D + I
+    n = a_hat.shape[0]
+    coalesced = adjacency.coalesce()
+    ii, jj = coalesced.indices()
+    vv = coalesced.values()
+    pos = torch.full((n,), -1, dtype=torch.long, device=device)
+
+    if delta > 0.0:
+        return _build_leaky_tables(
+            a_hat, m_prop, d_tilde_all, patterns, tau, delta, halo_hops, degree
+        )
+
+    tables = []
+    for p in patterns:
+        nodes = torch.as_tensor(p.node_indices, dtype=torch.long, device=device)
+        s = int(nodes.numel())
+        pos.fill_(-1)
+        pos[nodes] = torch.arange(s, device=device)
+        # internal weight submatrix W_SS (edges with both endpoints in S)
+        mask = (pos[ii] >= 0) & (pos[jj] >= 0)
+        w_sub = torch.zeros(s, s, dtype=dtype, device=device)
+        w_sub[pos[ii[mask]], pos[jj[mask]]] = vv[mask].to(dtype)
+        w_sub = 0.5 * (w_sub + w_sub.T)  # undirected
+        d_int = w_sub.sum(1)  # internal degree
+        d_tot_s = d_total[nodes].to(dtype)
+        d_bnd = (d_tot_s - d_int).clamp_min(0.0)  # boundary degree d_partial
+        d_tilde = d_tilde_all[nodes].to(dtype)
+        q = (
+            (torch.diag(d_int) - w_sub)  # L^int_S
+            + torch.diag(d_bnd)  # diag(d_partial)
+            + tau * torch.diag(d_tilde)  # tau * D_tilde_S
+        )
+        q = 0.5 * (q + q.T)
+        sqrt_dt = d_tilde.sqrt().unsqueeze(1)  # (s, 1)
+        # Y[k] = (M_tau phi_k X)[S] * sqrt(d_tilde_S)   -> (K+1, s, d)
+        Y = torch.stack([m_prop[k][nodes] * sqrt_dt for k in range(degree + 1)], dim=0)
+        tables.append({"Y": Y, "Q": q, "dtilde": d_tilde})
+    return tables
+
+
+def _build_leaky_tables(
+    a_hat, m_prop, d_tilde_all, patterns, tau, delta, halo_hops, degree
+):
+    """Per-gang halo tables for the delta-leaky cone (Definitions 4.4/4.6)."""
+
+    dtype, device = a_hat.dtype, a_hat.device
+    n = a_hat.shape[0]
+    a_coo = a_hat.coalesce()
+    ai, aj = a_coo.indices()
+    av = a_coo.values()
+    pos = torch.full((n,), -1, dtype=torch.long, device=device)
+
+    tables = []
+    for p in patterns:
+        core = torch.as_tensor(p.node_indices, dtype=torch.long, device=device)
+        # grow the r-hop halo H = S union (r-hop boundary) by neighbour accretion
+        halo = core
+        for _ in range(max(1, int(halo_hops))):
+            halo = torch.unique(torch.cat([halo, aj[torch.isin(ai, halo)]]))
+        h = int(halo.numel())
+        pos.fill_(-1)
+        pos[halo] = torch.arange(h, device=device)
+        core_local = pos[core]
+        leak_mask = torch.ones(h, dtype=torch.bool, device=device)
+        leak_mask[core_local] = False  # True on the halo (outside-S) coordinates
+        # A_hat[H, H] sub-block (normalized adjacency, includes self-loops)
+        m = (pos[ai] >= 0) & (pos[aj] >= 0)
+        a_hh = torch.zeros(h, h, dtype=dtype, device=device)
+        a_hh[pos[ai[m]], pos[aj[m]]] = av[m].to(dtype)
+        a_hh = 0.5 * (a_hh + a_hh.T)
+        # local M_tau form on the halo: ||w||^2_{M_tau} = w^T B_H w
+        b_h = (1.0 + tau) * torch.eye(h, dtype=dtype, device=device) - a_hh
+        b_h = 0.5 * (b_h + b_h.T)
+        # ell2 orthogonality to v_S: c^T w = <w, v_S>_{l2}, v_S ~ D_tilde^{1/2} 1_S
+        c = torch.zeros(h, dtype=dtype, device=device)
+        c[core_local] = d_tilde_all[core].to(dtype).sqrt()
+        # halo-localized bank table in w-coordinates (no degree weighting)
+        Y = torch.stack([m_prop[k][halo] for k in range(degree + 1)], dim=0)
+        tables.append(
+            {"Y": Y, "B": b_h, "c": c, "leak_mask": leak_mask, "delta": float(delta)}
+        )
+    return tables
+
+
+def _top_confuser(
+    a_num: torch.Tensor, q: torch.Tensor, dtilde: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """Top generalized eigenvector of ``(A_num, Q)`` over ``{z : d_tilde^T z = 0}``.
+
+    Returns the maximizing ``z*`` of the eq.-36 Rayleigh quotient on the
+    degree-mean-zero subspace (the constant gang mode ``z ~ 1`` is the captured
+    direction and is excluded).  Solved by whitening on an orthonormal basis of the
+    constraint subspace; the caller detaches this (Danskin: ``z*`` is held fixed
+    when differentiating the ratio through ``Theta``).
+    """
+
+    s = a_num.shape[0]
+    dvec = dtilde / dtilde.norm().clamp_min(eps)
+    # orthonormal basis P (s x s-1) of the complement of d_tilde
+    P = torch.linalg.svd(dvec.reshape(s, 1), full_matrices=True).U[:, 1:]
+    a_r = P.T @ a_num @ P
+    b_r = P.T @ q @ P
+    a_r = 0.5 * (a_r + a_r.T)
+    b_r = 0.5 * (b_r + b_r.T)
+    jitter = eps * (b_r.diagonal().mean().abs() + 1.0)
+    b_r = b_r + jitter * torch.eye(s - 1, dtype=q.dtype, device=q.device)
+    # generalized eig via Cholesky whitening: C = Lc^{-1} A_r Lc^{-T}
+    lc = torch.linalg.cholesky(b_r)
+    tmp = torch.linalg.solve_triangular(lc, a_r, upper=False)
+    c = torch.linalg.solve_triangular(lc, tmp.T, upper=False).T
+    c = 0.5 * (c + c.T)
+    y = torch.linalg.eigh(c).eigenvectors[:, -1]  # largest generalized eigenvalue
+    x = torch.linalg.solve_triangular(lc.T, y.unsqueeze(1), upper=True).squeeze(1)
+    z = P @ x
+    return z / z.norm().clamp_min(eps)
+
+
+def _top_leaky_confuser(
+    a_h: torch.Tensor,
+    b_h: torch.Tensor,
+    c: torch.Tensor,
+    leak_mask: torch.Tensor,
+    delta: float,
+    eps: float,
+) -> torch.Tensor:
+    """Maximizer ``w*`` of the delta-leaky Rayleigh quotient (Definition 4.6).
+
+    ``max  w^T A_H w / w^T B_H w`` over the cone ``{c^T w = 0,  w^T E w <= 0}`` with
+    ``E = diag(leak_mask) - delta I`` (so ``w^T E w <= 0`` is exactly
+    ``||w_leak||^2 <= delta ||w||^2``).  Reduced to the constraint subspace
+    ``c^T w = 0`` and solved by the S-procedure: the KKT points satisfy
+    ``(A_H - mu E) w = lam B_H w`` with ``mu >= 0`` and complementary slackness, so
+    we bisect ``mu`` until the top eigenvector of ``(A_r - mu E_r, B_r)`` sits on the
+    leak boundary ``w^T E w = 0`` (``mu = 0`` if the leak cap is already slack).
+
+    ``B_r`` is fixed across the mu-search, so it is whitened *once*: with
+    ``B_r = Lc Lc^T`` the pencil becomes the standard symmetric eigenproblem
+    ``(Ca - mu Ce) y = lam y`` where ``Ca = Lc^{-1} A_r Lc^{-T}`` and
+    ``Ce = Lc^{-1} E_r Lc^{-T}`` are precomputed -- every mu step is then one small
+    ``eigh`` on the same-size matrix, no re-factorization.  Detached; the caller
+    differentiates the ratio at fixed ``w*`` (Danskin).
+    """
+
+    h = a_h.shape[0]
+    cn = c / c.norm().clamp_min(eps)
+    P = torch.linalg.svd(cn.reshape(h, 1), full_matrices=True).U[:, 1:]  # (h, h-1)
+    a_r = 0.5 * (P.T @ a_h @ P + (P.T @ a_h @ P).T)
+    b_r = P.T @ b_h @ P
+    b_r = 0.5 * (b_r + b_r.T)
+    b_r = b_r + eps * (b_r.diagonal().mean().abs() + 1.0) * torch.eye(
+        h - 1, dtype=b_h.dtype, device=b_h.device
+    )
+    e_mat = torch.diag(leak_mask.to(a_h.dtype)) - delta * torch.eye(
+        h, dtype=a_h.dtype, device=a_h.device
+    )
+    e_r = 0.5 * (P.T @ e_mat @ P + (P.T @ e_mat @ P).T)
+
+    # whiten B_r once; work in y = Lc^T x coordinates
+    lc = torch.linalg.cholesky(b_r)
+
+    def _whiten(mat):
+        t = torch.linalg.solve_triangular(lc, mat, upper=False)  # Lc^{-1} mat
+        m = torch.linalg.solve_triangular(lc, t.T, upper=False).T  # Lc^{-1} mat Lc^{-T}
+        return 0.5 * (m + m.T)
+
+    ca, ce = _whiten(a_r), _whiten(e_r)
+    # eigenvector maps back as x = Lc^{-T} y, w = P x, so w = (P Lc^{-T}) y with
+    # P Lc^{-T} = (Lc^{-1} P^T)^T.  In the search we only need sign(w^T E w), which
+    # equals sign(y^T Ce y) (== w^T E w up to the positive w-normalization), so we
+    # avoid the back-transform until the final vector is returned.
+    p_lct_inv = torch.linalg.solve_triangular(lc, P.T, upper=False).T  # (h, h-1)
+
+    def _top_y(mu):
+        return torch.linalg.eigh(ca - mu * ce).eigenvectors[:, -1]
+
+    def _leak(y):  # sign-consistent proxy for w^T E w
+        return float(y @ (ce @ y))
+
+    def _back(y):
+        w = p_lct_inv @ y
+        return w / w.norm().clamp_min(eps)
+
+    y0 = _top_y(0.0)
+    if _leak(y0) <= 1e-9:  # leak cap already slack -> unconstrained (on c) optimum
+        return _back(y0)
+    # bracket a mu with leak(mu) < 0, then bisect to the boundary leak(mu*) = 0
+    mu_hi = 1.0
+    for _ in range(40):
+        if _leak(_top_y(mu_hi)) < 0.0:
+            break
+        mu_hi *= 2.0
+    mu_lo = 0.0
+    for _ in range(24):
+        mu = 0.5 * (mu_lo + mu_hi)
+        if _leak(_top_y(mu)) > 0.0:
+            mu_lo = mu
+        else:
+            mu_hi = mu
+    return _back(_top_y(mu_hi))  # feasible (leak-satisfying) side
+
+
+def _gang_confusability_leaky(
+    theta: torch.Tensor,
+    chol: torch.Tensor,
+    table: dict,
+    eps: float,
+) -> torch.Tensor:
+    """Differentiable delta-leaky confusability ``chi^{tau,delta}_{R_Theta}(S)``.
+
+    Halo ``w``-coordinates: ``u = Y_H^T w = (M_tau Z)[H]^T w`` (per channel
+    ``u_a = <Z_{:,a}, w>_{M_tau}``), numerator ``u^T G_Z^+ u = ||Pi^{M_tau}_{span Z}
+    w||^2_{M_tau}``, denominator ``w^T B_H w = ||w||^2_{M_tau}``.  ``chi`` is the
+    largest ratio over the delta-leaky cone; ``w*`` is found detached and the ratio
+    differentiated at fixed ``w*`` (Danskin), exactly as in the hard case.  ``chol``
+    is the shared Cholesky factor of ``G_Z + ridge I`` (built once per step).
+    """
+
+    Y, b_h, c = table["Y"], table["B"], table["c"]
+    leak_mask, delta = table["leak_mask"], table["delta"]
+    h = b_h.shape[0]
+    if h < 2 or not bool(leak_mask.any()):
+        # no halo to leak into -> falls back to the hard internal-support problem
+        # (handled by the delta=0 path); return 0 rather than a degenerate solve.
+        return chol.new_zeros(())
+    Y_H = torch.einsum("kia,ka->ia", Y, theta)  # (h, d)  M_tau Z restricted to H
+    g_inv = torch.cholesky_solve(Y_H.T, chol)  # G_Z^+ Y_H^T   (d, h)
+    a_h = Y_H @ g_inv  # w^T (Y_H G_Z^+ Y_H^T) w              (h, h)
+    a_h = 0.5 * (a_h + a_h.T)
+    with torch.no_grad():
+        w_star = _top_leaky_confuser(a_h.detach(), b_h, c, leak_mask, delta, eps)
+    num = w_star @ (a_h @ w_star)
+    den = (w_star @ (b_h @ w_star)).clamp_min(eps)
+    return num / den
+
+
+def _gang_confusability(
+    theta: torch.Tensor,
+    chol: torch.Tensor,
+    table: dict,
+    eps: float,
+) -> torch.Tensor:
+    """Differentiable hard confusability ``chi^tau_{R_Theta}(S)`` of eq. 36.
+
+    ``u = M(Theta) z`` with ``M[a,:] = sum_k theta[k,a] Y[k,:,a]`` (so
+    ``u_a = <Z_{:,a}, D_tilde^{1/2} z>_{M_tau}``), the numerator
+    ``u^T G_Z^+ u = ||Pi^{M_tau}_{span Z} w||^2_{M_tau}`` is the retained energy of
+    the internal fluctuation ``w``, and ``chi`` is its largest fraction of
+    ``||w||^2_{M_tau} = z^T Q z``.  The top eigenvector ``z*`` is found once
+    (detached); the returned scalar carries gradient through ``M(Theta)`` and
+    ``G_Z(Theta)`` only, which by Danskin's rule is exactly ``d chi / d Theta``.
+    ``chol`` is the shared Cholesky factor of ``G_Z + ridge I`` (built once per
+    step in :func:`collective_confusability` and reused across gangs).
+
+    Dispatches to the delta-leaky cone (:func:`_gang_confusability_leaky`) when the
+    table carries a halo (``delta > 0``); otherwise the hard eq.-36 problem below.
+    """
+
+    if "leak_mask" in table:
+        return _gang_confusability_leaky(theta, chol, table, eps)
+
+    Y, q, dtilde = table["Y"], table["Q"], table["dtilde"]
+    s = q.shape[0]
+    if s < 2:
+        return chol.new_zeros(())
+    M = torch.einsum("ka,kia->ai", theta, Y)  # (d, s)
+    g_inv_m = torch.cholesky_solve(M, chol)  # G_Z^+ M   (d, s)
+    a_num = M.T @ g_inv_m  # z^T (M^T G_Z^+ M) z            (s, s)
+    a_num = 0.5 * (a_num + a_num.T)
+    with torch.no_grad():
+        z_star = _top_confuser(a_num.detach(), q, dtilde, eps)
+    num = z_star @ (a_num @ z_star)
+    den = (z_star @ (q @ z_star)).clamp_min(eps)
+    return num / den
+
+
+def collective_confusability(
+    theta: torch.Tensor,
+    Z: torch.Tensor,
+    a_hat: torch.Tensor,
+    tau: float,
+    ridge: float,
+    tables: list,
+    eps: float,
+    *,
+    reduce: str = "max",
+) -> torch.Tensor:
+    """Worst-gang confusability ``max_{j<=m} chi^tau_{R_Theta}(S_j)`` (eq. 40 term).
+
+    Danskin over the ``max`` is automatic: the gradient flows through the single
+    worst gang each step.  ``reduce="mean"`` uses the average instead (a smoother,
+    all-gang pressure if the hard max is too spiky).
+    """
+
+    if not tables:
+        return Z.new_zeros(())
+    # G_Z = Z^T M_tau Z and its Cholesky factor are gang-independent: build the
+    # sparse mat-vec and the (d,d) factorization ONCE and share it across every
+    # gang (was recomputed and re-factorized per gang).  cholesky/cholesky_solve
+    # are differentiable, so gradient still flows through G_Z(Theta).
+    g_z = Z.T @ _m_apply(a_hat, Z, tau)
+    g_z = 0.5 * (g_z + g_z.T)
+    d = g_z.shape[0]
+    chol = torch.linalg.cholesky(
+        g_z + ridge * torch.eye(d, dtype=g_z.dtype, device=g_z.device)
+    )
+    chis = torch.stack([_gang_confusability(theta, chol, t, eps) for t in tables])
+    return chis.mean() if reduce == "mean" else chis.max()
+
+
+class _RiemannianAdam:
+    """Adam on the product of per-channel unit spheres ``{||theta[:,a]||=1}``.
+
+    The constraint ``||theta^(a)|| = 1`` (one sphere per feature channel ``a``) is
+    kept *exactly* every step rather than restored by a post-hoc renormalization.
+    Each step (Absil-Mahony-Sepulchre / Becigneul-Ganea RAdam):
+
+    1. project the Euclidean gradient to each sphere's tangent
+       ``g_tan = g - <g, theta> theta`` (per column);
+    2. run Adam on the tangent (bias-corrected moments), which respects the
+       manifold instead of the redundant radial direction the normalize-in-forward
+       reparametrization leaves in the optimizer state;
+    3. retract by normalization ``theta <- (theta - lr*d)/||.||`` and vector-
+       transport the first moment to the new tangent by re-projection.
+
+    ``step(theta, egrad)`` takes the *loss* Euclidean gradient (minimization) and
+    returns the updated on-manifold ``theta``.
+    """
+
+    def __init__(self, shape, lr, *, betas=(0.9, 0.999), eps=1e-8, dtype, device):
+        self.lr = float(lr)
+        self.b1, self.b2 = betas
+        self.eps = eps
+        self.t = 0
+        self.m = torch.zeros(shape, dtype=dtype, device=device)
+        self.v = torch.zeros(shape, dtype=dtype, device=device)
+
+    @staticmethod
+    def _tangent(theta, g):  # remove the radial (per-column) component
+        return g - (g * theta).sum(0, keepdim=True) * theta
+
+    def step(self, theta, egrad):
+        self.t += 1
+        rgrad = self._tangent(theta, egrad)  # Riemannian gradient
+        self.m = self.b1 * self.m + (1 - self.b1) * rgrad
+        self.v = self.b2 * self.v + (1 - self.b2) * rgrad * rgrad
+        m_hat = self.m / (1 - self.b1**self.t)
+        v_hat = self.v / (1 - self.b2**self.t)
+        direction = self._tangent(theta, m_hat / (v_hat.sqrt() + self.eps))
+        new = theta - self.lr * direction  # descend the loss
+        new = new / new.norm(dim=0, keepdim=True).clamp_min(1e-12)  # retraction
+        self.m = self._tangent(new, self.m)  # transport moment to the new point
+        return new.detach()
+
+
 def fit_collective_bank(
     a_hat: torch.Tensor,
     adjacency: torch.Tensor,
@@ -572,8 +967,25 @@ def fit_collective_bank(
     snapshot_interval: int = 20,
     softmin_temperature: float = 0.0,
     basis: str = "chebyshev",
+    conf_weight: float = 0.0,
+    conf_reduce: str = "max",
+    conf_delta: float = 0.0,
+    conf_halo_hops: int = 1,
+    optimizer_kind: str = "projected",
 ) -> dict:
     """Ascend ``lambda_min(Gamma(Theta))`` over the per-channel unit spheres.
+
+    ``optimizer_kind`` chooses how the constraint ``||theta^(a)|| = 1`` is enforced:
+    ``"projected"`` (default) optimizes an unconstrained ``raw`` with Adam and
+    normalizes in the forward pass (weight-norm style); ``"riemannian"`` optimizes
+    ``theta`` directly on the product of per-channel spheres with
+    :class:`_RiemannianAdam`, keeping the norm exact and the step geometry-aware.
+
+    With ``conf_weight`` (``beta``) ``> 0`` the objective becomes the collective
+    *margin* of eq. 40, ``lambda_min(Gamma) - beta * max_j chi^tau_{R_Theta}(S_j)``:
+    the confusability penalty (eq. 36, :func:`collective_confusability`) drives down
+    the worst gang's retained internal-fluctuation energy so no gang's *parts*
+    survive as a separate supernode (the necessity branch of Theorem 4.10).
 
     Returns the learned ``theta`` (``(K+1, d)``, unit columns) plus the initial
     and final objective and the optimization history.
@@ -610,6 +1022,25 @@ def fit_collective_bank(
 
     propagated = _basis_stack(a_hat, X, degree, basis)  # [phi_k(A_hat) X], k=0..K
 
+    # confusability regularizer (eq. 40): precompute the Theta-independent per-gang
+    # tables once; the penalty -beta*max_j chi(S_j) is added to the margin below.
+    conf_active = conf_weight > 0.0 and len(train_patterns) > 0
+    conf_tables = (
+        build_confusability_tables(
+            a_hat,
+            adjacency,
+            train_patterns,
+            X,
+            tau=tau,
+            degree=degree,
+            basis=basis,
+            delta=conf_delta,
+            halo_hops=conf_halo_hops,
+        )
+        if conf_active
+        else []
+    )
+
     torch.manual_seed(fit_seed)
     raw = torch.nn.Parameter(
         torch.ones(degree + 1, X.shape[1], dtype=dtype, device=device)
@@ -637,17 +1068,48 @@ def fit_collective_bank(
         init_neg = float(
             _neg_softmax(Z0, _neg_l_vhat(neg_sampler() if neg_active else None))
         )
+        init_conf = (
+            float(
+                collective_confusability(
+                    _unit(raw),
+                    Z0,
+                    a_hat,
+                    tau,
+                    ridge,
+                    conf_tables,
+                    eps,
+                    reduce=conf_reduce,
+                )
+            )
+            if conf_active
+            else 0.0
+        )
 
-    optimizer = torch.optim.Adam((raw,), lr=learning_rate)
+    riemannian = optimizer_kind == "riemannian"
+    if riemannian:
+        theta_param = torch.nn.Parameter(_unit(raw).detach().clone())  # unit columns
+        r_opt = _RiemannianAdam(
+            theta_param.shape, learning_rate, dtype=dtype, device=device
+        )
+        optimizer = None
+    else:
+        theta_param = None
+        optimizer = torch.optim.Adam((raw,), lr=learning_rate)
+    # the live parameter whose gradient the ascent is taken w.r.t. each step
+    param = theta_param if riemannian else raw
     best_theta = _unit(raw).detach().clone()
-    best_obj, best_neg = init_obj, init_neg
+    # track the best iterate by the *margin* lambda_min - beta*conf (eq. 40); when
+    # beta=0 this reduces to the plain lambda_min criterion.
+    best_lam, best_neg, best_conf = init_obj, init_neg, init_conf
+    best_crit = init_obj - conf_weight * init_conf
     history: list[float] = []
     neg_history: list[float] = []
+    conf_history: list[float] = []
     energy_history: list[float] = []
     snapshots: list = []
     snap_interval = max(1, epochs // 20) if snapshot_interval > 0 else 0
     for _ep in range(epochs):
-        theta = _unit(raw)
+        theta = theta_param if riemannian else _unit(raw)
         Z = _filtered_bank(propagated, theta)
         gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau)
         # lam_min = torch.linalg.eigvalsh(gamma)[0]
@@ -660,10 +1122,19 @@ def fit_collective_bank(
             else torch.linalg.eigvalsh(gamma)[0]
         )
 
+        # eq. 40 margin: subtract the worst-gang confusability penalty from the
+        # capture floor, so the same step lifts lambda_min AND shrinks chi.
+        if conf_active:
+            conf = collective_confusability(
+                theta, Z, a_hat, tau, ridge, conf_tables, eps, reduce=conf_reduce
+            )
+            pos_obj = pos_obj - conf_weight * conf
+            conf_val = float(conf.detach())
+        else:
+            conf_val = 0.0
+
         if not neg_active:
-            optimizer.zero_grad(set_to_none=True)
-            (-pos_obj).backward()
-            optimizer.step()
+            (ascent_grad,) = torch.autograd.grad(pos_obj, param)
             soft_neg_val = 0.0
         else:
             # fresh negatives every epoch -> stochastic repeller (no overfitting).
@@ -671,25 +1142,32 @@ def fit_collective_bank(
             soft_neg = _neg_softmax(Z, l_vhat_neg)
             # Take the two gradients separately so the negative step can be made
             # non-conflicting with the positive margin (gradient surgery).
-            optimizer.zero_grad(set_to_none=True)
-            pos_obj.backward(retain_graph=True)
-            grad_pos = raw.grad.detach().clone()  # ascent dir for the positive obj
-            optimizer.zero_grad(set_to_none=True)
-            soft_neg.backward()
-            desc_neg = -raw.grad.detach().clone()  # descent dir for the negatives
+            (grad_pos,) = torch.autograd.grad(pos_obj, param, retain_graph=True)
+            grad_pos = grad_pos.detach().clone()  # ascent dir for the positive obj
+            (grad_neg,) = torch.autograd.grad(soft_neg, param)
+            desc_neg = -grad_neg.detach().clone()  # descent dir for the negatives
             if neg_project:
                 conflict = (desc_neg * grad_pos).sum()
                 if conflict < 0:  # this step would lower lambda_min -> remove it
                     denom = grad_pos.pow(2).sum().clamp_min(eps)
                     desc_neg = desc_neg - (conflict / denom) * grad_pos
-            ascent = grad_pos + neg_weight * desc_neg
-            raw.grad = -ascent  # Adam minimizes, so feed the negated ascent
-            optimizer.step()
+            ascent_grad = grad_pos + neg_weight * desc_neg
             soft_neg_val = float(soft_neg.detach())
+
+        # apply the ascent: Adam minimizes, so both optimizers get the negated
+        # ascent as the loss gradient.
+        if riemannian:
+            with torch.no_grad():
+                theta_param.copy_(r_opt.step(theta_param.detach(), -ascent_grad))
+        else:
+            optimizer.zero_grad(set_to_none=True)
+            raw.grad = -ascent_grad
+            optimizer.step()
 
         value = float(torch.linalg.eigvalsh(gamma)[0].detach())
         history.append(value)
         neg_history.append(soft_neg_val)
+        conf_history.append(conf_val)
         energy_history.append(float(torch.diagonal(gamma.detach()).clamp(0, 1).mean()))
         if snap_interval > 0 and (_ep % snap_interval == 0 or _ep == epochs - 1):
             snapshots.append(
@@ -700,22 +1178,35 @@ def fit_collective_bank(
                     "gamma_diag": torch.diagonal(gamma.detach()).clamp(0, 1).tolist(),
                 }
             )
-        # snapshot by the (stable) positive margin; the negatives are a stochastic
-        # regularizer resampled each step, so their per-epoch value is noisy.
-        if value > best_obj:
-            best_obj = value
+        # snapshot by the eq.-40 margin lambda_min - beta*conf (== lambda_min when
+        # beta=0); the negatives are a stochastic regularizer resampled each step,
+        # so their per-epoch value is noisy and not used as the selection criterion.
+        crit = value - conf_weight * conf_val
+        if crit > best_crit:
+            best_crit = crit
+            best_lam = value
             best_neg = soft_neg_val
-            best_theta = _unit(raw).detach().clone()
+            best_conf = conf_val
+            best_theta = (
+                theta_param.detach().clone()
+                if riemannian
+                else _unit(raw).detach().clone()
+            )
 
     return {
         "theta": best_theta,
         "init_objective": init_obj,
-        "objective": best_obj,
+        "objective": best_lam,
+        "margin": best_crit,
+        "confusability_init": init_conf,
+        "confusability": best_conf,
+        "confusability_mean": float(np.mean(conf_history)) if conf_history else 0.0,
         "neg_objective_init": init_neg,
         "neg_objective": best_neg,
         "neg_objective_mean": float(np.mean(neg_history)) if neg_history else 0.0,
         "history": history,
         "neg_history": neg_history,
+        "conf_history": conf_history,
         "energy_history": energy_history,
         "snapshots": snapshots,
     }
@@ -1482,12 +1973,29 @@ def run_for_tau(
         neg_sharpen=args.neg_sharpen,
         softmin_temperature=args.softmin_temperature,
         basis=args.basis,
+        conf_weight=args.conf_weight,
+        conf_reduce=args.conf_reduce,
+        conf_delta=args.conf_delta,
+        conf_halo_hops=args.conf_halo_hops,
+        optimizer_kind=args.optimizer,
     )
     theta = fit["theta"]
     LOGGER.info(
         f"  [tau={tau:g}] lambda_min(Gamma) train: {fit['init_objective']:.6g} -> "
         f"{fit['objective']:.6g}  (basis={args.basis})"
     )
+    if args.conf_weight > 0.0:
+        _chi_kind = (
+            f"chi^(tau,delta={args.conf_delta:g})"
+            if args.conf_delta > 0.0
+            else "chi^tau"
+        )
+        LOGGER.info(
+            f"  [tau={tau:g}] confusability {args.conf_reduce}_j {_chi_kind}(S_j) "
+            f"(beta={args.conf_weight:g}): {fit['confusability_init']:.6g} -> "
+            f"{fit['confusability']:.6g} (want down)  "
+            f"margin lambda_min-beta*chi = {fit['margin']:.6g}"
+        )
     # Prop 6.3 diagnostic: conditioning of the screened channel Gram Z^T M_tau Z in
     # each basis at the learned filter -- the monomial Hankel Gram is exponentially
     # worse in K, which is exactly what the Chebyshev switch cures.
@@ -1646,6 +2154,11 @@ def run_for_tau(
                     "channel_gram_cond_monomial": kappa_mono,
                     "lambda_min_gamma_init": fit["init_objective"],
                     "lambda_min_gamma_final": fit["objective"],
+                    "conf_weight": args.conf_weight,
+                    "conf_delta": args.conf_delta,
+                    "confusability_init": fit.get("confusability_init"),
+                    "confusability_final": fit.get("confusability"),
+                    "margin_final": fit.get("margin"),
                     "neg_softmax_lambda_max_init": fit.get("neg_objective_init"),
                     "neg_softmax_lambda_max_mean": fit.get("neg_objective_mean"),
                     "theta": theta.detach().cpu().tolist(),
@@ -1818,6 +2331,16 @@ def main() -> None:
     )
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=0.02)
+    parser.add_argument(
+        "--optimizer",
+        choices=["projected", "riemannian"],
+        default="riemannian",
+        help="how the per-channel constraint ||theta^(a)||=1 is enforced when "
+        "learning the bank: 'projected' (default) runs Adam on an unconstrained raw "
+        "and normalizes in the forward pass; 'riemannian' runs Adam on the product "
+        "of unit spheres (exact norm each step, geometry-aware) -- usually reaches a "
+        "higher margin and reduces confusability more reliably under --conf-weight.",
+    )
     parser.add_argument("--ridge", type=float, default=1e-4)
     parser.add_argument(
         "--tau",
@@ -1971,6 +2494,45 @@ def main() -> None:
         "spectrum instead of the hard lambda_min (0 = hard min; larger -> closer to "
         "the mean retained energy, spreading ascent over all weak gang directions)",
     )
+    # confusability regularizer (eq. 40 margin objective; eq. 36 confusability)
+    parser.add_argument(
+        "--conf-weight",
+        type=float,
+        default=17.5,
+        help="beta: weight of the confusability penalty in the eq.-40 margin "
+        "objective lambda_min(Gamma) - beta*max_j chi^tau_{R_Theta}(S_j). chi(S_j) "
+        "(eq. 36) is the largest fraction of a within-gang fluctuation's M_tau-energy "
+        "retained by the learned target span(Z); penalizing it stops a gang's *parts* "
+        "from surviving as a separate supernode (Theorem 4.10 necessity branch). "
+        "0 = pure detect-all objective (no penalty).",
+    )
+    parser.add_argument(
+        "--conf-reduce",
+        choices=["max", "mean"],
+        default="mean",
+        help="how the per-gang confusabilities are pooled into the penalty: 'max' "
+        "(eq. 40, the worst gang, Danskin gradient through it) or 'mean' (smoother, "
+        "spreads pressure over all training gangs).",
+    )
+    parser.add_argument(
+        "--conf-delta",
+        type=float,
+        default=0.0,
+        help="leakage level delta in [0,1) for the confusability cone (Def. 4.4). "
+        "0 = hard confusability chi^tau (eq. 36, confuser supported inside S); >0 = "
+        "the delta-leaky variant chi^{tau,delta} (Def. 4.6) that also penalizes "
+        "confusers placing up to a delta fraction of their l2 mass in the one-hop "
+        "halo of S -- excludes 'arc + a bit of boundary' splits, not just internal "
+        "ones (Remark 4.11: reach). Monotone in delta.",
+    )
+    parser.add_argument(
+        "--conf-halo-hops",
+        type=int,
+        default=1,
+        help="radius of the halo the leaky confuser may reach into (Remark 4.12 "
+        "r-hop confuser; 1 = one-hop halo, the paper's default). Only used when "
+        "--conf-delta > 0.",
+    )
     parser.add_argument(
         "--indicator",
         choices=["degree_weighted", "plain"],
@@ -1993,7 +2555,7 @@ def main() -> None:
     parser.add_argument(
         "--reduction",
         type=float,
-        default=0.7,
+        default=0.6,
         help="stop coarsening when n_coarse/n_original <= this fraction",
     )
     parser.add_argument(
