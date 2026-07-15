@@ -210,12 +210,51 @@ def pattern_indicator_matrix(
 def propagation_stack(
     adjacency: torch.Tensor, signals: torch.Tensor, degree: int
 ) -> List[torch.Tensor]:
-    """Compute ``[V, A_hat V, ..., A_hat**degree V]`` by sparse matvecs."""
+    """Compute ``[V, A_hat V, ..., A_hat**degree V]`` by sparse matvecs.
+
+    This is the *monomial* dictionary ``col T = [X, A_hat X, ..., A_hat^K X]`` of
+    the paper (eq. 30).  Its screened Gram is a Hankel matrix and therefore
+    exponentially ill-conditioned in ``K`` (Beckermann, 2000); use
+    :func:`chebyshev_stack` for the well-conditioned Chebyshev dictionary that
+    spans the *same* subspace (Lemma 6.1).
+    """
 
     propagated = [signals]
     for _ in range(degree):
         propagated.append(torch.sparse.mm(adjacency, propagated[-1]))
     return propagated
+
+
+def chebyshev_stack(
+    adjacency: torch.Tensor, signals: torch.Tensor, degree: int
+) -> List[torch.Tensor]:
+    """Chebyshev dictionary ``[T_0(A_hat)V, ..., T_K(A_hat)V]`` (paper eq. 30).
+
+    Built by the three-term recurrence of the first-kind Chebyshev polynomials
+    evaluated at the *normalized adjacency* ``A_hat`` (whose spectrum lies in
+    ``[-1, 1]``, the natural Chebyshev domain, so **no rescaling is needed** --
+    unlike ChebNet, which rescales the Laplacian)::
+
+        T_0(A_hat) = I,   T_1(A_hat) = A_hat,
+        T_k(A_hat) = 2 A_hat T_{k-1}(A_hat) - T_{k-2}(A_hat).
+
+    Each new term costs one sparse matvec, so the whole stack is ``O(K|E|d)`` --
+    the same cost as :func:`propagation_stack`.  ``span(T_0..T_K) = span(I..A^K)``
+    (Lemma 6.1), so swapping this in leaves the learned subspace, the collective
+    Gram ``Gamma``, and the objective unchanged in exact arithmetic; what changes
+    is the *conditioning* of the coefficient solve: the Chebyshev Gram is
+    uniformly well-conditioned ``kappa(G) = O(C/c)`` (Prop 6.3) where the monomial
+    Hankel Gram grows like ``e^{c K}`` -- so the filter trains stably at high ``K``
+    and needs no Tikhonov ridge to stay solvable.
+    """
+
+    stack = [signals]  # T_0(A_hat) V = V
+    if degree >= 1:
+        stack.append(torch.sparse.mm(adjacency, signals))  # T_1(A_hat) V = A_hat V
+    for _ in range(2, degree + 1):
+        # T_k V = 2 A_hat (T_{k-1} V) - T_{k-2} V
+        stack.append(2.0 * torch.sparse.mm(adjacency, stack[-1]) - stack[-2])
+    return stack
 
 
 def filter_signals(

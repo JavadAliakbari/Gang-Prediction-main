@@ -76,7 +76,11 @@ import torch
 from torch_geometric.data import Data
 
 from src.utils.utils import *
-from src.sgc_detection import fit_collective_sgc, propagation_stack
+from src.sgc_detection import (
+    chebyshev_stack,
+    fit_collective_sgc,
+    propagation_stack,
+)
 from src.loukas_sgc_detection import (
     _degrees,
     build_laplacian_subspace,
@@ -442,6 +446,26 @@ def _filtered_bank(propagated: list[torch.Tensor], theta: torch.Tensor) -> torch
     return sum(propagated[k] * theta[k].unsqueeze(0) for k in range(theta.shape[0]))
 
 
+def _basis_stack(
+    a_hat: torch.Tensor, X: torch.Tensor, degree: int, basis: str
+) -> list[torch.Tensor]:
+    """Dictionary the filter bank is built on: monomial ``A_hat^k X`` or Chebyshev.
+
+    ``basis="chebyshev"`` returns ``[T_k(A_hat) X]_{k=0..K}`` (paper eq. 30, the
+    well-conditioned bank of Section 6.2); ``basis="monomial"`` returns the legacy
+    ``[A_hat^k X]_{k=0..K}``.  Both span the same subspace (Lemma 6.1), so the
+    learned filter ``theta``, the collective Gram ``Gamma``, and the whole
+    detection path are identical in exact arithmetic -- only the conditioning of
+    the coefficient solve differs (Prop 6.3).
+    """
+
+    if basis == "chebyshev":
+        return chebyshev_stack(a_hat, X, degree)
+    if basis == "monomial":
+        return propagation_stack(a_hat, X, degree)
+    raise ValueError("basis must be 'chebyshev' or 'monomial'")
+
+
 def _collective_gamma(
     a_hat: torch.Tensor,
     Z: torch.Tensor,
@@ -547,6 +571,7 @@ def fit_collective_bank(
     neg_sharpen: bool = False,
     snapshot_interval: int = 20,
     softmin_temperature: float = 0.0,
+    basis: str = "chebyshev",
 ) -> dict:
     """Ascend ``lambda_min(Gamma(Theta))`` over the per-channel unit spheres.
 
@@ -583,7 +608,7 @@ def fit_collective_bank(
         phi_neg = (v_neg * l_v_neg).sum(0).clamp_min(eps)
         return (l_v_neg + tau * v_neg) / (phi_neg + tau).sqrt().unsqueeze(0)
 
-    propagated = propagation_stack(a_hat, X, degree)  # [A_hat^k X], k=0..K
+    propagated = _basis_stack(a_hat, X, degree, basis)  # [phi_k(A_hat) X], k=0..K
 
     torch.manual_seed(fit_seed)
     raw = torch.nn.Parameter(
@@ -696,6 +721,33 @@ def fit_collective_bank(
     }
 
 
+def channel_gram_cond(
+    a_hat: torch.Tensor,
+    X: torch.Tensor,
+    theta: torch.Tensor,
+    tau: float,
+    basis: str,
+) -> float:
+    """Condition number ``kappa`` of the screened channel Gram ``Z^T M_tau Z``.
+
+    This is the quantity Prop 6.3 bounds: with the Chebyshev basis the Gram is
+    uniformly well-conditioned (``kappa = O(C/c)``), while the monomial Hankel Gram
+    blows up like ``e^{cK}``.  Reported per basis so the numerical payoff of the
+    switch is visible directly (a smaller ``kappa`` is the reason the Chebyshev
+    solve needs no ridge and trains stably at large ``K``).
+    """
+
+    propagated = _basis_stack(a_hat, X, theta.shape[0] - 1, basis)
+    Z = _filtered_bank(propagated, theta)
+    g_z = Z.T @ _m_apply(a_hat, Z, tau)
+    g_z = 0.5 * (g_z + g_z.T)
+    eigs = torch.linalg.eigvalsh(g_z)
+    lo = (
+        eigs[eigs > 0].min() if (eigs > 0).any() else eigs.abs().min().clamp_min(1e-300)
+    )
+    return float(eigs[-1] / lo)
+
+
 def build_bank_subspace(
     a_hat: torch.Tensor,
     adjacency: torch.Tensor,
@@ -707,6 +759,7 @@ def build_bank_subspace(
     structural_width: int = 0,
     seed: int | None = None,
     coarsen_target: str = "bank",
+    basis: str = "chebyshev",
 ) -> torch.Tensor:
     """Target ``R`` handed to the coarsener.
 
@@ -750,7 +803,7 @@ def build_bank_subspace(
     m_norm = (phi + tau).sqrt().unsqueeze(0)  # ||v_j||_{M_tau}
     m_vhat = (l_v + tau * V) / m_norm  # M_tau v_hat_j                     (N, m)
 
-    propagated = propagation_stack(a_hat, X, theta.shape[0] - 1)
+    propagated = _basis_stack(a_hat, X, theta.shape[0] - 1, basis)
     Z = _filtered_bank(propagated, theta)  # (N, d)
 
     if coarsen_target == "bank":
@@ -782,7 +835,7 @@ def build_bank_subspace(
             generator=gen,
         )
         theta_bar = theta.mean(dim=1) if theta.dim() > 1 else theta  # (K+1,)
-        prop_struct = propagation_stack(a_hat, omega, theta_bar.shape[0] - 1)
+        prop_struct = _basis_stack(a_hat, omega, theta_bar.shape[0] - 1, basis)
         z_struct = _filtered_bank(prop_struct, theta_bar)  # (N, structural_width)
         target = torch.cat([target, z_struct], dim=1)  # (N, m + structural_width)
     return target
@@ -797,6 +850,7 @@ def retained_energy(
     ridge: float,
     tau: float = 0.0,
     indicator: str = "degree_weighted",
+    basis: str = "chebyshev",
 ) -> dict:
     """Per-gang retained ``M_tau``-energy ``C_S = Gamma_jj`` and the collective margin.
 
@@ -804,7 +858,7 @@ def retained_energy(
     """
 
     _, m_vhat = _make_indicators(a_hat, adjacency, patterns, tau, indicator)
-    propagated = propagation_stack(a_hat, X, theta.shape[0] - 1)
+    propagated = _basis_stack(a_hat, X, theta.shape[0] - 1, basis)
     Z = _filtered_bank(propagated, theta)
     gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau)
     diag = torch.diagonal(gamma).clamp(0.0, 1.0)
@@ -1145,6 +1199,7 @@ def fit_joint_bank_head(
     tau: float,
     label_weight: float,
     seed: int,
+    basis: str = "chebyshev",
 ) -> tuple:
     """Filter bank trained on the **two-term** objective (coarsening + labels).
 
@@ -1160,7 +1215,7 @@ def fit_joint_bank_head(
     dtype = X.dtype
     eps = torch.finfo(dtype).eps
     m_vhat = _train_gang_m_vhat(a_hat, adjacency, train_patterns, tau)
-    propagated = propagation_stack(a_hat, X, degree)  # [A_hat^k X], k=0..K
+    propagated = _basis_stack(a_hat, X, degree, basis)  # [phi_k(A_hat) X], k=0..K
     d = X.shape[1]
     raw = nn.Parameter(torch.ones(degree + 1, d, dtype=dtype))
     head = nn.Linear(d, 2).to(dtype=dtype)
@@ -1288,7 +1343,7 @@ def run_classification_comparison(
     )
 
     # --- collective bank: frozen linear probe for labels; detection reused -----
-    propagated = propagation_stack(normalized, X, theta.shape[0] - 1)
+    propagated = _basis_stack(normalized, X, theta.shape[0] - 1, args.basis)
     Z_coll = _filtered_bank(propagated, theta)
     coll_cls = train_linear_head(
         Z_coll,
@@ -1316,6 +1371,7 @@ def run_classification_comparison(
         tau=tau,
         label_weight=args.label_reg_weight,
         seed=args.seed,
+        basis=args.basis,
     )
     _, joint_det = _coarsen_and_detect(
         normalized, adjacency, Z_joint, splits, graph.y, args, tau
@@ -1425,11 +1481,21 @@ def run_for_tau(
         neg_project=args.neg_project,
         neg_sharpen=args.neg_sharpen,
         softmin_temperature=args.softmin_temperature,
+        basis=args.basis,
     )
     theta = fit["theta"]
     LOGGER.info(
         f"  [tau={tau:g}] lambda_min(Gamma) train: {fit['init_objective']:.6g} -> "
-        f"{fit['objective']:.6g}"
+        f"{fit['objective']:.6g}  (basis={args.basis})"
+    )
+    # Prop 6.3 diagnostic: conditioning of the screened channel Gram Z^T M_tau Z in
+    # each basis at the learned filter -- the monomial Hankel Gram is exponentially
+    # worse in K, which is exactly what the Chebyshev switch cures.
+    kappa_cheb = channel_gram_cond(normalized, X, theta, tau, "chebyshev")
+    kappa_mono = channel_gram_cond(normalized, X, theta, tau, "monomial")
+    LOGGER.info(
+        f"  [tau={tau:g}] channel-Gram cond(Z^T M Z)  chebyshev={kappa_cheb:.3e}  "
+        f"monomial={kappa_mono:.3e}  (ratio {kappa_mono / max(kappa_cheb, 1e-300):.1f}x)"
     )
     if neg_sampler is not None:
         LOGGER.info(
@@ -1446,6 +1512,7 @@ def run_for_tau(
         args.ridge,
         tau,
         indicator=args.indicator,
+        basis=args.basis,
     )
     test_cap = retained_energy(
         normalized,
@@ -1456,6 +1523,7 @@ def run_for_tau(
         args.ridge,
         tau,
         indicator=args.indicator,
+        basis=args.basis,
     )
     LOGGER.info(
         f"  [tau={tau:g}] retained M_tau-energy  train: min={train_cap['min_capture']:.3f} "
@@ -1476,6 +1544,7 @@ def run_for_tau(
         structural_width=args.structural_width,
         seed=args.seed,
         coarsen_target=args.coarsen_target,
+        basis=args.basis,
     )
 
     # 6. Loukas RSA coarsening with the learned target ------------------------
@@ -1572,6 +1641,9 @@ def run_for_tau(
                 "config": vars(args) | {"output": str(out_dir), "tau": tau},
                 "learning": {
                     "tau": tau,
+                    "basis": args.basis,
+                    "channel_gram_cond_chebyshev": kappa_cheb,
+                    "channel_gram_cond_monomial": kappa_mono,
                     "lambda_min_gamma_init": fit["init_objective"],
                     "lambda_min_gamma_final": fit["objective"],
                     "neg_softmax_lambda_max_init": fit.get("neg_objective_init"),
@@ -1731,13 +1803,25 @@ def main() -> None:
     parser.add_argument("--avg-degree", type=float, default=2.0)
     parser.add_argument("--feature-dim", type=int, default=64)
     parser.add_argument("--train-ratio", type=float, default=0.4)
-    parser.add_argument("--degree", type=int, default=10, help="polynomial degree K")
-    parser.add_argument("--epochs", type=int, default=1500)
+    parser.add_argument("--degree", type=int, default=15, help="polynomial degree K")
+    parser.add_argument(
+        "--basis",
+        choices=["chebyshev", "monomial"],
+        default="chebyshev",
+        help="polynomial basis for the learnable filter bank Z = g_theta(A_hat) X: "
+        "'chebyshev' (default) builds Z on the Chebyshev dictionary [T_k(A_hat) X] "
+        "of the paper (Section 6.2, eq. 30) -- the screened Gram is uniformly "
+        "well-conditioned (Prop 6.3), so the filter trains stably at high K with no "
+        "ridge tuning; 'monomial' is the legacy dictionary [A_hat^k X] (Hankel Gram, "
+        "exponentially ill-conditioned in K). Both span the same subspace (Lemma "
+        "6.1), so the optimum is identical in exact arithmetic.",
+    )
+    parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=0.02)
     parser.add_argument("--ridge", type=float, default=1e-4)
     parser.add_argument(
         "--tau",
-        default="0.0",
+        default="0.4",
         help="screened metric M_tau = L + tau*I; energy/objective is measured in "
         "||x||^2_{M_tau} = ||x||_L^2 + tau*||x||_2^2 (tau=0 -> L_sym seminorm, "
         "tau->inf -> l2). Pass one value, or a comma-separated list "
