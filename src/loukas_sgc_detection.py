@@ -1120,7 +1120,10 @@ def _ward_partition(
     #     A, n_clusters=k, connectivity=adjacency, distance_threshold=None
     # )
     model = AgglomerativeClustering(
-        n_clusters=k, linkage="ward", connectivity=conn,  distance_threshold=1,
+        n_clusters=k,
+        linkage="ward",
+        connectivity=conn,
+        distance_threshold=None,
     ).fit(A_np)
 
     groups = torch.as_tensor(model.labels_, dtype=torch.long, device=adjacency.device)

@@ -82,7 +82,13 @@ from src.sgc_detection import (
     propagation_stack,
 )
 from src.loukas_sgc_detection import (
+    LoukasCoarseningResult,
     _degrees,
+    _exact_rsa_epsilon,
+    _l_orthonormalize,
+    _laplacian,
+    _normalized_laplacian,
+    _screened_metric,
     build_laplacian_subspace,
     build_sgc_subspace,
     evaluate_loukas_patterns,
@@ -1444,6 +1450,152 @@ def _basis_retained_energy(
     return {"mean": float(diag.mean()), "min": float(diag.min())}
 
 
+def _labels_from_tree(children: "np.ndarray", n_samples: int, k: int) -> "np.ndarray":
+    """Cut an agglomerative merge tree to ``k`` clusters -> contiguous labels.
+
+    ``children`` is the sklearn ``children_`` array (row ``i`` records the two
+    nodes merged to form node ``n_samples + i``; leaves are ``0..n_samples-1``).
+    Applying the first ``n_samples - k`` merges and path-compressed union-find
+    labels every leaf by its surviving root (ported from ``Coarsening_test``).
+    """
+
+    n_merges = max(0, n_samples - k)
+    parent = np.arange(n_samples + len(children))
+
+    def find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:  # path compression
+            parent[x], x = root, parent[x]
+        return root
+
+    for i in range(n_merges):
+        a, b = int(children[i, 0]), int(children[i, 1])
+        parent[find(a)] = n_samples + i
+        parent[find(b)] = n_samples + i
+
+    roots: dict = {}
+    labels = np.empty(n_samples, dtype=np.int64)
+    for leaf in range(n_samples):
+        r = find(leaf)
+        labels[leaf] = roots.setdefault(r, len(roots))
+    return labels
+
+
+def ward_tree_coarsen(
+    adjacency: torch.Tensor,
+    basis: torch.Tensor,
+    train_patterns: list,
+    node_labels: torch.Tensor,
+    *,
+    tau: float,
+    laplacian: str = "symmetric",
+    threshold: float = 0.51,
+    stop: str = "epsilon",
+    epsilon_budget: float = float("inf"),
+    num_cuts: int = 200,
+) -> tuple:
+    """Contiguity-constrained Ward tree over ``R = span(basis)``, cut fine->coarse.
+
+    Builds the *whole* Ward merge tree once (on the ``M_tau``-orthonormal rows of
+    ``R``, connectivity = graph adjacency so every supernode stays connected), then
+    walks cluster counts from the *first combination* (``k = n-1``) toward the root
+    (fewer, coarser supernodes).  At each cut it records the exact RSA distortion
+    ``epsilon`` (Loukas Def. 2) and the mean **training** F1.  Two stop rules:
+
+    * ``stop="epsilon"`` -- keep coarsening while the exact ``epsilon`` stays within
+      ``epsilon_budget``; return the *coarsest* cut that still satisfies it (epsilon
+      is monotone non-decreasing along the nested tree cuts, so this is the crossing).
+    * ``stop="f1"``      -- return the cut with the best mean training F1 (the peak
+      of the recall-vs-precision trade-off, chosen on *training* gangs only).
+
+    Returns ``(LoukasCoarseningResult, trajectory)`` where ``trajectory`` is the
+    per-cut list of ``{n_coarse, epsilon, train_f1, recall, precision}`` dicts.
+    """
+
+    try:
+        from sklearn.cluster import AgglomerativeClustering
+        from scipy.sparse import csr_matrix
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("ward-tree coarsening needs scikit-learn and scipy") from exc
+
+    base_fn = (
+        _laplacian if laplacian in ("combinatorial", "comb") else _normalized_laplacian
+    )
+    metric = _screened_metric(base_fn(adjacency), tau)  # M_tau (sparse)
+    a0 = _l_orthonormalize(basis, metric)  # M_tau-orthonormal basis of R (original)
+    A = a0.detach().cpu().numpy()
+    n = int(adjacency.shape[0])
+    if A.shape[1] == 0:
+        raise ValueError("target subspace has no positive-energy direction for Ward")
+
+    # connectivity = original adjacency sparsity -> Ward merges stay connected
+    idx = adjacency.coalesce().indices().cpu().numpy()
+    conn = csr_matrix(
+        (np.ones(idx.shape[1], dtype=np.float64), (idx[0], idx[1])), shape=(n, n)
+    )
+    model = AgglomerativeClustering(
+        n_clusters=2, linkage="ward", connectivity=conn, compute_full_tree=True
+    ).fit(A)
+    children = np.asarray(model.children_)
+
+    # cluster-count schedule, descending: first combination (k=n-1) -> coarse
+    ks = np.unique(np.round(np.geomspace(2, n - 1, max(num_cuts, 2))).astype(int))
+    ks = ks[(ks >= 2) & (ks <= n - 1)][::-1]
+
+    trajectory: list = []
+    best = None
+    for k in ks.tolist():
+        labels = _labels_from_tree(children, n, int(k))
+        n2s = torch.from_numpy(labels).to(node_labels.device)
+        eps = _exact_rsa_epsilon(a0, metric, n2s)
+        results, by_label = evaluate_loukas_patterns(
+            train_patterns, n2s, node_labels, threshold=threshold
+        )
+        f1 = float(np.mean([r.f1 for r in results])) if results else 0.0
+        alert = by_label.get("alert", {})
+        rec = float(alert.get("mean_recall", 0.0) or 0.0)
+        prec = float(alert.get("mean_precision", 0.0) or 0.0)
+        n_coarse = int(labels.max()) + 1
+        entry = {
+            "n_coarse": n_coarse,
+            "epsilon": eps,
+            "train_f1": f1,
+            "recall": rec,
+            "precision": prec,
+            "labels": labels,
+        }
+        trajectory.append(entry)
+        if stop == "epsilon":
+            if eps <= epsilon_budget:
+                best = entry  # last (coarsest) feasible cut so far
+            else:
+                break  # monotone: once over budget, coarser cuts only get worse
+        else:  # f1
+            if best is None or f1 > best["train_f1"]:
+                best = entry
+
+    if best is None:  # even the first combination overshot the budget
+        best = trajectory[0] if trajectory else None
+    if best is None:
+        raise ValueError("ward-tree produced no valid cut")
+
+    labels = best["labels"]
+    result = LoukasCoarseningResult(
+        node_to_supernode=torch.from_numpy(labels).to(node_labels.device),
+        n_original=n,
+        n_coarse=best["n_coarse"],
+        epsilon=best["epsilon"],
+        epsilon_bound=float(
+            "nan"
+        ),  # per-level product bound not defined for a tree cut
+        sigmas=[],
+        sizes=[n, best["n_coarse"]],
+    )
+    return result, trajectory
+
+
 def _coarsen_and_detect(normalized, adjacency, basis, splits, node_labels, args, tau):
     """Coarsen with ``basis`` and score alert recall/precision/detection per split.
 
@@ -1454,23 +1606,40 @@ def _coarsen_and_detect(normalized, adjacency, basis, splits, node_labels, args,
     retained ``M_tau``-energy of its gang indicators under ``span(basis)``.
     """
 
-    if args.epsilon is not None:
-        budget = dict(
-            reduction=args.reduction,
-            epsilon=args.epsilon,
-            epsilon_ramp_levels=args.epsilon_ramp_levels,
+    ward_trajectory = None
+    if args.coarsening_method == "ward-tree":
+        # Build the Ward tree once and cut it fine->coarse, stopping either at the
+        # RSA epsilon budget or at the best *training* F1 (--ward-stop).
+        coarsening, ward_trajectory = ward_tree_coarsen(
+            adjacency,
+            basis,
+            splits["train"],
+            node_labels,
+            tau=tau,
+            laplacian=args.coarsening_laplacian,
+            threshold=args.threshold,
+            stop=args.ward_stop,
+            epsilon_budget=(args.epsilon if args.epsilon is not None else float("inf")),
+            num_cuts=args.ward_num_cuts,
         )
     else:
-        budget = dict(reduction=args.reduction)
-    coarsening = loukas_coarsen_pytorch(
-        adjacency,
-        basis,
-        method=args.coarsening_method,
-        laplacian=args.coarsening_laplacian,
-        max_levels=args.max_levels,
-        tau=tau,
-        **budget,
-    )
+        if args.epsilon is not None:
+            budget = dict(
+                reduction=args.reduction,
+                epsilon=args.epsilon,
+                epsilon_ramp_levels=args.epsilon_ramp_levels,
+            )
+        else:
+            budget = dict(reduction=args.reduction)
+        coarsening = loukas_coarsen_pytorch(
+            adjacency,
+            basis,
+            method=args.coarsening_method,
+            laplacian=args.coarsening_laplacian,
+            max_levels=args.max_levels,
+            tau=tau,
+            **budget,
+        )
     report = {}
     for name, split in splits.items():
         metrics = _alert_metrics(
@@ -1494,6 +1663,9 @@ def _coarsen_and_detect(normalized, adjacency, basis, splits, node_labels, args,
             "detected": metrics.get("detected"),
             "total": metrics.get("total"),
         }
+    if ward_trajectory is not None:
+        # stash the fine->coarse sweep for logging / JSON (no schema change needed)
+        coarsening.ward_trajectory = ward_trajectory
     return coarsening, report
 
 
@@ -2060,12 +2232,24 @@ def run_for_tau(
     coarsening, report = _coarsen_and_detect(
         normalized, adjacency, basis, splits, graph.y, args, tau
     )
-    LOGGER.info(
-        f"  [tau={tau:g}] coarsening: N={coarsening.n_original} -> n_coarse="
-        f"{coarsening.n_coarse}  levels={len(coarsening.sigmas)}  "
-        f"epsilon={coarsening.epsilon:.4g} (RSA exact; bound "
-        f"{coarsening.epsilon_bound:.4g})"
-    )
+    if getattr(coarsening, "ward_trajectory", None) is not None:
+        traj = coarsening.ward_trajectory
+        best_f1 = max((t["train_f1"] for t in traj), default=0.0)
+        LOGGER.info(
+            f"  [tau={tau:g}] ward-tree ({args.ward_stop}-stop): "
+            f"N={coarsening.n_original} -> n_coarse={coarsening.n_coarse}  "
+            f"epsilon={coarsening.epsilon:.4g} "
+            f"(budget {args.epsilon if args.epsilon is not None else float('inf'):.4g})  "
+            f"train_f1={next(t['train_f1'] for t in traj if t['n_coarse'] == coarsening.n_coarse):.3f}  "
+            f"(swept {len(traj)} cuts, best train_f1={best_f1:.3f})"
+        )
+    else:
+        LOGGER.info(
+            f"  [tau={tau:g}] coarsening: N={coarsening.n_original} -> n_coarse="
+            f"{coarsening.n_coarse}  levels={len(coarsening.sigmas)}  "
+            f"epsilon={coarsening.epsilon:.4g} (RSA exact; bound "
+            f"{coarsening.epsilon_bound:.4g})"
+        )
 
     # negative separation diagnostic on a fresh batch of repellers
     neg_share_mean = None
@@ -2171,6 +2355,20 @@ def run_for_tau(
                     "reduction": coarsening.reduction,
                     "epsilon": coarsening.epsilon,
                     "n_levels": len(coarsening.sigmas),
+                    "method": args.coarsening_method,
+                    "ward_stop": (
+                        args.ward_stop
+                        if args.coarsening_method == "ward-tree"
+                        else None
+                    ),
+                    "ward_trajectory": (
+                        [
+                            {k: v for k, v in t.items() if k != "labels"}
+                            for t in coarsening.ward_trajectory
+                        ]
+                        if getattr(coarsening, "ward_trajectory", None) is not None
+                        else None
+                    ),
                 },
                 "detection": report,
                 "encoder_comparison": encoder_reports,
@@ -2584,8 +2782,29 @@ def main() -> None:
             "kmeans",
             "linkage",
             "ward",
+            "ward-tree",
         ],
-        default="ward",
+        default="ward-tree",
+        help="coarsening family. 'ward-tree' builds the contiguity-constrained "
+        "Ward merge tree once (like Coarsening_test), then cuts it fine->coarse "
+        "and stops per --ward-stop; the others run the Loukas local-variation "
+        "greedy under the --reduction/--epsilon budget.",
+    )
+    parser.add_argument(
+        "--ward-stop",
+        choices=["epsilon", "f1"],
+        default="f1",
+        help="stop rule for --coarsening-method ward-tree: 'epsilon' keeps "
+        "coarsening while the exact RSA distortion stays <= --epsilon (coarsest "
+        "feasible cut); 'f1' returns the cut with the best mean TRAINING F1 "
+        "(peak of the recall/precision trade-off on training gangs only).",
+    )
+    parser.add_argument(
+        "--ward-num-cuts",
+        type=int,
+        default=200,
+        help="number of tree cuts sampled (geometric, fine->coarse) when walking "
+        "the ward-tree; higher = finer resolution of the epsilon crossing / F1 peak.",
     )
     parser.add_argument(
         "--coarsening-laplacian",
