@@ -111,7 +111,7 @@ class GraphData:
     * ``y``         -- node class labels ``(N,)`` (gang nodes marked ``1``); used
       only for evaluation and, optionally, negative sampling.
     """
-
+    edge_index: torch.Tensor
     a_hat: torch.Tensor
     adjacency: torch.Tensor
     X: torch.Tensor
@@ -125,12 +125,12 @@ class GraphData:
         random structural range-finder).  The features are cast to the operator's
         dtype/device so the bank stays numerically consistent.
         """
-
+        edge_index = graph.edge_index
         a_hat, adjacency = graph_operators(graph)
         X = graph.x if features is None else features
         X = X.to(device=a_hat.device, dtype=a_hat.dtype)
         y = graph.y.to(a_hat.device)
-        return cls(a_hat=a_hat, adjacency=adjacency, X=X, y=y)
+        return cls(edge_index=edge_index, a_hat=a_hat, adjacency=adjacency, X=X, y=y)
 
     @property
     def num_nodes(self) -> int:
@@ -222,10 +222,10 @@ class CollectiveBankDetector:
         return build_bank_subspace(
             data.a_hat,
             data.adjacency,
-            train_patterns,
             data.X,
             self.theta_,
             c.ridge,
+            train_patterns,
             c.tau,
             structural_width=c.structural_width,
             seed=c.seed,

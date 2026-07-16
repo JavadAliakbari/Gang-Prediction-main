@@ -67,7 +67,7 @@ from src.run_elliptic_gang_conductance import (
     connected_components_sets,
     random_connected_set,
 )
-from src.pattern_models import create_pattern
+from src.pattern_models import create_pattern, make_patterns
 from src.loukas_sgc_detection import (
     build_joint_subspace,
     build_sgc_subspace,
@@ -154,20 +154,6 @@ def build_torch_graph(A_w, A_unw, cls, X, weighted: bool):
         y=y,
     )
     return graph
-
-
-def make_patterns(sets, label, pattern_type, prefix):
-    """Wrap node-index arrays as Pattern objects with the given label."""
-
-    return [
-        create_pattern(
-            pattern_id=f"{prefix}{i}",
-            nodes=[int(v) for v in S],
-            pattern_type=pattern_type,
-            label=label,  # 'alert' (gang) or 'normal'; the encoders key on this
-        )
-        for i, S in enumerate(sets)
-    ]
 
 
 def split_train_test(patterns, train_ratio, rng):
@@ -353,7 +339,15 @@ def main() -> None:
     )
     ap.add_argument(
         "--coarsening-method",
-        choices=["edges", "neighborhood", "capped", "star", "kmeans", "linkage", "ward"],
+        choices=[
+            "edges",
+            "neighborhood",
+            "capped",
+            "star",
+            "kmeans",
+            "linkage",
+            "ward",
+        ],
         default="ward",
         help="local-variation candidate family. 'edges' (default, option 2) is "
         "canonical Loukas Algorithm 2: one cheapest-first matching per level, so "
@@ -559,11 +553,11 @@ def main() -> None:
     bank_basis = build_bank_subspace(
         normalized,
         adjacency,
-        gang_train,
         X2,
         # Xf,
         bank_fit["theta"],
         args.ridge,
+        gang_train,
         tau=args.bank_tau,
     )
 

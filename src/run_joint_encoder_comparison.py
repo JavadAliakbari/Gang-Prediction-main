@@ -886,10 +886,10 @@ def main() -> None:
         bank_basis = build_bank_subspace(
             normalized,
             adjacency,
-            alert_train_patterns,
             X,
             bank_theta,
             args.ridge,
+            alert_train_patterns,
             args.bank_tau,
             structural_width=args.bank_structural_width,
             seed=seed,

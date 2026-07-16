@@ -489,6 +489,21 @@ def _collective_gamma(
     """
 
     m_z = _m_apply(a_hat, Z, tau)  # M_tau Z          (N, d)
+    return _collective_gamma_mz(Z, m_z, m_vhat, ridge)
+
+
+def _collective_gamma_mz(
+    Z: torch.Tensor, m_z: torch.Tensor, m_vhat: torch.Tensor, ridge: float
+) -> torch.Tensor:
+    """``Gamma`` with ``m_z = M_tau Z`` supplied (no sparse mat-vec).
+
+    ``M_tau Z`` is linear in ``theta`` (``M_tau`` and the filter both commute with
+    ``A_hat``), so the training loop precomputes the screened dictionary stack
+    ``[M_tau phi_k(A_hat) X]`` once and rebuilds ``m_z`` per epoch by an elementwise
+    filter combine -- turning the previous per-epoch sparse mat-vec into a cheap
+    dense contraction (:func:`_collective_gamma` still offers the standalone form).
+    """
+
     g_z = Z.T @ m_z  # Z^T M_tau Z                    (d, d)
     g_z = 0.5 * (g_z + g_z.T)
     m = Z.T @ m_vhat  # Z^T M_tau Vhat                (d, m)
@@ -884,26 +899,35 @@ def collective_confusability(
     eps: float,
     *,
     reduce: str = "max",
+    m_z: "torch.Tensor | None" = None,
+    chol: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     """Worst-gang confusability ``max_{j<=m} chi^tau_{R_Theta}(S_j)`` (eq. 40 term).
 
     Danskin over the ``max`` is automatic: the gradient flows through the single
     worst gang each step.  ``reduce="mean"`` uses the average instead (a smoother,
     all-gang pressure if the hard max is too spiky).
+
+    The per-gang solves need only the shared Cholesky factor of ``G_Z + ridge I``
+    and the (small, precomputed) gang tables -- **not** the full embedding.  Pass
+    ``chol`` directly (the training loop builds it N-free from the precomputed Gram
+    kernel) to skip this call's ``O(N)`` work entirely; otherwise supply ``m_z =
+    M_tau Z`` to reuse the caller's mat-vec, or fall back to computing it here.
     """
 
     if not tables:
-        return Z.new_zeros(())
-    # G_Z = Z^T M_tau Z and its Cholesky factor are gang-independent: build the
-    # sparse mat-vec and the (d,d) factorization ONCE and share it across every
-    # gang (was recomputed and re-factorized per gang).  cholesky/cholesky_solve
-    # are differentiable, so gradient still flows through G_Z(Theta).
-    g_z = Z.T @ _m_apply(a_hat, Z, tau)
-    g_z = 0.5 * (g_z + g_z.T)
-    d = g_z.shape[0]
-    chol = torch.linalg.cholesky(
-        g_z + ridge * torch.eye(d, dtype=g_z.dtype, device=g_z.device)
-    )
+        return theta.new_zeros(())
+    # cholesky/cholesky_solve are differentiable, so gradient flows through
+    # G_Z(Theta) whether chol is precomputed or built here.
+    if chol is None:
+        if m_z is None:
+            m_z = _m_apply(a_hat, Z, tau)
+        g_z = Z.T @ m_z
+        g_z = 0.5 * (g_z + g_z.T)
+        d = g_z.shape[0]
+        chol = torch.linalg.cholesky(
+            g_z + ridge * torch.eye(d, dtype=g_z.dtype, device=g_z.device)
+        )
     chis = torch.stack([_gang_confusability(theta, chol, t, eps) for t in tables])
     return chis.mean() if reduce == "mean" else chis.max()
 
@@ -1027,6 +1051,42 @@ def fit_collective_bank(
         return (l_v_neg + tau * v_neg) / (phi_neg + tau).sqrt().unsqueeze(0)
 
     propagated = _basis_stack(a_hat, X, degree, basis)  # [phi_k(A_hat) X], k=0..K
+    # Screened dictionary stack [M_tau phi_k(A_hat) X], precomputed ONCE (K+1 sparse
+    # mat-vecs).  M_tau Z is linear in theta, so M_tau Z = _filtered_bank(m_prop,
+    # theta) each epoch -- no per-epoch sparse mat-vec in the Gram/confusability.
+    m_propagated = [_m_apply(a_hat, propagated[k], tau) for k in range(degree + 1)]
+
+    # N-independent Gram kernel.  The screened channel Gram and the RHS are
+    # quadratic / linear in the per-channel filter ``theta`` with theta-independent
+    # coefficients:
+    #   g_z[a,b] = Z[:,a]^T M_tau Z[:,b] = sum_{k,l} theta[k,a] theta[l,b] P[k,l,a,b],
+    #   m[a,j]   = Z[:,a]^T M_tau vhat_j = sum_k theta[k,a] Q[k,a,j],
+    # with P[k,l,a,b] = <phi_k X[:,a], M_tau phi_l X[:,b]> and
+    #      Q[k,a,j]   = <phi_k X[:,a], M_tau vhat_j>.
+    # Precomputing ``P`` (via one (K+1)d x (K+1)d Gram of the stacked dictionaries)
+    # and ``Q`` ONCE turns every epoch's Gram from an O(K N d) pass over the
+    # propagated stack into an O(K^2 d^2) einsum -- fully independent of N.
+    d_feat = X.shape[1]
+    _pr = torch.cat(propagated, dim=1)  # (N, (K+1) d), column k*d+a = phi_k X[:,a]
+    _mp = torch.cat(m_propagated, dim=1)  # (N, (K+1) d)
+    gram_kernel = (
+        (_pr.T @ _mp)  # ((K+1)d, (K+1)d)
+        .reshape(degree + 1, d_feat, degree + 1, d_feat)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )  # P: (K+1, K+1, d, d)
+    rhs_kernel = (_pr.T @ m_vhat).reshape(degree + 1, d_feat, -1)  # Q: (K+1, d, m)
+    del _pr, _mp
+    ridge_eye = ridge * torch.eye(d_feat, dtype=dtype, device=device)
+
+    def _gamma_and_chol(theta: torch.Tensor):
+        """``(Gamma, chol)`` from the precomputed kernel -- no O(N) work."""
+        g_z = torch.einsum("ka,lb,klab->ab", theta, theta, gram_kernel)
+        g_z = 0.5 * (g_z + g_z.T)
+        m = torch.einsum("ka,kaj->aj", theta, rhs_kernel)  # (d, m)
+        chol = torch.linalg.cholesky(g_z + ridge_eye)
+        gamma = m.T @ torch.cholesky_solve(m, chol)  # Vhat^T M Z (Z^T M Z)^+ Z^T M Vhat
+        return 0.5 * (gamma + gamma.T), chol
 
     # confusability regularizer (eq. 40): precompute the Theta-independent per-gang
     # tables once; the penalty -beta*max_j chi(S_j) is added to the margin below.
@@ -1057,14 +1117,15 @@ def fit_collective_bank(
             torch.finfo(dtype).eps
         )
 
-    def _neg_softmax(embedding: torch.Tensor, l_vhat_neg) -> torch.Tensor:
+    def _neg_softmax(embedding: torch.Tensor, l_vhat_neg, m_z=None) -> torch.Tensor:
         if l_vhat_neg is None:
             return torch.zeros((), dtype=dtype, device=device)
-        return _soft_lambda_max(
-            _collective_gamma(a_hat, embedding, l_vhat_neg, ridge, tau),
-            neg_temperature,
-            sharpen=neg_sharpen,
+        gamma_neg = (
+            _collective_gamma_mz(embedding, m_z, l_vhat_neg, ridge)
+            if m_z is not None
+            else _collective_gamma(a_hat, embedding, l_vhat_neg, ridge, tau)
         )
+        return _soft_lambda_max(gamma_neg, neg_temperature, sharpen=neg_sharpen)
 
     with torch.no_grad():
         Z0 = _filtered_bank(propagated, _unit(raw))
@@ -1116,8 +1177,7 @@ def fit_collective_bank(
     snap_interval = max(1, epochs // 20) if snapshot_interval > 0 else 0
     for _ep in range(epochs):
         theta = theta_param if riemannian else _unit(raw)
-        Z = _filtered_bank(propagated, theta)
-        gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau)
+        gamma, chol = _gamma_and_chol(theta)  # N-independent (precomputed kernel)
         # lam_min = torch.linalg.eigvalsh(gamma)[0]
         # objective ascended by the optimizer: the hard lambda_min (T=0) or a
         # differentiable soft-min over the whole low end of the spectrum (T>0).
@@ -1129,10 +1189,19 @@ def fit_collective_bank(
         )
 
         # eq. 40 margin: subtract the worst-gang confusability penalty from the
-        # capture floor, so the same step lifts lambda_min AND shrinks chi.
+        # capture floor, so the same step lifts lambda_min AND shrinks chi.  The
+        # confusability reuses the Gram's Cholesky factor -- also N-independent.
         if conf_active:
             conf = collective_confusability(
-                theta, Z, a_hat, tau, ridge, conf_tables, eps, reduce=conf_reduce
+                theta,
+                None,
+                a_hat,
+                tau,
+                ridge,
+                conf_tables,
+                eps,
+                reduce=conf_reduce,
+                chol=chol,
             )
             pos_obj = pos_obj - conf_weight * conf
             conf_val = float(conf.detach())
@@ -1144,8 +1213,12 @@ def fit_collective_bank(
             soft_neg_val = 0.0
         else:
             # fresh negatives every epoch -> stochastic repeller (no overfitting).
+            # Negatives resample new indicators each step, so they still need the
+            # full embedding Z / M_tau Z (built here only when negatives are on).
+            Z = _filtered_bank(propagated, theta)
+            m_z = _filtered_bank(m_propagated, theta)
             l_vhat_neg = _neg_l_vhat(neg_sampler())
-            soft_neg = _neg_softmax(Z, l_vhat_neg)
+            soft_neg = _neg_softmax(Z, l_vhat_neg, m_z=m_z)
             # Take the two gradients separately so the negative step can be made
             # non-conflicting with the positive margin (gradient surgery).
             (grad_pos,) = torch.autograd.grad(pos_obj, param, retain_graph=True)
@@ -1248,10 +1321,10 @@ def channel_gram_cond(
 def build_bank_subspace(
     a_hat: torch.Tensor,
     adjacency: torch.Tensor,
-    train_patterns: list,
     X: torch.Tensor,
     theta: torch.Tensor,
     ridge: float,
+    train_patterns: list | None = None,
     tau: float = 0.0,
     structural_width: int = 0,
     seed: int | None = None,
@@ -1293,19 +1366,18 @@ def build_bank_subspace(
     reconstruct them.  ``structural_width = 0`` leaves the target unchanged.
     """
 
-    eps = torch.finfo(a_hat.dtype).eps
-    V = degree_weighted_indicators(adjacency, train_patterns)  # (N, m)
-    l_v = _l_apply(a_hat, V)
-    phi = (V * l_v).sum(0).clamp_min(eps)  # Phi_j = ||v_j||_L^2
-    m_norm = (phi + tau).sqrt().unsqueeze(0)  # ||v_j||_{M_tau}
-    m_vhat = (l_v + tau * V) / m_norm  # M_tau v_hat_j                     (N, m)
-
     propagated = _basis_stack(a_hat, X, theta.shape[0] - 1, basis)
     Z = _filtered_bank(propagated, theta)  # (N, d)
 
     if coarsen_target == "bank":
         target = Z  # R = span(Z), the full learned filter-bank subspace     (N, d)
     elif coarsen_target == "indicators":
+        eps = torch.finfo(a_hat.dtype).eps
+        V = degree_weighted_indicators(adjacency, train_patterns)  # (N, m)
+        l_v = _l_apply(a_hat, V)
+        phi = (V * l_v).sum(0).clamp_min(eps)  # Phi_j = ||v_j||_L^2
+        m_norm = (phi + tau).sqrt().unsqueeze(0)  # ||v_j||_{M_tau}
+        m_vhat = (l_v + tau * V) / m_norm  # M_tau v_hat_j                     (N, m)
         m_z = _m_apply(a_hat, Z, tau)  # M_tau Z                             (N, d)
         g_z = Z.T @ m_z  # Z^T M_tau Z                                       (d, d)
         g_z = 0.5 * (g_z + g_z.T)
@@ -2216,10 +2288,10 @@ def run_for_tau(
     basis = build_bank_subspace(
         normalized,
         adjacency,
-        train_patterns,
         X,
         theta,
         args.ridge,
+        train_patterns,
         tau,
         structural_width=args.structural_width,
         seed=args.seed,
