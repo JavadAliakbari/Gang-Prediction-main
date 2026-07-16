@@ -100,12 +100,25 @@ _NON_FEATURE_COLS = {"address", "Time step", "class", "Time_step"}
 
 
 def load_node_features(
-    data_dir: Path, nodes_df: pd.DataFrame, day_start: int, day_end: int
-) -> torch.Tensor:
+    data_dir: Path,
+    nodes_df: pd.DataFrame,
+    day_start: int,
+    day_end: int,
+    *,
+    keep_columns: "list[str] | None" = None,
+    return_columns: bool = False,
+):
     """Standardised wallet-feature matrix X aligned to ``nodes_df`` row order.
 
     ``build_graph`` assigns node index i to ``nodes_df['address'].iloc[i]``; we
     reindex the feature rows by that address order so X[i] is node i's features.
+
+    ``keep_columns`` pins the numeric feature columns to a fixed set (e.g. the
+    columns kept on the training day) so a filter fit on one day can be applied
+    to another day whose zero-variance columns differ -- the column set (hence
+    ``X``'s width) stays identical while the z-score statistics are still
+    recomputed on *this* day's rows.  With ``return_columns=True`` the kept
+    column names are returned alongside ``X`` so the caller can reuse them.
     """
 
     feat = pd.read_csv(data_dir / "wallets_features.csv", dtype={"address": str})
@@ -115,13 +128,23 @@ def load_node_features(
 
     num = feat.drop(columns=[c for c in _NON_FEATURE_COLS if c in feat.columns])
     num = num.select_dtypes(include=[np.number])
+    if keep_columns is not None:
+        # align to the training day's column set (missing columns -> all-NaN -> 0)
+        num = num.reindex(columns=list(keep_columns))
     X = num.to_numpy(dtype=np.float64)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    # column z-score (drop zero-variance columns so they don't blow up)
     mu = X.mean(axis=0)
     sd = X.std(axis=0)
-    keep = sd > 1e-12
-    X = (X[:, keep] - mu[keep]) / sd[keep]
+    if keep_columns is None:
+        # column z-score (drop zero-variance columns so they don't blow up)
+        keep = sd > 1e-12
+        cols = list(num.columns[keep])
+        X = (X[:, keep] - mu[keep]) / sd[keep]
+    else:
+        # columns are pinned: keep every one, clamp the divisor so a column that
+        # is constant on this day maps to 0 rather than blowing up.
+        cols = list(num.columns)
+        X = (X - mu) / np.clip(sd, 1e-12, None)
     # row L2-normalisation: makes each node's feature vector unit length,
     # removing inter-node magnitude differences after column standardisation.
     row_norm = np.linalg.norm(X, axis=1, keepdims=True).clip(min=1e-12)
@@ -130,7 +153,10 @@ def load_node_features(
         f"  Feature matrix X: {X.shape[0]:,} x {X.shape[1]} "
         "(col z-scored + row L2-normalised)"
     )
-    return torch.from_numpy(X).to(torch.float64)
+    Xt = torch.from_numpy(X).to(torch.float64)
+    if return_columns:
+        return Xt, cols
+    return Xt
 
 
 # ---------------------------------------------------------------------------

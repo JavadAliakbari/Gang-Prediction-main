@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "src")))
@@ -47,15 +48,93 @@ def _random_structural_features(num_nodes: int, width: int, seed: int) -> torch.
     return (X - X.mean(0, keepdim=True)) / X.std(0, keepdim=True).clamp_min(1e-8)
 
 
+def _evaluate_transfer_day(
+    det: CollectiveBankDetector,
+    args: argparse.Namespace,
+    day: int,
+    feature_columns: "list[str] | None",
+) -> dict:
+    """Apply the *already-fit* detector to a single held-out day ``day``.
+
+    The learned filter bank ``det.theta_`` is frozen; only the target subspace
+    ``R = span(g_Theta(A_hat) X)`` and the RSA/Ward coarsening are recomputed on
+    this day's graph.  The Ward cut is chosen by the label-free epsilon budget
+    (``det.config.ward_stop == "epsilon"``), so the day's own gang labels never
+    influence the coarsening -- they are used only to *score* the resulting
+    supernodes.  Returns a per-day record (report + graph sizes).
+    """
+
+    print(f"\n--- transfer day {day} ---")
+    A_unw, A_w, cls, nodes_df = build_graph(args.data_dir, day, day)
+    if args.feature_mode == "wallet":
+        Xfeat = load_node_features(
+            args.data_dir, nodes_df, day, day, keep_columns=feature_columns
+        )
+    else:
+        Xfeat = _random_structural_features(
+            int(A_unw.shape[0]), args.random_width, args.seed + day
+        )
+    graph = build_torch_graph(A_w, A_unw, cls, Xfeat, weighted=args.weighted)
+
+    illicit_idx = np.where(cls == 1)[0]
+    gang_sets = connected_components_sets(A_unw, illicit_idx, args.min_gang_size)
+    day_gangs = make_patterns(gang_sets, "alert", "gang", "g")
+    print(f"  gangs (illicit CC>={args.min_gang_size}): {len(day_gangs)}")
+
+    data = GraphData.from_graph(graph)
+    if data.feature_dim != int(det.theta_.shape[1]):
+        raise ValueError(
+            f"day {day} feature-dim {data.feature_dim} != trained filter "
+            f"feature-dim {int(det.theta_.shape[1])}; cannot apply frozen filter."
+        )
+
+    record: dict = {
+        "day": day,
+        "n_nodes": data.num_nodes,
+        "n_gangs": len(day_gangs),
+        "report": None,
+    }
+    if not day_gangs:
+        print("  no gangs on this day -> skipping evaluation")
+        return record
+
+    basis = det.target_subspace(data, day_gangs)  # R = span(Z); labels unused
+    coarsening, _ = det.coarsen(data, basis, day_gangs)
+    report = det.evaluate(data, coarsening, {"all": day_gangs})
+    record["report"] = report.get("all")
+    record["coarsening"] = {
+        "n_original": int(coarsening.n_original),
+        "n_coarse": int(coarsening.n_coarse),
+        "epsilon": float(getattr(coarsening, "epsilon", float("nan"))),
+    }
+    r = record["report"]
+    if r is not None:
+        print(
+            f"  recall={r['mean_recall']:.3f} precision={r['mean_precision']:.3f} "
+            f"f1={r['mean_f1']:.3f} detection={r['detection_rate']:.1%} "
+            f"({r['detected']}/{r['total']})"
+        )
+    return record
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     # --- dataset ---
     ap.add_argument("--data-dir", default="data/elliptic_actors", type=Path)
-    ap.add_argument("--day-start", type=int, default=32)
-    ap.add_argument("--day-end", type=int, default=32)
+    ap.add_argument("--day-start", type=int, default=24)
+    ap.add_argument("--day-end", type=int, default=24)
     ap.add_argument("--min-gang-size", type=int, default=2)
     ap.add_argument("--weighted", action="store_true", default=False)
-    ap.add_argument("--train-ratio", type=float, default=0.5)
+    ap.add_argument("--train-ratio", type=float, default=0.8)
+    ap.add_argument(
+        "--transfer-days",
+        type=int,
+        default=10,
+        help="apply the trained (frozen) filter to this many single days *after* "
+        "--day-end, evaluating each day's graph individually (0 = disable). Each "
+        "day builds its own graph g_k (day-end+k) and is scored with the label-free "
+        "epsilon-budget Ward cut so the transfer is honest.",
+    )
     ap.add_argument(
         "--feature-mode",
         choices=["wallet", "random"],
@@ -76,7 +155,7 @@ def main() -> None:
     # --- detector hyperparameters (mirror DetectorConfig) ---
     ap.add_argument("--degree", type=int, default=32, help="polynomial degree K")
     ap.add_argument("--basis", choices=["chebyshev", "monomial"], default="chebyshev")
-    ap.add_argument("--tau", type=float, default=0.3, help="screening (0 = Cor 4.7)")
+    ap.add_argument("--tau", type=float, default=0.5, help="screening (0 = Cor 4.7)")
     ap.add_argument("--epochs", type=int, default=500, help="training epochs")
     ap.add_argument("--learning-rate", type=float, default=0.02)
     ap.add_argument("--ridge", type=float, default=1e-3)
@@ -112,7 +191,7 @@ def main() -> None:
         default="symmetric",
     )
     ap.add_argument("--reduction", type=float, default=0.3)
-    ap.add_argument("--epsilon", type=float, default=0.4)
+    ap.add_argument("--epsilon", type=float, default=0.5)
     ap.add_argument("--max-levels", type=int, default=10)
     ap.add_argument("--ward-stop", choices=["epsilon", "f1"], default="epsilon")
     ap.add_argument("--ward-num-cuts", type=int, default=500)
@@ -128,9 +207,10 @@ def main() -> None:
     # --- 1. load the Elliptic++ graph + illicit gangs -----------------------
     print(f"=== Elliptic++ (modular) | days {args.day_start}-{args.day_end} ===")
     A_unw, A_w, cls, nodes_df = build_graph(args.data_dir, args.day_start, args.day_end)
+    feature_columns: "list[str] | None" = None
     if args.feature_mode == "wallet":
-        Xfeat = load_node_features(
-            args.data_dir, nodes_df, args.day_start, args.day_end
+        Xfeat, feature_columns = load_node_features(
+            args.data_dir, nodes_df, args.day_start, args.day_end, return_columns=True
         )
     else:
         Xfeat = _random_structural_features(
@@ -240,6 +320,88 @@ def main() -> None:
             f"{r['detected']:>4}/{r['total']:<5}"
         )
 
+    # --- 3b. transfer: apply the frozen filter to the next N single days ----
+    transfer_records: list[dict] = []
+    transfer_summary: dict | None = None
+    if args.transfer_days > 0:
+        # Freeze the learned filter; recompute only the subspace + coarsening per
+        # day. Force the label-free epsilon Ward stop so no day's own gangs steer
+        # its coarsening (honest transfer).
+        det_transfer = CollectiveBankDetector(replace(cfg, ward_stop="epsilon"))
+        det_transfer.theta_ = det.theta_
+        det_transfer.fit_info_ = det.fit_info_
+
+        print("\n" + "=" * 74)
+        print(
+            f"TRANSFER: frozen filter (trained on days {args.day_start}-{args.day_end}) "
+            f"applied to days {args.day_end + 1}-{args.day_end + args.transfer_days}"
+        )
+        print("=" * 74)
+        for k in range(1, args.transfer_days + 1):
+            transfer_records.append(
+                _evaluate_transfer_day(
+                    det_transfer, args, args.day_end + k, feature_columns
+                )
+            )
+
+        # per-day table + average over the days that had gangs
+        print("\n" + "=" * 74)
+        print("PER-DAY TRANSFER PERFORMANCE (frozen filter, honest epsilon cut)")
+        print("=" * 74)
+        thdr = (
+            f"  {'day':<5} {'nodes':>8} {'gangs':>6} {'recall':>8} {'precision':>10} "
+            f"{'f1':>7} {'detection':>10} {'det/tot':>10}"
+        )
+        print(thdr)
+        print("  " + "-" * (len(thdr) - 2))
+        scored = [rec for rec in transfer_records if rec["report"] is not None]
+        for rec in transfer_records:
+            r = rec["report"]
+            if r is None:
+                print(
+                    f"  {rec['day']:<5} {rec['n_nodes']:>8,} {rec['n_gangs']:>6} "
+                    f"{'--':>8} {'--':>10} {'--':>7} {'--':>10} {'--':>10}"
+                )
+                continue
+            print(
+                f"  {rec['day']:<5} {rec['n_nodes']:>8,} {rec['n_gangs']:>6} "
+                f"{r['mean_recall']:>8.3f} {r['mean_precision']:>10.3f} "
+                f"{r['mean_f1']:>7.3f} {r['detection_rate']:>10.1%} "
+                f"{r['detected']:>4}/{r['total']:<5}"
+            )
+        if scored:
+            keys = ("mean_recall", "mean_precision", "mean_f1", "detection_rate")
+            avg = {
+                k: float(np.mean([rec["report"][k] for rec in scored])) for k in keys
+            }
+            tot_det = int(sum(rec["report"]["detected"] for rec in scored))
+            tot_all = int(sum(rec["report"]["total"] for rec in scored))
+            transfer_summary = {
+                "n_days_scored": len(scored),
+                **avg,
+                "detected": tot_det,
+                "total": tot_all,
+            }
+            print("  " + "-" * (len(thdr) - 2))
+            print(
+                f"  {'avg':<5} {'':>8} {'':>6} "
+                f"{avg['mean_recall']:>8.3f} {avg['mean_precision']:>10.3f} "
+                f"{avg['mean_f1']:>7.3f} {avg['detection_rate']:>10.1%} "
+                f"{tot_det:>4}/{tot_all:<5}"
+            )
+
+        # echo the training-day test-pattern performance for side-by-side reading
+        test_r = result["report"].get("test")
+        if test_r is not None:
+            print(
+                f"\n  training-day (d{args.day_start}-{args.day_end}) TEST patterns: "
+                f"recall={test_r['mean_recall']:.3f} "
+                f"precision={test_r['mean_precision']:.3f} "
+                f"f1={test_r['mean_f1']:.3f} "
+                f"detection={test_r['detection_rate']:.1%} "
+                f"({test_r['detected']}/{test_r['total']})"
+            )
+
     out_json = args.out / f"elliptic_modular_d{args.day_start}-{args.day_end}.json"
     payload = {
         "dataset": "elliptic++",
@@ -259,6 +421,10 @@ def main() -> None:
             "epsilon": co.epsilon,
         },
         "report": result["report"],
+        "transfer": {
+            "days": transfer_records,
+            "average": transfer_summary,
+        },
     }
     out_json.write_text(json.dumps(payload, indent=2, default=str) + "\n")
     print(f"\nJSON report: {out_json}")
