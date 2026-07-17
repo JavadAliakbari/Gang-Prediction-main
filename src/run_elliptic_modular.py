@@ -38,6 +38,7 @@ from src.run_elliptic_gang_detection import (
     make_patterns,
     split_train_test,
 )
+from src.utils.utils import LOGGER, now
 
 
 def _random_structural_features(num_nodes: int, width: int, seed: int) -> torch.Tensor:
@@ -64,7 +65,7 @@ def _evaluate_transfer_day(
     supernodes.  Returns a per-day record (report + graph sizes).
     """
 
-    print(f"\n--- transfer day {day} ---")
+    LOGGER.info(f"\n--- transfer day {day} ---")
     A_unw, A_w, cls, nodes_df = build_graph(args.data_dir, day, day)
     if args.feature_mode == "wallet":
         Xfeat = load_node_features(
@@ -79,7 +80,7 @@ def _evaluate_transfer_day(
     illicit_idx = np.where(cls == 1)[0]
     gang_sets = connected_components_sets(A_unw, illicit_idx, args.min_gang_size)
     day_gangs = make_patterns(gang_sets, "alert", "gang", "g")
-    print(f"  gangs (illicit CC>={args.min_gang_size}): {len(day_gangs)}")
+    LOGGER.info(f"  gangs (illicit CC>={args.min_gang_size}): {len(day_gangs)}")
 
     data = GraphData.from_graph(graph)
     if data.feature_dim != int(det.theta_.shape[1]):
@@ -95,7 +96,7 @@ def _evaluate_transfer_day(
         "report": None,
     }
     if not day_gangs:
-        print("  no gangs on this day -> skipping evaluation")
+        LOGGER.info("  no gangs on this day -> skipping evaluation")
         return record
 
     basis = det.target_subspace(data, day_gangs)  # R = span(Z); labels unused
@@ -109,7 +110,7 @@ def _evaluate_transfer_day(
     }
     r = record["report"]
     if r is not None:
-        print(
+        LOGGER.info(
             f"  recall={r['mean_recall']:.3f} precision={r['mean_precision']:.3f} "
             f"f1={r['mean_f1']:.3f} detection={r['detection_rate']:.1%} "
             f"({r['detected']}/{r['total']})"
@@ -129,7 +130,7 @@ def main() -> None:
     ap.add_argument(
         "--transfer-days",
         type=int,
-        default=10,
+        default=5,
         help="apply the trained (frozen) filter to this many single days *after* "
         "--day-end, evaluating each day's graph individually (0 = disable). Each "
         "day builds its own graph g_k (day-end+k) and is scored with the label-free "
@@ -198,14 +199,15 @@ def main() -> None:
     ap.add_argument("--threshold", type=float, default=0.51)
     ap.add_argument("--max-normal-patterns", type=int, default=120)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--out", default="results/elliptic_modular", type=Path)
+    out_dir = f"results/elliptic_modular/{now}/"
+    ap.add_argument("--out", default=out_dir, type=Path)
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
     torch.manual_seed(args.seed)
 
     # --- 1. load the Elliptic++ graph + illicit gangs -----------------------
-    print(f"=== Elliptic++ (modular) | days {args.day_start}-{args.day_end} ===")
+    LOGGER.info(f"=== Elliptic++ (modular) | days {args.day_start}-{args.day_end} ===")
     A_unw, A_w, cls, nodes_df = build_graph(args.data_dir, args.day_start, args.day_end)
     feature_columns: "list[str] | None" = None
     if args.feature_mode == "wallet":
@@ -216,7 +218,7 @@ def main() -> None:
         Xfeat = _random_structural_features(
             int(A_unw.shape[0]), args.random_width, args.seed
         )
-        print(
+        LOGGER.info(
             f"  Feature matrix X: {Xfeat.shape[0]:,} x {Xfeat.shape[1]} (random structural)"
         )
     graph = build_torch_graph(A_w, A_unw, cls, Xfeat, weighted=args.weighted)
@@ -224,7 +226,7 @@ def main() -> None:
     illicit_idx = np.where(cls == 1)[0]
     gang_sets = connected_components_sets(A_unw, illicit_idx, args.min_gang_size)
     gangs = make_patterns(gang_sets, "alert", "gang", "g")
-    print(
+    LOGGER.info(
         f"  Gangs (illicit CC>={args.min_gang_size}): {len(gangs)}  "
         f"| sizes: {sorted((p.num_nodes for p in gangs), reverse=True)[:12]}..."
     )
@@ -233,7 +235,7 @@ def main() -> None:
     )
     licit_sets = sorted(licit_sets, key=len, reverse=True)[: args.max_normal_patterns]
     normals = make_patterns(licit_sets, "normal", "normal", "n")
-    print(
+    LOGGER.info(
         f"  gangs={len(gangs)} (sizes {sorted((p.num_nodes for p in gangs), reverse=True)[:8]}...)  normals={len(normals)}"
     )
 
@@ -241,12 +243,12 @@ def main() -> None:
     gang_train, gang_test = split_train_test(gangs, args.train_ratio, rng)
     if args.max_train_gangs and len(gang_train) > args.max_train_gangs:
         gang_train = gang_train[: args.max_train_gangs]
-    print(
+    LOGGER.info(
         f"  train gangs: {len(gang_train)}  test gangs: {len(gang_test)}  "
         f"feature-dim: {graph.x.shape[1]}"
     )
     if len(gang_train) > graph.x.shape[1]:
-        print(
+        LOGGER.info(
             f"  WARNING: #train-gangs ({len(gang_train)}) > feature-dim "
             f"({graph.x.shape[1]}): capacity threshold -> lambda_min may be ~0. "
             "Use --feature-mode random --random-width, or --max-train-gangs."
@@ -280,41 +282,41 @@ def main() -> None:
     )
     det = CollectiveBankDetector(cfg)
 
-    print(
+    LOGGER.info(
         f"\n  Fitting collective bank (basis={cfg.basis}, tau={cfg.tau}, "
         f"K={cfg.degree}, opt={cfg.optimizer}) …"
     )
     result = det.run(data, gang_train, gang_test, all_patterns=gangs)
 
     fit = result["fit"]
-    print(
+    LOGGER.info(
         f"    lambda_min(Gamma): {fit['init_objective']:.4g} -> {fit['objective']:.4g}"
     )
     if cfg.conf_weight > 0:
-        print(
+        LOGGER.info(
             f"    confusability chi: {fit['confusability_init']:.4g} -> {fit['confusability']:.4g}"
         )
     co = result["coarsening"]
-    print(
+    LOGGER.info(
         f"  coarsening ({cfg.coarsening_method}): N={co.n_original:,} -> "
         f"n_coarse={co.n_coarse:,}  epsilon={co.epsilon:.4g}"
     )
 
     # --- 3. report ----------------------------------------------------------
-    print("\n" + "=" * 74)
-    print(
+    LOGGER.info("\n" + "=" * 74)
+    LOGGER.info(
         f"ELLIPTIC++ GANG DETECTION (modular)  days {args.day_start}-{args.day_end}  "
         f"N={data.num_nodes:,}  {len(gangs)} gangs"
     )
-    print("=" * 74)
+    LOGGER.info("=" * 74)
     hdr = f"  {'split':<6} {'recall':>8} {'precision':>10} {'f1':>7} {'detection':>10} {'det/tot':>10}"
-    print(hdr)
-    print("  " + "-" * (len(hdr) - 2))
+    LOGGER.info(hdr)
+    LOGGER.info("  " + "-" * (len(hdr) - 2))
     for name in ("train", "test", "all"):
         r = result["report"].get(name)
         if r is None:
             continue
-        print(
+        LOGGER.info(
             f"  {name:<6} {r['mean_recall']:>8.3f} {r['mean_precision']:>10.3f} "
             f"{r['mean_f1']:>7.3f} {r['detection_rate']:>10.1%} "
             f"{r['detected']:>4}/{r['total']:<5}"
@@ -331,12 +333,12 @@ def main() -> None:
         det_transfer.theta_ = det.theta_
         det_transfer.fit_info_ = det.fit_info_
 
-        print("\n" + "=" * 74)
-        print(
+        LOGGER.info("\n" + "=" * 74)
+        LOGGER.info(
             f"TRANSFER: frozen filter (trained on days {args.day_start}-{args.day_end}) "
             f"applied to days {args.day_end + 1}-{args.day_end + args.transfer_days}"
         )
-        print("=" * 74)
+        LOGGER.info("=" * 74)
         for k in range(1, args.transfer_days + 1):
             transfer_records.append(
                 _evaluate_transfer_day(
@@ -345,25 +347,25 @@ def main() -> None:
             )
 
         # per-day table + average over the days that had gangs
-        print("\n" + "=" * 74)
-        print("PER-DAY TRANSFER PERFORMANCE (frozen filter, honest epsilon cut)")
-        print("=" * 74)
+        LOGGER.info("\n" + "=" * 74)
+        LOGGER.info("PER-DAY TRANSFER PERFORMANCE (frozen filter, honest epsilon cut)")
+        LOGGER.info("=" * 74)
         thdr = (
             f"  {'day':<5} {'nodes':>8} {'gangs':>6} {'recall':>8} {'precision':>10} "
             f"{'f1':>7} {'detection':>10} {'det/tot':>10}"
         )
-        print(thdr)
-        print("  " + "-" * (len(thdr) - 2))
+        LOGGER.info(thdr)
+        LOGGER.info("  " + "-" * (len(thdr) - 2))
         scored = [rec for rec in transfer_records if rec["report"] is not None]
         for rec in transfer_records:
             r = rec["report"]
             if r is None:
-                print(
+                LOGGER.info(
                     f"  {rec['day']:<5} {rec['n_nodes']:>8,} {rec['n_gangs']:>6} "
                     f"{'--':>8} {'--':>10} {'--':>7} {'--':>10} {'--':>10}"
                 )
                 continue
-            print(
+            LOGGER.info(
                 f"  {rec['day']:<5} {rec['n_nodes']:>8,} {rec['n_gangs']:>6} "
                 f"{r['mean_recall']:>8.3f} {r['mean_precision']:>10.3f} "
                 f"{r['mean_f1']:>7.3f} {r['detection_rate']:>10.1%} "
@@ -382,8 +384,8 @@ def main() -> None:
                 "detected": tot_det,
                 "total": tot_all,
             }
-            print("  " + "-" * (len(thdr) - 2))
-            print(
+            LOGGER.info("  " + "-" * (len(thdr) - 2))
+            LOGGER.info(
                 f"  {'avg':<5} {'':>8} {'':>6} "
                 f"{avg['mean_recall']:>8.3f} {avg['mean_precision']:>10.3f} "
                 f"{avg['mean_f1']:>7.3f} {avg['detection_rate']:>10.1%} "
@@ -393,7 +395,7 @@ def main() -> None:
         # echo the training-day test-pattern performance for side-by-side reading
         test_r = result["report"].get("test")
         if test_r is not None:
-            print(
+            LOGGER.info(
                 f"\n  training-day (d{args.day_start}-{args.day_end}) TEST patterns: "
                 f"recall={test_r['mean_recall']:.3f} "
                 f"precision={test_r['mean_precision']:.3f} "
@@ -427,7 +429,7 @@ def main() -> None:
         },
     }
     out_json.write_text(json.dumps(payload, indent=2, default=str) + "\n")
-    print(f"\nJSON report: {out_json}")
+    LOGGER.info(f"\nJSON report: {out_json}")
 
     basis = det.target_subspace(data, gang_train)
     coarsening, _ = det.coarsen(data, basis, gang_train)
