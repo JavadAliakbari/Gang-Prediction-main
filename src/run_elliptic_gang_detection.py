@@ -99,6 +99,14 @@ from src.run_collective_bank_detection import (
 _NON_FEATURE_COLS = {"address", "Time step", "class", "Time_step"}
 
 
+def random_structural_features(num_nodes: int, width: int, seed: int) -> torch.Tensor:
+    """Isotropic random range-finder ``Omega`` (the structural feature channel)."""
+
+    gen = torch.Generator().manual_seed(seed)
+    X = torch.randn(num_nodes, width, dtype=torch.float64, generator=gen)
+    return (X - X.mean(0, keepdim=True)) / X.std(0, keepdim=True).clamp_min(1e-8)
+
+
 def load_node_features(
     data_dir: Path,
     nodes_df: pd.DataFrame,

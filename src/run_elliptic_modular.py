@@ -27,26 +27,100 @@ sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "src")))
 sys.path.insert(0, str(Path.cwd()))
 
 import numpy as np
+import pandas as pd
 import torch
+from sklearn.metrics import roc_auc_score
 
 from src.analyze_elliptic_coarsening import analyze_coarsening
 from src.collective_detector import CollectiveBankDetector, DetectorConfig, GraphData
+from src.loukas_sgc_detection import evaluate_loukas_patterns
+from src.run_collective_bank_detection import build_node_split
 from src.run_elliptic_gang_conductance import build_graph, connected_components_sets
 from src.run_elliptic_gang_detection import (
     build_torch_graph,
     load_node_features,
     make_patterns,
     split_train_test,
+    random_structural_features,
 )
+# pure diagnostic helpers (no coarsening) reused so the missed-gang plots are
+# produced here from the coarsenings this script already computes -- no separate
+# analyze_missed_gangs run.
+from src.analyze_missed_gangs import gang_moments, gang_structure, plot_diagnostics
 from src.utils.utils import LOGGER, now
 
 
-def _random_structural_features(num_nodes: int, width: int, seed: int) -> torch.Tensor:
-    """Isotropic random range-finder ``Omega`` (the structural feature channel)."""
+def _gang_diagnostic_rows(det, data, gangs, gang_sets, edge_index, day, node_to_super):
+    """Per-gang structural stats + detection outcome for the missed-gang analysis.
 
-    gen = torch.Generator().manual_seed(seed)
-    X = torch.randn(num_nodes, width, dtype=torch.float64, generator=gen)
-    return (X - X.mean(0, keepdim=True)) / X.std(0, keepdim=True).clamp_min(1e-8)
+    Uses an **already-computed** coarsening (``node_to_super``) -- no re-coarsening.
+    Records the theory's predictors (conductance ``Phi``, boundary-edge mean
+    ``mbar1``, retained capture, density, star-ness, degree ratio) beside each gang's
+    detection outcome, matching the schema :func:`plot_diagnostics` expects.
+    """
+
+    res, _ = evaluate_loukas_patterns(
+        gangs, node_to_super, data.y, threshold=det.config.threshold
+    )
+    phi, mbar1 = gang_moments(data.a_hat, data.adjacency, gangs)
+    cap = det.capture(data, gangs)["per_gang_capture"]
+    gang_of = torch.full((data.num_nodes,), -1, dtype=torch.long)
+    for gi, S in enumerate(gang_sets):
+        gang_of[torch.as_tensor(list(S), dtype=torch.long)] = gi
+    struct = gang_structure(edge_index, gang_of, len(gangs), data.num_nodes)
+    return [
+        {
+            "day": day, "gang": gangs[gi].id, "size": struct[gi]["size"],
+            "Phi": float(phi[gi]), "mbar1": float(mbar1[gi]), "capture": float(cap[gi]),
+            "density": struct[gi]["density"], "starness": struct[gi]["starness"],
+            "deg_ratio": struct[gi]["deg_ratio"], "recall": res[gi].recall,
+            "precision": res[gi].precision, "f1": res[gi].f1,
+            "detected": int(res[gi].detected),
+        }
+        for gi in range(len(gangs))
+    ]
+
+
+def _write_missed_gang_diagnostics(rows: list, out: Path) -> None:
+    """Pool per-gang rows (training + transfer days) -> CSV, plot, AUC report."""
+
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    df.to_csv(out / "per_gang_diagnostics.csv", index=False)
+    plot_diagnostics(df, out / "missed_gang_diagnostics.png")
+
+    feats = ["size", "Phi", "mbar1", "capture", "density", "starness", "deg_ratio"]
+    LOGGER.info("\n" + "=" * 78)
+    LOGGER.info(
+        f"POOLED MISSED-GANG DIAGNOSTICS: {len(df)} gangs over {df.day.nunique()} days"
+        f"   detected {int(df.detected.sum())}/{len(df)} ({df.detected.mean():.1%})"
+    )
+    LOGGER.info("=" * 78)
+    LOGGER.info(
+        f"{'statistic':<12}{'detected median':>17}{'missed median':>15}{'AUC(detect)':>13}"
+    )
+    LOGGER.info("-" * 78)
+    summary = {}
+    have_det, have_mis = (df.detected == 1).any(), (df.detected == 0).any()
+    for f in feats:
+        d_med = float(df[df.detected == 1][f].median()) if have_det else float("nan")
+        m_med = float(df[df.detected == 0][f].median()) if have_mis else float("nan")
+        try:
+            auc = float(roc_auc_score(df.detected, df[f]))
+        except Exception:
+            auc = float("nan")
+        summary[f] = {"detected_median": d_med, "missed_median": m_med, "auc": auc}
+        LOGGER.info(f"{f:<12}{d_med:>17.4g}{m_med:>15.4g}{auc:>13.2f}")
+    LOGGER.info("\nAUC > 0.5: higher value -> more likely detected;  AUC < 0.5: -> missed.")
+    (out / "missed_gang_summary.json").write_text(
+        json.dumps(
+            {"n_gangs": len(df), "detected": int(df.detected.sum()), "stats": summary},
+            indent=2,
+        )
+        + "\n"
+    )
+    LOGGER.info(f"missed-gang CSV + plot + summary -> {out}")
 
 
 def _evaluate_transfer_day(
@@ -72,7 +146,7 @@ def _evaluate_transfer_day(
             args.data_dir, nodes_df, day, day, keep_columns=feature_columns
         )
     else:
-        Xfeat = _random_structural_features(
+        Xfeat = random_structural_features(
             int(A_unw.shape[0]), args.random_width, args.seed + day
         )
     graph = build_torch_graph(A_w, A_unw, cls, Xfeat, weighted=args.weighted)
@@ -108,6 +182,11 @@ def _evaluate_transfer_day(
         "n_coarse": int(coarsening.n_coarse),
         "epsilon": float(getattr(coarsening, "epsilon", float("nan"))),
     }
+    # per-gang missed-gang diagnostics from THIS day's coarsening (no re-coarsening)
+    record["gang_rows"] = _gang_diagnostic_rows(
+        det, data, day_gangs, gang_sets, graph.edge_index, day,
+        coarsening.node_to_supernode,
+    )
     r = record["report"]
     if r is not None:
         LOGGER.info(
@@ -130,7 +209,7 @@ def main() -> None:
     ap.add_argument(
         "--transfer-days",
         type=int,
-        default=5,
+        default=10,
         help="apply the trained (frozen) filter to this many single days *after* "
         "--day-end, evaluating each day's graph individually (0 = disable). Each "
         "day builds its own graph g_k (day-end+k) and is scored with the label-free "
@@ -164,6 +243,32 @@ def main() -> None:
         "--optimizer", choices=["projected", "riemannian"], default="riemannian"
     )
     ap.add_argument("--softmin-temperature", type=float, default=0.2)
+    ap.add_argument(
+        "--capture-objective",
+        choices=["lambda_min", "trace", "softmin_diag"],
+        default="lambda_min",
+        help="what the bank ascends: 'lambda_min' (capture + cross-gang separation, "
+        "carries the m>d capacity wall) | 'trace' (mean per-gang capture, no "
+        "separation, no capacity wall) | 'softmin_diag' (worst gang's capture, no "
+        "separation). trace/softmin_diag drop the cross-gang separation lambda_min "
+        "buys, which the connectivity-constrained coarsener provides for free "
+        "(Prop 8.5); the needed neighbour separation is the confusability chi.",
+    )
+    ap.add_argument(
+        "--label-weight",
+        type=float,
+        default=0.0,
+        help="beta for a supervised illicit/licit node head trained JOINTLY with "
+        "the filter: loss = -capture + label_weight*CE(head(Z), y). 0 = off. Uses "
+        "--neg-per-pos host nodes per gang node as the negative class.",
+    )
+    ap.add_argument(
+        "--neg-per-pos",
+        type=float,
+        default=1.0,
+        help="host (non-gang) nodes sampled per gang node as the negative class for "
+        "the --label-weight head (only used when --label-weight > 0).",
+    )
     ap.add_argument("--conf-weight", type=float, default=10.0)
     ap.add_argument("--conf-reduce", choices=["max", "mean"], default="mean")
     ap.add_argument("--conf-delta", type=float, default=0.0)
@@ -215,7 +320,7 @@ def main() -> None:
             args.data_dir, nodes_df, args.day_start, args.day_end, return_columns=True
         )
     else:
-        Xfeat = _random_structural_features(
+        Xfeat = random_structural_features(
             int(A_unw.shape[0]), args.random_width, args.seed
         )
         LOGGER.info(
@@ -265,6 +370,8 @@ def main() -> None:
         ridge=args.ridge,
         optimizer=args.optimizer,
         softmin_temperature=args.softmin_temperature,
+        capture_objective=args.capture_objective,
+        label_weight=args.label_weight,
         conf_weight=args.conf_weight,
         conf_reduce=args.conf_reduce,
         conf_delta=args.conf_delta,
@@ -282,15 +389,43 @@ def main() -> None:
     )
     det = CollectiveBankDetector(cfg)
 
+    # optional joint supervised head: build a node-level illicit/host split on the
+    # TRAIN gangs (labels are used only for the head; the coarsening cut stays
+    # label-free via --ward-stop epsilon).
+    label_y = label_idx = None
+    if args.label_weight > 0.0:
+        label_y, label_idx, _ = build_node_split(
+            gang_train,
+            gang_test,
+            data.num_nodes,
+            (data.y == 1),
+            neg_per_pos=args.neg_per_pos,
+            seed=args.seed,
+        )
+        LOGGER.info(
+            f"  joint label head: beta={args.label_weight:g}  "
+            f"{len(label_idx):,} labelled nodes "
+            f"({int((label_y[label_idx] == 1).sum()):,} illicit)"
+        )
+
     LOGGER.info(
         f"\n  Fitting collective bank (basis={cfg.basis}, tau={cfg.tau}, "
-        f"K={cfg.degree}, opt={cfg.optimizer}) …"
+        f"K={cfg.degree}, opt={cfg.optimizer}, objective={cfg.capture_objective}"
+        f"{f', label_w={cfg.label_weight:g}' if cfg.label_weight > 0 else ''}) …"
     )
-    result = det.run(data, gang_train, gang_test, all_patterns=gangs)
+    result = det.run(
+        data,
+        gang_train,
+        gang_test,
+        all_patterns=gangs,
+        label_y=label_y,
+        label_idx=label_idx,
+    )
 
     fit = result["fit"]
     LOGGER.info(
-        f"    lambda_min(Gamma): {fit['init_objective']:.4g} -> {fit['objective']:.4g}"
+        f"    capture ({cfg.capture_objective}) / lambda_min(Gamma): "
+        f"{fit['init_objective']:.4g} -> {fit['objective']:.4g}"
     )
     if cfg.conf_weight > 0:
         LOGGER.info(
@@ -424,7 +559,11 @@ def main() -> None:
         },
         "report": result["report"],
         "transfer": {
-            "days": transfer_records,
+            # per-gang diagnostic rows live in the CSV, not here (keeps JSON small)
+            "days": [
+                {k: v for k, v in rec.items() if k != "gang_rows"}
+                for rec in transfer_records
+            ],
             "average": transfer_summary,
         },
     }
@@ -447,6 +586,16 @@ def main() -> None:
         n2s,
         normals,
     )
+
+    # --- 4. pooled missed-gang diagnostics (reuses coarsenings already computed) --
+    # Training day: the coarsening just built above (n2s).  Transfer days: the
+    # per-gang rows collected inside _evaluate_transfer_day.  No re-coarsening.
+    diag_rows = _gang_diagnostic_rows(
+        det, data, gangs, gang_sets, graph.edge_index, args.day_start, n2s
+    )
+    for rec in transfer_records:
+        diag_rows += rec.get("gang_rows", [])
+    _write_missed_gang_diagnostics(diag_rows, args.out)
 
 
 if __name__ == "__main__":

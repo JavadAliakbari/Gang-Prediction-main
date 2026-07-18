@@ -109,6 +109,14 @@ from sklearn.metrics import (
 )
 
 
+def random_structural_features(num_nodes: int, width: int, seed: int) -> torch.Tensor:
+    """Isotropic random range-finder ``Omega`` (the structural feature channel)."""
+
+    gen = torch.Generator().manual_seed(seed)
+    X = torch.randn(num_nodes, width, dtype=torch.float64, generator=gen)
+    return (X - X.mean(0, keepdim=True)) / X.std(0, keepdim=True).clamp_min(1e-8)
+
+
 # --------------------------------------------------------------------------- #
 # 1-2.  synthetic random graph with planted dense motifs
 # --------------------------------------------------------------------------- #
@@ -541,6 +549,61 @@ def _soft_lambda_max(
         tau = max(float(temperature), 1e-8)
     weights = torch.softmax((eigs - eigs[-1]) / tau, dim=0)
     return (weights * eigs).sum()
+
+
+def _soft_min_values(values: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Boltzmann soft-min over a plain vector (used on ``Gamma``'s *diagonal*).
+
+    :func:`_soft_lambda_min` soft-mins the *eigenvalues* of ``Gamma``, which couples
+    capture to cross-gang separation.  This one soft-mins whatever vector it is
+    handed -- e.g. the per-gang captures ``Gamma_jj`` -- so the objective can ask for
+    "every gang well captured" without also demanding the gangs be mutually
+    independent (see ``capture_objective="softmin_diag"``).
+    """
+
+    if temperature <= 0.0:
+        return values.min()
+    t = max(float(temperature), 1e-8)
+    weights = torch.softmax((values.min().detach() - values) / t, dim=0)
+    return (weights * values).sum()
+
+
+def _capture_objective(
+    gamma: torch.Tensor, kind: str, temperature: float
+) -> torch.Tensor:
+    """The quantity the bank ascends.
+
+    * ``lambda_min``   -- ``lambda_min(Gamma)``: capture of the hardest gang *after
+      discounting alignment with the others*.  Enforces capture **and** cross-gang
+      separation, and carries the capacity wall ``lambda_min = 0`` when ``m > d``
+      (Theorem 7.3).
+    * ``trace``        -- ``mean_j Gamma_jj``: mean per-gang capture.  Pure capture,
+      no separation term, **no capacity wall**.
+    * ``softmin_diag`` -- soft-min of ``Gamma_jj``: the *worst gang's* capture, still
+      with no cross-gang separation term.
+
+    ``trace`` / ``softmin_diag`` are motivated by the connectivity constraint: a
+    local-variation / Ward coarsener only ever merges *adjacent* nodes, so spatially
+    disjoint gangs cannot be merged into one supernode however aligned their
+    embeddings are -- Prop 8.5's "copies do not merge ... repetition is thus harmless
+    for detection".  The separation that *is* needed (from the gang's own
+    neighbourhood) is the confusability ``chi``, which is a separate term.
+    """
+
+    diag = torch.diagonal(gamma)
+    if kind == "trace":
+        return diag.mean()
+    if kind == "softmin_diag":
+        return _soft_min_values(diag, temperature)
+    if kind == "lambda_min":
+        return (
+            _soft_lambda_min(gamma, temperature)
+            if temperature > 0.0
+            else torch.linalg.eigvalsh(gamma)[0]
+        )
+    raise ValueError(
+        "capture_objective must be 'lambda_min', 'trace', or 'softmin_diag'"
+    )
 
 
 def _soft_lambda_min(
@@ -1002,6 +1065,10 @@ def fit_collective_bank(
     conf_delta: float = 0.0,
     conf_halo_hops: int = 1,
     optimizer_kind: str = "projected",
+    capture_objective: str = "lambda_min",
+    label_weight: float = 0.0,
+    label_y: "torch.Tensor | None" = None,
+    label_idx: "torch.Tensor | None" = None,
 ) -> dict:
     """Ascend ``lambda_min(Gamma(Theta))`` over the per-channel unit spheres.
 
@@ -1088,6 +1155,20 @@ def fit_collective_bank(
         gamma = m.T @ torch.cholesky_solve(m, chol)  # Vhat^T M Z (Z^T M Z)^+ Z^T M Vhat
         return 0.5 * (gamma + gamma.T), chol
 
+    # optional joint label head: restrict the propagated stack to the labelled rows
+    # once, so the per-epoch CE costs O(K n_lab d) instead of O(K N d).
+    label_active = label_weight > 0.0 and label_y is not None and label_idx is not None
+    head = None
+    if label_active:
+        prop_lab = [propagated[k][label_idx] for k in range(degree + 1)]
+        head = torch.nn.Linear(X.shape[1], 2).to(dtype=dtype, device=device)
+        head_opt = torch.optim.Adam(
+            head.parameters(), lr=learning_rate, weight_decay=5e-4
+        )
+        y_lab = label_y.to(torch.long)[label_idx]
+        counts = torch.bincount(y_lab, minlength=2).to(dtype=dtype)
+        cls_w = (counts.sum() / counts.clamp_min(1.0)) / 2.0
+
     # confusability regularizer (eq. 40): precompute the Theta-independent per-gang
     # tables once; the penalty -beta*max_j chi(S_j) is added to the margin below.
     conf_active = conf_weight > 0.0 and len(train_patterns) > 0
@@ -1168,7 +1249,7 @@ def fit_collective_bank(
     # track the best iterate by the *margin* lambda_min - beta*conf (eq. 40); when
     # beta=0 this reduces to the plain lambda_min criterion.
     best_lam, best_neg, best_conf = init_obj, init_neg, init_conf
-    best_crit = init_obj - conf_weight * init_conf
+    best_crit = -float("inf")  # first epoch always sets the baseline (any objective)
     history: list[float] = []
     neg_history: list[float] = []
     conf_history: list[float] = []
@@ -1181,12 +1262,7 @@ def fit_collective_bank(
         # lam_min = torch.linalg.eigvalsh(gamma)[0]
         # objective ascended by the optimizer: the hard lambda_min (T=0) or a
         # differentiable soft-min over the whole low end of the spectrum (T>0).
-        pos_obj = (
-            _soft_lambda_min(gamma, softmin_temperature)
-            # torch.trace(gamma) / gamma.shape[0]
-            if softmin_temperature > 0.0
-            else torch.linalg.eigvalsh(gamma)[0]
-        )
+        pos_obj = _capture_objective(gamma, capture_objective, softmin_temperature)
 
         # eq. 40 margin: subtract the worst-gang confusability penalty from the
         # capture floor, so the same step lifts lambda_min AND shrinks chi.  The
@@ -1208,8 +1284,31 @@ def fit_collective_bank(
         else:
             conf_val = 0.0
 
+        # optional supervised head on the SAME embedding, trained jointly.  Only the
+        # labelled rows of Z are needed, so this stays cheap (the propagated stack is
+        # pre-restricted to label_idx) and the Gram path stays N-independent.
+        if label_active:
+            Z_lab = _filtered_bank(prop_lab, theta)
+            ce = F.cross_entropy(head(Z_lab), y_lab, weight=cls_w)
+            pos_obj = pos_obj - label_weight * ce
+            ce_val = float(ce.detach())
+        else:
+            ce_val = 0.0
+
         if not neg_active:
-            (ascent_grad,) = torch.autograd.grad(pos_obj, param)
+            if label_active:
+                # one backward for theta AND the head: both ascend pos_obj, so the
+                # head's Adam (which minimizes) is fed the negated ascent.
+                grads = torch.autograd.grad(
+                    pos_obj, [param, *head.parameters()], allow_unused=True
+                )
+                ascent_grad = grads[0]
+                head_opt.zero_grad(set_to_none=True)
+                for p, g in zip(head.parameters(), grads[1:]):
+                    p.grad = None if g is None else -g
+                head_opt.step()
+            else:
+                (ascent_grad,) = torch.autograd.grad(pos_obj, param)
             soft_neg_val = 0.0
         else:
             # fresh negatives every epoch -> stochastic repeller (no overfitting).
@@ -1257,10 +1356,12 @@ def fit_collective_bank(
                     "gamma_diag": torch.diagonal(gamma.detach()).clamp(0, 1).tolist(),
                 }
             )
-        # snapshot by the eq.-40 margin lambda_min - beta*conf (== lambda_min when
-        # beta=0); the negatives are a stochastic regularizer resampled each step,
-        # so their per-epoch value is noisy and not used as the selection criterion.
-        crit = value - conf_weight * conf_val
+        # snapshot by the FULL objective actually being ascended (capture term -
+        # beta*conf - label_weight*CE), so the criterion matches whichever
+        # capture_objective is in use rather than always assuming lambda_min.  The
+        # negatives are a stochastic regularizer resampled each step, so their
+        # per-epoch value is noisy and stays out of the selection criterion.
+        crit = float(pos_obj.detach())
         if crit > best_crit:
             best_crit = crit
             best_lam = value
@@ -1935,12 +2036,17 @@ def fit_joint_bank_head(
     label_weight: float,
     seed: int,
     basis: str = "chebyshev",
+    capture_weight: float = 1.0,
 ) -> tuple:
     """Filter bank trained on the **two-term** objective (coarsening + labels).
 
-    ``loss = -lambda_min(Gamma(Z)) + label_weight * CE(head(Z), y)``.  The first
-    term is the *same* collective capture objective that makes ``Z`` a good RSA
-    coarsening target (so the embedding still detects gangs); the second is a label
+    ``loss = -capture_weight * lambda_min(Gamma(Z)) + label_weight * CE(head(Z), y)``.
+    ``capture_weight = 0`` drops the collective term entirely, giving a *purely
+    supervised* embedding (the ``beta -> inf`` limit) without needing a numerically
+    awkward huge ``label_weight``; ``label_weight = 0`` recovers the pure
+    detect-all bank.  The first term is the collective capture objective that makes
+    ``Z`` a good RSA coarsening target (so the embedding still detects gangs); the
+    second is a label
     regularizer that flows into **both** the head and the per-channel filter
     coefficients.  The single learned ``Z`` therefore serves coarsening *and*
     prediction.  Returns ``(theta, Z, metrics, lam_min_final)``.
@@ -1970,7 +2076,7 @@ def fit_joint_bank_head(
         gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau)
         lam_min = torch.linalg.eigvalsh(gamma)[0]
         ce = F.cross_entropy(head(Z[train_idx]), yl[train_idx], weight=w.to(dtype))
-        loss = -lam_min + label_weight * ce
+        loss = -capture_weight * lam_min + label_weight * ce
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()

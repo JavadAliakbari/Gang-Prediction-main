@@ -61,6 +61,15 @@ class DetectorConfig:
     ridge: float = 1e-4
     optimizer: str = "projected"  # "projected" | "riemannian"
     softmin_temperature: float = 0.2  # 0 = hard lambda_min
+    # what the bank ascends: "lambda_min" (capture + cross-gang separation, carries
+    # the m>d capacity wall) | "trace" (mean per-gang capture, no separation term,
+    # no capacity wall) | "softmin_diag" (worst gang's capture, no separation).
+    # trace/softmin_diag rest on the connectivity constraint: a local-variation
+    # coarsener never merges non-adjacent gangs, so cross-gang separation is free
+    # (Prop 8.5) and only neighbour separation (the confusability chi) is needed.
+    capture_objective: str = "lambda_min"
+    # optional supervised head on the same embedding, trained jointly with theta
+    label_weight: float = 0.0
 
     # --- confusability margin (eq. 40) ---------------------------------------
     conf_weight: float = 0.0  # beta; 0 = pure detect-all objective
@@ -185,8 +194,13 @@ class CollectiveBankDetector:
         )
 
     # -- steps -------------------------------------------------------------- #
-    def fit(self, data: GraphData, train_patterns: list) -> "CollectiveBankDetector":
-        """Learn the filter bank ``Theta*`` on the *training* gangs."""
+    def fit(self, data: GraphData, train_patterns: list, *, label_y=None,
+            label_idx=None) -> "CollectiveBankDetector":
+        """Learn the filter bank ``Theta*`` on the *training* gangs.
+
+        ``label_y`` / ``label_idx`` optionally attach a supervised node head
+        (config ``label_weight`` > 0) trained jointly with the filter.
+        """
 
         c = self.config
         self.fit_info_ = fit_collective_bank(
@@ -210,6 +224,10 @@ class CollectiveBankDetector:
             conf_delta=c.conf_delta,
             conf_halo_hops=c.conf_halo_hops,
             optimizer_kind=c.optimizer,
+            capture_objective=c.capture_objective,
+            label_weight=c.label_weight,
+            label_y=label_y,
+            label_idx=label_idx,
         )
         self.theta_ = self.fit_info_["theta"]
         return self
@@ -334,10 +352,16 @@ class CollectiveBankDetector:
         test_patterns: list,
         *,
         all_patterns: "list | None" = None,
+        label_y=None,
+        label_idx=None,
     ) -> dict:
-        """Full pipeline: fit -> target -> coarsen -> evaluate, returning a results dict."""
+        """Full pipeline: fit -> target -> coarsen -> evaluate, returning a results dict.
 
-        self.fit(data, train_patterns)
+        ``label_y`` / ``label_idx`` optionally attach the joint supervised node head
+        (active when ``config.label_weight > 0``) during the fit.
+        """
+
+        self.fit(data, train_patterns, label_y=label_y, label_idx=label_idx)
         basis = self.target_subspace(data, train_patterns)
         coarsening, trajectory = self.coarsen(data, basis, train_patterns)
         splits = {
