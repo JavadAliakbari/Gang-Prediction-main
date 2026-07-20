@@ -783,7 +783,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--bank-basis",
-        choices=["chebyshev", "monomial"],
+        choices=["chebyshev", "monomial", "lanczos"],
         default="chebyshev",
         help="polynomial basis of the bank: 'chebyshev' (well-conditioned Gram, "
         "eq. 30) or 'monomial' (legacy A_hat^k; same span, worse conditioning).",

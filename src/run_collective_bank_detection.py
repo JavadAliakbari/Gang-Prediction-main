@@ -460,8 +460,63 @@ def _filtered_bank(propagated: list[torch.Tensor], theta: torch.Tensor) -> torch
     return sum(propagated[k] * theta[k].unsqueeze(0) for k in range(theta.shape[0]))
 
 
+def lanczos_stack(
+    a_hat: torch.Tensor, X: torch.Tensor, degree: int, tau: float
+) -> list[torch.Tensor]:
+    """Per-channel ``M_tau``-orthonormal Krylov basis ``q_k = p_k(A_hat) x_j``.
+
+    The *instance-optimal* dictionary: ``{p_k}`` are the orthogonal polynomials of
+    the actual ``M_tau``-weighted spectral density of ``(A_hat, x_j)``, so the
+    per-channel Gram ``<q_k, q_l>_{M_tau} = delta_kl`` is the identity **by
+    construction** (contrast Chebyshev, which is orthogonal against the arcsine
+    weight, i.e. optimal only for the graph whose density happens to be arcsine).
+
+    This is a genuine polynomial basis -- not merely an orthogonalized stack --
+    because ``A_hat`` is self-adjoint in the ``M_tau`` inner product: ``M_tau =
+    (1 + tau) I - A_hat`` is itself a polynomial in ``A_hat``, so the two commute
+    and the three-term Lanczos recurrence applies.  Each ``q_k`` is therefore
+    exactly ``p_k(A_hat) x_j`` with ``deg p_k = k``, and ``span{q_0..q_K}`` is the
+    Krylov space ``span{x_j, A_hat x_j, ..., A_hat^K x_j}`` -- the *same* span as
+    the monomial and Chebyshev stacks (Lemma 6.1), so this is a drop-in third
+    basis that changes only conditioning, not the reachable filter set.
+
+    Runs the ``d`` channels simultaneously (every op is a shared sparse mat-mul
+    plus per-column elementwise work) with **full reorthogonalization** against the
+    cached ``M_tau q_i`` -- plain three-term Lanczos loses orthogonality within a
+    few steps at these degrees, which would silently destroy the identity Gram
+    that is the whole point.  A channel whose Krylov space is exhausted
+    (``beta ~ 0``, e.g. a signal lying in a small invariant subspace) yields zero
+    vectors from that order on, correctly telling the filter those orders carry no
+    energy rather than amplifying numerical noise.
+    """
+
+    eps = torch.finfo(X.dtype).eps
+    tol = eps**0.5
+
+    def _unit(v, mv):
+        """Normalize each column to unit ``M_tau`` norm; zero out dead channels."""
+        nrm = (v * mv).sum(0).clamp_min(0.0).sqrt()
+        inv = torch.where(nrm > tol, 1.0 / nrm.clamp_min(eps), torch.zeros_like(nrm))
+        return v * inv.unsqueeze(0), mv * inv.unsqueeze(0), nrm
+
+    q, mq, _ = _unit(X, _m_apply(a_hat, X, tau))
+    Q, MQ = [q], [mq]
+    beta = torch.zeros(X.shape[1], dtype=X.dtype, device=X.device)
+    for k in range(degree):
+        w = torch.sparse.mm(a_hat, Q[-1])  # A_hat q_k
+        w = w - (w * MQ[-1]).sum(0).unsqueeze(0) * Q[-1]  # - alpha_k q_k
+        if k:
+            w = w - beta.unsqueeze(0) * Q[-2]  # - beta_k q_{k-1}
+        for Qi, MQi in zip(Q, MQ):  # full reorthogonalization (cached M_tau q_i)
+            w = w - (w * MQi).sum(0).unsqueeze(0) * Qi
+        q, mq, beta = _unit(w, _m_apply(a_hat, w, tau))
+        Q.append(q)
+        MQ.append(mq)
+    return Q
+
+
 def _basis_stack(
-    a_hat: torch.Tensor, X: torch.Tensor, degree: int, basis: str
+    a_hat: torch.Tensor, X: torch.Tensor, degree: int, basis: str, tau: float = 0.0
 ) -> list[torch.Tensor]:
     """Dictionary the filter bank is built on: monomial ``A_hat^k X`` or Chebyshev.
 
@@ -471,13 +526,36 @@ def _basis_stack(
     learned filter ``theta``, the collective Gram ``Gamma``, and the whole
     detection path are identical in exact arithmetic -- only the conditioning of
     the coefficient solve differs (Prop 6.3).
+
+    ``basis="lanczos"`` (:func:`lanczos_stack`) is the third, *instance-optimal*
+    option.  Chebyshev is *minimax*-optimal, not optimal for this graph: it
+    orthogonalizes against the arcsine weight on ``[-1, 1]``, whereas the quantity
+    that actually conditions the solve is the ``M_tau``-weighted spectral density
+    of ``(A_hat, X)``.  The genuinely optimal dictionary is the sequence of
+    orthogonal polynomials w.r.t. *that* measure -- exactly what Lanczos on
+    ``(A_hat, X)`` computes -- which makes the channel Gram ``Z^T M_tau Z`` the
+    identity by construction and so dominates Chebyshev on conditioning whenever
+    the empirical density is far from arcsine (on heavy-tailed hosts the mass
+    concentrates near ``lambda ~ 1``, which is precisely that regime).  The price
+    is that the basis becomes graph-dependent:
+    the explicit witness polynomials and the sharp *universal* leakage constants
+    of Section 6.2 are stated for a fixed, graph-independent dictionary and do not
+    survive re-derivation against a per-graph measure, and the learned ``theta``
+    is no longer comparable across graphs (or across days, for the frozen-filter
+    transfer this code relies on).  So the two are a deliberate trade: Chebyshev
+    is the minimax-robust choice with transferable coefficients and universal
+    guarantees; Lanczos is the instance-optimal one with a perfectly conditioned
+    Gram but graph-specific coefficients and no universal constants.  We take the
+    robust side because the transfer experiments freeze ``theta`` across days.
     """
 
     if basis == "chebyshev":
         return chebyshev_stack(a_hat, X, degree)
     if basis == "monomial":
         return propagation_stack(a_hat, X, degree)
-    raise ValueError("basis must be 'chebyshev' or 'monomial'")
+    if basis == "lanczos":
+        return lanczos_stack(a_hat, X, degree, tau)
+    raise ValueError("basis must be 'chebyshev', 'monomial' or 'lanczos'")
 
 
 def _collective_gamma(
@@ -673,7 +751,7 @@ def build_confusability_tables(
 
     dtype, device = a_hat.dtype, a_hat.device
     # M_tau phi_k(A_hat) X for k=0..K, shared across gangs (Theta-independent).
-    propagated = _basis_stack(a_hat, X, degree, basis)
+    propagated = _basis_stack(a_hat, X, degree, basis, tau)
     m_prop = [_m_apply(a_hat, propagated[k], tau) for k in range(degree + 1)]
 
     d_total = _degrees(adjacency)  # (N,) weighted degree (no self-loops in W)
@@ -1117,7 +1195,7 @@ def fit_collective_bank(
         phi_neg = (v_neg * l_v_neg).sum(0).clamp_min(eps)
         return (l_v_neg + tau * v_neg) / (phi_neg + tau).sqrt().unsqueeze(0)
 
-    propagated = _basis_stack(a_hat, X, degree, basis)  # [phi_k(A_hat) X], k=0..K
+    propagated = _basis_stack(a_hat, X, degree, basis, tau)  # [phi_k(A_hat) X], k=0..K
     # Screened dictionary stack [M_tau phi_k(A_hat) X], precomputed ONCE (K+1 sparse
     # mat-vecs).  M_tau Z is linear in theta, so M_tau Z = _filtered_bank(m_prop,
     # theta) each epoch -- no per-epoch sparse mat-vec in the Gram/confusability.
@@ -1254,9 +1332,16 @@ def fit_collective_bank(
     neg_history: list[float] = []
     conf_history: list[float] = []
     energy_history: list[float] = []
+    # the objective actually ascended each epoch (capture term - beta*chi -
+    # label_weight*CE): its negation is the training loss, so plotting it shows
+    # what the optimizer optimized rather than a proxy.
+    margin_history: list[float] = []
+    ce_history: list[float] = []
+    capture_min_history: list[float] = []
     snapshots: list = []
     snap_interval = max(1, epochs // 20) if snapshot_interval > 0 else 0
-    for _ep in range(epochs):
+    epoch_bar = tqdm(range(epochs), desc="fitting collective bank", leave=False)
+    for _ep in epoch_bar:
         theta = theta_param if riemannian else _unit(raw)
         gamma, chol = _gamma_and_chol(theta)  # N-independent (precomputed kernel)
         # lam_min = torch.linalg.eigvalsh(gamma)[0]
@@ -1346,7 +1431,14 @@ def fit_collective_bank(
         history.append(value)
         neg_history.append(soft_neg_val)
         conf_history.append(conf_val)
-        energy_history.append(float(torch.diagonal(gamma.detach()).clamp(0, 1).mean()))
+        gamma_diag = torch.diagonal(gamma.detach()).clamp(0, 1)
+        energy_history.append(float(gamma_diag.mean()))
+        capture_min_history.append(float(gamma_diag.min()))
+        margin_history.append(float(pos_obj.detach()))
+        ce_history.append(ce_val)
+        epoch_bar.set_postfix(
+            lambda_min=f"{value:.4g}", margin=f"{float(pos_obj.detach()):.4g}"
+        )
         if snap_interval > 0 and (_ep % snap_interval == 0 or _ep == epochs - 1):
             snapshots.append(
                 {
@@ -1388,7 +1480,14 @@ def fit_collective_bank(
         "neg_history": neg_history,
         "conf_history": conf_history,
         "energy_history": energy_history,
+        "margin_history": margin_history,
+        "ce_history": ce_history,
+        "capture_min_history": capture_min_history,
         "snapshots": snapshots,
+        "n_train_patterns": len(train_patterns),
+        "capture_objective": capture_objective,
+        "conf_weight": conf_weight,
+        "label_weight": label_weight,
     }
 
 
@@ -1408,7 +1507,7 @@ def channel_gram_cond(
     solve needs no ridge and trains stably at large ``K``).
     """
 
-    propagated = _basis_stack(a_hat, X, theta.shape[0] - 1, basis)
+    propagated = _basis_stack(a_hat, X, theta.shape[0] - 1, basis, tau)
     Z = _filtered_bank(propagated, theta)
     g_z = Z.T @ _m_apply(a_hat, Z, tau)
     g_z = 0.5 * (g_z + g_z.T)
@@ -1467,7 +1566,7 @@ def build_bank_subspace(
     reconstruct them.  ``structural_width = 0`` leaves the target unchanged.
     """
 
-    propagated = _basis_stack(a_hat, X, theta.shape[0] - 1, basis)
+    propagated = _basis_stack(a_hat, X, theta.shape[0] - 1, basis, tau)
     Z = _filtered_bank(propagated, theta)  # (N, d)
 
     if coarsen_target == "bank":
@@ -1486,8 +1585,39 @@ def build_bank_subspace(
         eye = torch.eye(g_z.shape[0], dtype=g_z.dtype, device=g_z.device)
         coeffs = torch.linalg.solve(g_z + ridge * eye, rhs)  # (Z^T M Z)^+ Z^T M v_hat
         target = Z @ coeffs  # Pi^{M_tau}_{span Z} v_hat                     (N, m)
+    elif coarsen_target in ("dictionary", "bank+dictionary"):
+        # Theorem 6.2 closed form: project each v_hat_j onto the FULL dictionary
+        # col T = span{T_k(A_hat) x_a} ((K+1)d columns), not onto span(Z).  The
+        # "indicators" branch above caps every gang at the *bank's* capture
+        # (Gamma_jj of span Z); this branch attains the per-gang reachability
+        # ceiling of Theorem 6.5 -- the best capture ANY degree-K filter of these
+        # features can give that gang.  theta plays no role here beyond fixing
+        # K and the polynomial basis.
+        eps = torch.finfo(a_hat.dtype).eps
+        V = degree_weighted_indicators(adjacency, train_patterns)  # (N, m)
+        l_v = _l_apply(a_hat, V)
+        phi = (V * l_v).sum(0).clamp_min(eps)
+        m_vhat = (l_v + tau * V) / (phi + tau).sqrt().unsqueeze(0)  # (N, m)
+        B = torch.cat(propagated, dim=1)  # (N, (K+1)d)
+        m_b = _m_apply(a_hat, B, tau)
+        gram = B.T @ m_b
+        gram = 0.5 * (gram + gram.T)
+        rhs = B.T @ m_vhat  # ((K+1)d, m)
+        # rank-revealing pseudo-inverse: Krylov channels saturate, so the Gram is
+        # far from full rank and a plain ridge solve would blur the projection.
+        evals, evecs = torch.linalg.eigh(gram)
+        keep = evals > evals.max() * 1e-10
+        coeffs = evecs[:, keep] @ ((evecs[:, keep].T @ rhs) / evals[keep].unsqueeze(1))
+        target = B @ coeffs  # Pi^{M_tau}_{col T} v_hat  (N, m), per-gang optimal
+        if coarsen_target == "bank+dictionary":
+            # ceiling capture on the training gangs (dictionary columns) plus the
+            # shared bank span so *held-out* gangs keep a generalizing target.
+            target = torch.cat([Z, target], dim=1)  # (N, d + m)
     else:
-        raise ValueError("coarsen_target must be 'bank' or 'indicators'")
+        raise ValueError(
+            "coarsen_target must be 'bank', 'indicators', 'dictionary' "
+            "or 'bank+dictionary'"
+        )
 
     if structural_width and structural_width > 0:
         # Class-agnostic structural channel g_theta_bar(A_hat) Omega. The shared
@@ -1505,7 +1635,7 @@ def build_bank_subspace(
             generator=gen,
         )
         theta_bar = theta.mean(dim=1) if theta.dim() > 1 else theta  # (K+1,)
-        prop_struct = _basis_stack(a_hat, omega, theta_bar.shape[0] - 1, basis)
+        prop_struct = _basis_stack(a_hat, omega, theta_bar.shape[0] - 1, basis, tau)
         z_struct = _filtered_bank(prop_struct, theta_bar)  # (N, structural_width)
         target = torch.cat([target, z_struct], dim=1)  # (N, m + structural_width)
     return target
@@ -1528,7 +1658,7 @@ def retained_energy(
     """
 
     _, m_vhat = _make_indicators(a_hat, adjacency, patterns, tau, indicator)
-    propagated = _basis_stack(a_hat, X, theta.shape[0] - 1, basis)
+    propagated = _basis_stack(a_hat, X, theta.shape[0] - 1, basis, tau)
     Z = _filtered_bank(propagated, theta)
     gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau)
     diag = torch.diagonal(gamma).clamp(0.0, 1.0)
@@ -2056,7 +2186,7 @@ def fit_joint_bank_head(
     dtype = X.dtype
     eps = torch.finfo(dtype).eps
     m_vhat = _train_gang_m_vhat(a_hat, adjacency, train_patterns, tau)
-    propagated = _basis_stack(a_hat, X, degree, basis)  # [phi_k(A_hat) X], k=0..K
+    propagated = _basis_stack(a_hat, X, degree, basis, tau)  # [phi_k(A_hat) X], k=0..K
     d = X.shape[1]
     raw = nn.Parameter(torch.ones(degree + 1, d, dtype=dtype))
     head = nn.Linear(d, 2).to(dtype=dtype)
@@ -2184,7 +2314,7 @@ def run_classification_comparison(
     )
 
     # --- collective bank: frozen linear probe for labels; detection reused -----
-    propagated = _basis_stack(normalized, X, theta.shape[0] - 1, args.basis)
+    propagated = _basis_stack(normalized, X, theta.shape[0] - 1, args.basis, tau)
     Z_coll = _filtered_bank(propagated, theta)
     coll_cls = train_linear_head(
         Z_coll,
@@ -2695,7 +2825,7 @@ def main() -> None:
     parser.add_argument("--degree", type=int, default=15, help="polynomial degree K")
     parser.add_argument(
         "--basis",
-        choices=["chebyshev", "monomial"],
+        choices=["chebyshev", "monomial", "lanczos"],
         default="chebyshev",
         help="polynomial basis for the learnable filter bank Z = g_theta(A_hat) X: "
         "'chebyshev' (default) builds Z on the Chebyshev dictionary [T_k(A_hat) X] "

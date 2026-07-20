@@ -18,10 +18,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
+
+from plot_training import write_training_report
 
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "src")))
 sys.path.insert(0, str(Path.cwd()))
@@ -43,11 +47,40 @@ from src.run_elliptic_gang_detection import (
     split_train_test,
     random_structural_features,
 )
+
 # pure diagnostic helpers (no coarsening) reused so the missed-gang plots are
 # produced here from the coarsenings this script already computes -- no separate
 # analyze_missed_gangs run.
 from src.analyze_missed_gangs import gang_moments, gang_structure, plot_diagnostics
 from src.utils.utils import LOGGER, now
+
+
+def _relocate_logger_file(out_dir: Path) -> None:
+    """Move the LOGGER's log file into ``out_dir`` and remove the now-empty
+    ``results/<timestamp>/`` folder created for it in ``src/utils/utils.py``.
+
+    ``src/utils/utils.py`` creates a standalone results folder as a module-level
+    side effect purely to host the LOGGER's file handler. This run has its own
+    ``out_dir`` (``args.out``), so the log file belongs there instead -- this
+    relocates it and cleans up the now-empty scratch folder.
+    """
+
+    for handler in list(LOGGER.handlers):
+        if not isinstance(handler, logging.FileHandler):
+            continue
+        handler.close()
+        LOGGER.removeHandler(handler)
+        src_path = Path(handler.baseFilename)
+        if not src_path.exists():
+            continue
+        dest_path = Path(out_dir) / src_path.name
+        shutil.move(str(src_path), str(dest_path))
+        parent = src_path.parent
+        try:
+            if parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError:
+            pass
 
 
 def _gang_diagnostic_rows(det, data, gangs, gang_sets, edge_index, day, node_to_super):
@@ -70,11 +103,18 @@ def _gang_diagnostic_rows(det, data, gangs, gang_sets, edge_index, day, node_to_
     struct = gang_structure(edge_index, gang_of, len(gangs), data.num_nodes)
     return [
         {
-            "day": day, "gang": gangs[gi].id, "size": struct[gi]["size"],
-            "Phi": float(phi[gi]), "mbar1": float(mbar1[gi]), "capture": float(cap[gi]),
-            "density": struct[gi]["density"], "starness": struct[gi]["starness"],
-            "deg_ratio": struct[gi]["deg_ratio"], "recall": res[gi].recall,
-            "precision": res[gi].precision, "f1": res[gi].f1,
+            "day": day,
+            "gang": gangs[gi].id,
+            "size": struct[gi]["size"],
+            "Phi": float(phi[gi]),
+            "mbar1": float(mbar1[gi]),
+            "capture": float(cap[gi]),
+            "density": struct[gi]["density"],
+            "starness": struct[gi]["starness"],
+            "deg_ratio": struct[gi]["deg_ratio"],
+            "recall": res[gi].recall,
+            "precision": res[gi].precision,
+            "f1": res[gi].f1,
             "detected": int(res[gi].detected),
         }
         for gi in range(len(gangs))
@@ -112,7 +152,9 @@ def _write_missed_gang_diagnostics(rows: list, out: Path) -> None:
             auc = float("nan")
         summary[f] = {"detected_median": d_med, "missed_median": m_med, "auc": auc}
         LOGGER.info(f"{f:<12}{d_med:>17.4g}{m_med:>15.4g}{auc:>13.2f}")
-    LOGGER.info("\nAUC > 0.5: higher value -> more likely detected;  AUC < 0.5: -> missed.")
+    LOGGER.info(
+        "\nAUC > 0.5: higher value -> more likely detected;  AUC < 0.5: -> missed."
+    )
     (out / "missed_gang_summary.json").write_text(
         json.dumps(
             {"n_gangs": len(df), "detected": int(df.detected.sum()), "stats": summary},
@@ -121,6 +163,78 @@ def _write_missed_gang_diagnostics(rows: list, out: Path) -> None:
         + "\n"
     )
     LOGGER.info(f"missed-gang CSV + plot + summary -> {out}")
+
+
+def _run_pr_sweep(det, data, basis, gang_sets, tag, args) -> "dict | None":
+    """Full incremental Ward PR-sweep for one graph (training day-range or a transfer day).
+
+    Walks the whole Ward merge order (finest -> 2 clusters) recording every metric
+    at every level, so the epsilon budget is swept 0 -> 1 with all intermediates.
+    With ``--pr-sweep-exact-budget B > 0`` the epsilon axis is the *exact* RSA
+    constant, sampled at B adaptively-placed levels (largest-gap bisection) and
+    interpolated to every level; otherwise it is the free cumulative Ward
+    distortion.  Reuses the already-computed ``basis`` -- no extra coarsening.
+    """
+
+    from src.ward_pr_sweep import (
+        adaptive_exact_epsilon,
+        calibrate_epsilon,
+        plot_sweep,
+        summarize_sweep,
+        sweep_metrics,
+        ward_order,
+    )
+
+    if not gang_sets:
+        return None
+    lap = det.config.coarsening_laplacian
+    children, distances, a0, metric = ward_order(
+        data.adjacency, basis, det.config.tau, laplacian=lap
+    )
+    gsets_idx = [list(map(int, np.asarray(list(s)))) for s in gang_sets]
+    traj = sweep_metrics(children, distances, data.num_nodes, gsets_idx, args.threshold)
+    eps_key, checkpoints = "epsilon", None
+    if args.pr_sweep_exact_budget > 0:
+        lv, ex = adaptive_exact_epsilon(
+            children, data.num_nodes, a0, metric, budget=args.pr_sweep_exact_budget
+        )
+        calibrate_epsilon(traj, lv, ex, data.num_nodes)
+        eps_key = "epsilon_exact"
+        checkpoints = (data.num_nodes - lv, ex)
+    summ = summarize_sweep(traj, eps_budget=args.epsilon, eps_key=eps_key)
+    pd.DataFrame(traj).to_csv(args.out / f"pr_sweep_{tag}.csv", index=False)
+    auc, _ = plot_sweep(
+        traj,
+        f"elliptic++ {tag}",
+        args.out / f"pr_sweep_{tag}.png",
+        eps_budget=args.epsilon,
+        eps_key=eps_key,
+        exact_checkpoints=checkpoints,
+    )
+    b = summ["best_f1"]
+    LOGGER.info(
+        f"  PR-sweep [{tag}]: levels={len(traj)}  PR-AUC={auc:.3f}  "
+        f"best-F1 @ eps={b[eps_key]:.3f} (n_coarse={b['n_coarse']}): "
+        f"R={b['mean_recall']:.3f} P={b['mean_precision']:.3f} F1={b['mean_f1']:.3f} "
+        f"det={b['det_rate']:.1%}"
+    )
+    out = {
+        "tag": tag,
+        "levels": len(traj),
+        "pr_auc": auc,
+        "eps_key": eps_key,
+        "n_gangs": len(gsets_idx),
+        **{f"best_{k}": v for k, v in b.items()},
+    }
+    if "at_epsilon" in summ:
+        a = summ["at_epsilon"]
+        LOGGER.info(
+            f"    at budget eps<={a['epsilon_budget']:g} (eps={a[eps_key]:.3f}, "
+            f"n_coarse={a['n_coarse']}): R={a['mean_recall']:.3f} "
+            f"P={a['mean_precision']:.3f} F1={a['mean_f1']:.3f} det={a['det_rate']:.1%}"
+        )
+        out.update({f"budget_{k}": v for k, v in a.items()})
+    return out
 
 
 def _evaluate_transfer_day(
@@ -141,10 +255,20 @@ def _evaluate_transfer_day(
 
     LOGGER.info(f"\n--- transfer day {day} ---")
     A_unw, A_w, cls, nodes_df = build_graph(args.data_dir, day, day)
-    if args.feature_mode == "wallet":
+    if args.feature_mode in ("wallet", "wallet+random"):
         Xfeat = load_node_features(
             args.data_dir, nodes_df, day, day, keep_columns=feature_columns
         )
+        if args.feature_mode == "wallet+random":
+            Xfeat = torch.cat(
+                [
+                    Xfeat,
+                    random_structural_features(
+                        int(A_unw.shape[0]), args.random_width, args.seed + day
+                    ),
+                ],
+                dim=1,
+            )
     else:
         Xfeat = random_structural_features(
             int(A_unw.shape[0]), args.random_width, args.seed + day
@@ -184,9 +308,18 @@ def _evaluate_transfer_day(
     }
     # per-gang missed-gang diagnostics from THIS day's coarsening (no re-coarsening)
     record["gang_rows"] = _gang_diagnostic_rows(
-        det, data, day_gangs, gang_sets, graph.edge_index, day,
+        det,
+        data,
+        day_gangs,
+        gang_sets,
+        graph.edge_index,
+        day,
         coarsening.node_to_supernode,
     )
+    if args.pr_sweep:  # full epsilon sweep on this day, reusing the same basis
+        record["pr_sweep"] = _run_pr_sweep(
+            det, data, basis, gang_sets, f"day{day}", args
+        )
     r = record["report"]
     if r is not None:
         LOGGER.info(
@@ -201,11 +334,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     # --- dataset ---
     ap.add_argument("--data-dir", default="data/elliptic_actors", type=Path)
-    ap.add_argument("--day-start", type=int, default=24)
-    ap.add_argument("--day-end", type=int, default=24)
+    ap.add_argument("--day-start", type=int, default=26)
+    ap.add_argument("--day-end", type=int, default=26)
     ap.add_argument("--min-gang-size", type=int, default=2)
     ap.add_argument("--weighted", action="store_true", default=False)
-    ap.add_argument("--train-ratio", type=float, default=0.8)
+    ap.add_argument("--train-ratio", type=float, default=0.6)
     ap.add_argument(
         "--transfer-days",
         type=int,
@@ -217,11 +350,13 @@ def main() -> None:
     )
     ap.add_argument(
         "--feature-mode",
-        choices=["wallet", "random"],
-        default="wallet",
+        choices=["wallet", "random", "wallet+random"],
+        default="wallet+random",
         help="'wallet' uses the real z-scored wallet features as the bank input X; "
         "'random' uses an isotropic structural range-finder of --random-width columns "
-        "(more capacity when there are many training gangs).",
+        "(more capacity when there are many training gangs); 'wallet+random' "
+        "concatenates both -- the random channels raise the capture reachability "
+        "ceiling (Thm 6.5) where the wallet features cannot reach a gang's bands.",
     )
     ap.add_argument("--random-width", type=int, default=64)
     ap.add_argument(
@@ -234,13 +369,24 @@ def main() -> None:
     )
     # --- detector hyperparameters (mirror DetectorConfig) ---
     ap.add_argument("--degree", type=int, default=32, help="polynomial degree K")
-    ap.add_argument("--basis", choices=["chebyshev", "monomial"], default="chebyshev")
+    ap.add_argument(
+        "--basis",
+        choices=["chebyshev", "monomial", "lanczos"],
+        default="chebyshev",
+        help="filter dictionary: chebyshev (minimax-robust, graph-independent), "
+        "monomial (legacy, ill-conditioned), or lanczos (instance-optimal: "
+        "orthogonal polys of this graph's M_tau-weighted spectral density, "
+        "identity channel Gram, but graph-dependent so theta is not comparable "
+        "across days).",
+    )
     ap.add_argument("--tau", type=float, default=0.5, help="screening (0 = Cor 4.7)")
-    ap.add_argument("--epochs", type=int, default=500, help="training epochs")
-    ap.add_argument("--learning-rate", type=float, default=0.02)
+    ap.add_argument("--epochs", type=int, default=1500, help="training epochs")
+    ap.add_argument(
+        "--learning-rate", type=float, default=0.01, help="Adam learning rate"
+    )
     ap.add_argument("--ridge", type=float, default=1e-3)
     ap.add_argument(
-        "--optimizer", choices=["projected", "riemannian"], default="riemannian"
+        "--optimizer", choices=["projected", "riemannian"], default="projected"
     )
     ap.add_argument("--softmin-temperature", type=float, default=0.2)
     ap.add_argument(
@@ -273,7 +419,49 @@ def main() -> None:
     ap.add_argument("--conf-reduce", choices=["max", "mean"], default="mean")
     ap.add_argument("--conf-delta", type=float, default=0.0)
     ap.add_argument("--structural-width", type=int, default=0)
-    ap.add_argument("--coarsen-target", choices=["bank", "indicators"], default="bank")
+    ap.add_argument(
+        "--coarsen-target",
+        choices=[
+            "bank",
+            "indicators",
+            "dictionary",
+            "bank+dictionary",
+            "multihead",
+            "multihead-warm",
+            "attn",
+        ],
+        default="multihead-warm",
+        help="'bank' = span(Z); 'indicators' = v_hat projected onto span(Z) "
+        "(capped at the bank's capture); 'dictionary' = Theorem 6.2 closed-form "
+        "projection onto the FULL Chebyshev dictionary (per-gang capture "
+        "ceiling); 'bank+dictionary' = both concatenated (ceiling on train "
+        "gangs, bank span for held-out gangs); 'multihead' = span of --heads "
+        "filter banks trained cold by capture ascent (inductive); "
+        "'multihead-warm' = span of k-means-compressed closed-form gang filters, "
+        "zero training by default (inductive; the best transfer config); "
+        "'attn' = multihead-warm span + KQV-routed per-candidate columns "
+        "(routing frozen after training; candidate sets needed at eval).",
+    )
+    ap.add_argument(
+        "--heads",
+        type=int,
+        default=4,
+        help="number of filter heads for multihead/multihead-warm/attn targets "
+        "(fixed, independent of the number of training gangs)",
+    )
+    ap.add_argument(
+        "--head-epochs",
+        type=int,
+        default=100,
+        help="cold training epochs for --coarsen-target multihead",
+    )
+    ap.add_argument(
+        "--head-finetune",
+        type=int,
+        default=0,
+        help="gentle (lr/10) fine-tune epochs for warm heads (0 = frozen, "
+        "recommended: Adam destroys the closed-form structure at full lr)",
+    )
     # --- coarsening ---
     ap.add_argument(
         "--coarsening-method",
@@ -296,14 +484,32 @@ def main() -> None:
         choices=["symmetric", "combinatorial"],
         default="symmetric",
     )
+    ap.add_argument(
+        "--pr-sweep",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="walk the whole Ward merge order (finest -> 2 clusters) recording "
+        "recall/precision/f1/jaccard/detection + epsilon at every level: a full "
+        "epsilon sweep 0->1 with all intermediates, plus a PR curve (+AUC) and a "
+        "metrics-vs-epsilon plot per day.",
+    )
+    ap.add_argument(
+        "--pr-sweep-exact-budget",
+        type=int,
+        default=200,
+        help="if >0, use the EXACT RSA constant as the sweep's epsilon axis, "
+        "computed at this many adaptively-placed levels (endpoints anchored, then "
+        "the largest epsilon gap split each step) and interpolated to every level.",
+    )
     ap.add_argument("--reduction", type=float, default=0.3)
-    ap.add_argument("--epsilon", type=float, default=0.5)
+    ap.add_argument("--epsilon", type=float, default=1.05)
     ap.add_argument("--max-levels", type=int, default=10)
+
     ap.add_argument("--ward-stop", choices=["epsilon", "f1"], default="epsilon")
     ap.add_argument("--ward-num-cuts", type=int, default=500)
     ap.add_argument("--threshold", type=float, default=0.51)
     ap.add_argument("--max-normal-patterns", type=int, default=120)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=1)
     out_dir = f"results/elliptic_modular/{now}/"
     ap.add_argument("--out", default=out_dir, type=Path)
     args = ap.parse_args()
@@ -315,10 +521,24 @@ def main() -> None:
     LOGGER.info(f"=== Elliptic++ (modular) | days {args.day_start}-{args.day_end} ===")
     A_unw, A_w, cls, nodes_df = build_graph(args.data_dir, args.day_start, args.day_end)
     feature_columns: "list[str] | None" = None
-    if args.feature_mode == "wallet":
+    if args.feature_mode in ("wallet", "wallet+random"):
         Xfeat, feature_columns = load_node_features(
             args.data_dir, nodes_df, args.day_start, args.day_end, return_columns=True
         )
+        if args.feature_mode == "wallet+random":
+            Xfeat = torch.cat(
+                [
+                    Xfeat,
+                    random_structural_features(
+                        int(A_unw.shape[0]), args.random_width, args.seed
+                    ),
+                ],
+                dim=1,
+            )
+            LOGGER.info(
+                f"  + {args.random_width} random structural channels -> "
+                f"X: {Xfeat.shape[0]:,} x {Xfeat.shape[1]}"
+            )
     else:
         Xfeat = random_structural_features(
             int(A_unw.shape[0]), args.random_width, args.seed
@@ -377,6 +597,9 @@ def main() -> None:
         conf_delta=args.conf_delta,
         structural_width=args.structural_width,
         coarsen_target=args.coarsen_target,
+        heads=args.heads,
+        head_epochs=args.head_epochs,
+        head_finetune=args.head_finetune,
         coarsening_method=args.coarsening_method,
         coarsening_laplacian=args.coarsening_laplacian,
         reduction=args.reduction,
@@ -431,6 +654,18 @@ def main() -> None:
         LOGGER.info(
             f"    confusability chi: {fit['confusability_init']:.4g} -> {fit['confusability']:.4g}"
         )
+    # loss / capture / confusability / per-gang capture over the fit
+    fig = write_training_report(
+        fit,
+        args.out,
+        title=(
+            f"collective bank fit -- elliptic++ d{args.day_start}-{args.day_end} "
+            f"({cfg.capture_objective}, beta={cfg.conf_weight:g}, K={cfg.degree}, "
+            f"tau={cfg.tau:g}, {len(gang_train)} train gangs)"
+        ),
+    )
+    if fig is not None:
+        LOGGER.info(f"    training curves + history CSV -> {fig}")
     co = result["coarsening"]
     LOGGER.info(
         f"  coarsening ({cfg.coarsening_method}): N={co.n_original:,} -> "
@@ -457,6 +692,31 @@ def main() -> None:
             f"{r['detected']:>4}/{r['total']:<5}"
         )
 
+    # --- 3a. full epsilon sweep on the training graph (reuses the fitted filter) --
+    pr_sweep_records: list[dict] = []
+    if args.pr_sweep:
+        LOGGER.info("\n" + "=" * 74)
+        LOGGER.info(
+            "FULL WARD PR-SWEEP (finest -> 2 clusters; every metric at every level)"
+            + (
+                f"\n  epsilon axis: EXACT RSA, {args.pr_sweep_exact_budget} adaptive samples"
+                if args.pr_sweep_exact_budget > 0
+                else "\n  epsilon axis: cumulative Ward distortion (free)"
+            )
+        )
+        LOGGER.info("=" * 74)
+        train_basis = det.target_subspace(data, gangs)
+        rec = _run_pr_sweep(
+            det,
+            data,
+            train_basis,
+            gang_sets,
+            f"train_d{args.day_start}-{args.day_end}",
+            args,
+        )
+        if rec is not None:
+            pr_sweep_records.append(rec)
+
     # --- 3b. transfer: apply the frozen filter to the next N single days ----
     transfer_records: list[dict] = []
     transfer_summary: dict | None = None
@@ -467,6 +727,10 @@ def main() -> None:
         det_transfer = CollectiveBankDetector(replace(cfg, ward_stop="epsilon"))
         det_transfer.theta_ = det.theta_
         det_transfer.fit_info_ = det.fit_info_
+        # multihead/attn targets: reuse the TRAINING day's frozen heads (and
+        # routing keys) -- without this the transfer day would rebuild heads
+        # from its own gangs, which is neither inductive nor honest.
+        det_transfer.heads_state_ = det.heads_state_
 
         LOGGER.info("\n" + "=" * 74)
         LOGGER.info(
@@ -527,6 +791,10 @@ def main() -> None:
                 f"{tot_det:>4}/{tot_all:<5}"
             )
 
+        for rec in transfer_records:  # collect each day's sweep for the summary table
+            if rec.get("pr_sweep"):
+                pr_sweep_records.append(rec["pr_sweep"])
+
         # echo the training-day test-pattern performance for side-by-side reading
         test_r = result["report"].get("test")
         if test_r is not None:
@@ -538,6 +806,39 @@ def main() -> None:
                 f"detection={test_r['detection_rate']:.1%} "
                 f"({test_r['detected']}/{test_r['total']})"
             )
+
+    # --- PR-sweep summary across the training graph + every transfer day -----
+    if pr_sweep_records:
+        S = pd.DataFrame(pr_sweep_records)
+        S.to_csv(args.out / "pr_sweep_summary.csv", index=False)
+        ek = pr_sweep_records[0]["eps_key"]
+        LOGGER.info("\n" + "=" * 96)
+        LOGGER.info(
+            "PR-SWEEP SUMMARY  (best-F1 stop over the full epsilon sweep, per graph)"
+        )
+        LOGGER.info("=" * 96)
+        h = (
+            f"  {'graph':<18}{'gangs':>6}{'levels':>8}{'PR-AUC':>8}"
+            f"{'eps*':>8}{'n_coarse':>10}{'recall':>8}{'prec':>8}{'F1':>8}{'det':>8}"
+        )
+        LOGGER.info(h)
+        LOGGER.info("  " + "-" * (len(h) - 2))
+        for r in pr_sweep_records:
+            LOGGER.info(
+                f"  {r['tag']:<18}{r['n_gangs']:>6}{r['levels']:>8}{r['pr_auc']:>8.3f}"
+                f"{r[f'best_{ek}']:>8.3f}{r['best_n_coarse']:>10}"
+                f"{r['best_mean_recall']:>8.3f}{r['best_mean_precision']:>8.3f}"
+                f"{r['best_mean_f1']:>8.3f}{r['best_det_rate']:>8.1%}"
+            )
+        if len(pr_sweep_records) > 1:
+            LOGGER.info("  " + "-" * (len(h) - 2))
+            LOGGER.info(
+                f"  {'mean':<18}{'':>6}{'':>8}{S.pr_auc.mean():>8.3f}"
+                f"{S[f'best_{ek}'].mean():>8.3f}{'':>10}"
+                f"{S.best_mean_recall.mean():>8.3f}{S.best_mean_precision.mean():>8.3f}"
+                f"{S.best_mean_f1.mean():>8.3f}{S.best_det_rate.mean():>8.1%}"
+            )
+        LOGGER.info(f"\n  PR-sweep CSVs + plots -> {args.out}")
 
     out_json = args.out / f"elliptic_modular_d{args.day_start}-{args.day_end}.json"
     payload = {
@@ -566,6 +867,7 @@ def main() -> None:
             ],
             "average": transfer_summary,
         },
+        "pr_sweep": pr_sweep_records or None,
     }
     out_json.write_text(json.dumps(payload, indent=2, default=str) + "\n")
     LOGGER.info(f"\nJSON report: {out_json}")
@@ -596,6 +898,10 @@ def main() -> None:
     for rec in transfer_records:
         diag_rows += rec.get("gang_rows", [])
     _write_missed_gang_diagnostics(diag_rows, args.out)
+
+    # move the LOGGER's log file into out_dir and drop the scratch results/
+    # folder created for it at import time (src/utils/utils.py).
+    _relocate_logger_file(args.out)
 
 
 if __name__ == "__main__":

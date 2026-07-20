@@ -36,6 +36,9 @@ from src.loukas_sgc_detection import (
     loukas_coarsen_pytorch,
 )
 from src.run_collective_bank_detection import (
+    _basis_stack,
+    _m_apply,
+    _train_gang_m_vhat,
     build_bank_subspace,
     channel_gram_cond,
     fit_collective_bank,
@@ -43,6 +46,11 @@ from src.run_collective_bank_detection import (
     retained_energy,
     ward_tree_coarsen,
 )
+
+#: coarsen targets built from a frozen bank of filter HEADS (see
+#: :meth:`CollectiveBankDetector._multihead_target`) rather than the single
+#: shared filter -- all fully inductive except the routed columns of "attn".
+MULTIHEAD_TARGETS = ("multihead", "multihead-warm", "attn")
 
 
 # --------------------------------------------------------------------------- #
@@ -54,7 +62,7 @@ class DetectorConfig:
 
     # --- learnable filter bank ------------------------------------------------
     degree: int = 10  # Chebyshev/monomial degree K
-    basis: str = "chebyshev"  # "chebyshev" | "monomial"
+    basis: str = "chebyshev"  # "chebyshev" | "monomial" | "lanczos"
     tau: float = 0.3  # screened metric M_tau = L + tau I
     epochs: int = 800
     learning_rate: float = 0.02
@@ -85,9 +93,24 @@ class DetectorConfig:
     neg_size_max: int = 10
 
     # --- target subspace handed to the coarsener -----------------------------
-    coarsen_target: str = "bank"  # "bank" | "indicators"
+    # "bank"            span(Z) of the single shared filter (d cols, inductive)
+    # "indicators"      v_hat projected onto span(Z) (capped at bank capture)
+    # "dictionary"      Theorem 6.2 closed-form projection onto the FULL
+    #                   dictionary (per-gang capture ceiling; needs node sets)
+    # "bank+dictionary" both concatenated
+    # "multihead"       span of `heads` filter banks trained cold by capture
+    #                   ascent (heads*d cols, inductive)
+    # "multihead-warm"  span of k-means-compressed closed-form gang filters,
+    #                   zero training by default (heads*d cols, inductive)
+    # "attn"            multihead-warm span + KQV-routed per-candidate columns
+    #                   (routing frozen; candidate node sets needed at eval)
+    coarsen_target: str = "bank"
     structural_width: int = 0
     indicator: str = "degree_weighted"  # capture/energy indicator
+    # --- multi-head / attention head bank (multihead* / attn targets) --------
+    heads: int = 4  # number of filter heads (fixed, independent of #gangs)
+    head_epochs: int = 300  # cold training epochs for "multihead"
+    head_finetune: int = 0  # gentle (lr/10) fine-tune epochs for warm heads
 
     # --- coarsening + detection ----------------------------------------------
     coarsening_method: str = "ward-tree"
@@ -172,6 +195,10 @@ class CollectiveBankDetector:
         self.config = config or DetectorConfig()
         self.theta_: torch.Tensor | None = None
         self.fit_info_: dict | None = None
+        # frozen multi-head / attention state (multihead* / attn targets): built
+        # once from the training day's patterns, then reused verbatim -- copy it
+        # onto a transfer detector alongside ``theta_`` to keep transfer honest.
+        self.heads_state_: dict | None = None
 
     # -- internals ---------------------------------------------------------- #
     def _negative_sampler(self, data: GraphData, train_patterns: list):
@@ -232,11 +259,101 @@ class CollectiveBankDetector:
         self.theta_ = self.fit_info_["theta"]
         return self
 
+    def _multihead_target(self, data: GraphData, patterns: list) -> torch.Tensor:
+        """Multi-head / attention coarsening targets (frozen inductive heads).
+
+        On the FIRST call the heads are built from ``patterns`` (the training
+        day's train gangs) and stored in ``heads_state_``; every later call --
+        including transfer days -- reuses them frozen.
+
+        * ``multihead``       H heads trained cold by mean-capture ascent;
+                              target = concatenated span (H*d columns).
+        * ``multihead-warm``  heads = k-means centroids of the closed-form
+                              per-gang filters (Theorem 6.2); optional gentle
+                              (lr/10) fine-tune via ``head_finetune``; target =
+                              concatenated span.  Zero training by default.
+        * ``attn``            the multihead-warm span PLUS one KQV-routed column
+                              per pattern in ``patterns`` (cosine attention of
+                              the pattern's spectral descriptor against frozen
+                              cluster-mean keys).  The routed columns need the
+                              candidate node sets of the evaluation day -- the
+                              certification regime, not blind discovery.
+        """
+
+        from src.run_attention_bank import (
+            cluster_mean_keys,
+            kmeans_filters,
+            motif_descriptors,
+            routed_columns,
+        )
+        from src.run_multihead_bank import (
+            _m_apply_cached,
+            closed_form_gang_filters,
+            multihead_bank,
+            train_multihead,
+            unit_channels,
+        )
+
+        c = self.config
+        eps = torch.finfo(data.a_hat.dtype).eps
+        prop = _basis_stack(data.a_hat, data.X, c.degree, c.basis, c.tau)
+
+        if self.heads_state_ is None:  # training day: build + freeze the heads
+            m_vhat = _train_gang_m_vhat(data.a_hat, data.adjacency, patterns, c.tau)
+            if c.coarsen_target == "multihead":
+                m_prop = [_m_apply(data.a_hat, P, c.tau) for P in prop]
+                theta, _ = train_multihead(
+                    prop, m_prop, m_vhat, heads=c.heads, objective="trace",
+                    epochs=c.head_epochs, lr=c.learning_rate, ridge=c.ridge,
+                    seed=c.seed,
+                )
+                self.heads_state_ = {"theta": theta}
+            else:  # warm heads from the closed-form per-gang filters
+                _m_apply_cached.clear()
+                _m_apply_cached["tau"] = c.tau
+                W = closed_form_gang_filters(data.a_hat, prop, m_vhat)
+                labels = np.arange(W.shape[0])
+                if W.shape[0] > c.heads:
+                    W, labels = kmeans_filters(W, c.heads, c.seed)
+                if c.head_finetune > 0:
+                    m_prop = [_m_apply(data.a_hat, P, c.tau) for P in prop]
+                    W, _ = train_multihead(
+                        prop, m_prop, m_vhat, heads=W.shape[0], objective="trace",
+                        epochs=c.head_finetune, lr=c.learning_rate / 10.0,
+                        ridge=c.ridge, seed=c.seed, init=W,
+                    )
+                self.heads_state_ = {"theta": W}
+                if c.coarsen_target == "attn":
+                    desc = motif_descriptors(prop, m_vhat)
+                    self.heads_state_["keys"] = cluster_mean_keys(
+                        desc, labels, W.shape[0]
+                    )
+                    self.heads_state_["temp"] = 0.1
+
+        st = self.heads_state_
+        # span target: per-channel normalization is harmless for a span
+        target = multihead_bank(prop, unit_channels(st["theta"]))
+        if c.coarsen_target == "attn":
+            # routed column per candidate pattern (whole-head normalization --
+            # single columns are NOT invariant to per-channel rescaling)
+            m_vhat = _train_gang_m_vhat(data.a_hat, data.adjacency, patterns, c.tau)
+            desc = motif_descriptors(prop, m_vhat).flatten(1)
+            keys = st["keys"] / st["keys"].norm(dim=1, keepdim=True).clamp_min(eps)
+            alpha = torch.softmax(desc @ keys.T / st["temp"], dim=1)
+            th = st["theta"]
+            th = th / th.flatten(1).norm(dim=1).clamp_min(eps).view(-1, 1, 1)
+            theta_m = torch.einsum("mh,hkd->mkd", alpha, th)
+            z = routed_columns(torch.stack(prop, dim=0), theta_m)
+            target = torch.cat([target, z], dim=1)
+        return target
+
     def target_subspace(self, data: GraphData, train_patterns: list) -> torch.Tensor:
         """Coarsening target ``R = span(Z)`` from the learned filter (needs :meth:`fit`)."""
 
         self._require_fit()
         c = self.config
+        if c.coarsen_target in MULTIHEAD_TARGETS:
+            return self._multihead_target(data, train_patterns)
         return build_bank_subspace(
             data.a_hat,
             data.adjacency,
