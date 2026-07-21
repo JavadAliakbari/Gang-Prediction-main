@@ -25,8 +25,6 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from plot_training import write_training_report
-
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "src")))
 sys.path.insert(0, str(Path.cwd()))
 
@@ -52,6 +50,7 @@ from src.run_elliptic_gang_detection import (
 # produced here from the coarsenings this script already computes -- no separate
 # analyze_missed_gangs run.
 from src.analyze_missed_gangs import gang_moments, gang_structure, plot_diagnostics
+from src.plot_training import write_training_report
 from src.utils.utils import LOGGER, now
 
 
@@ -281,10 +280,11 @@ def _evaluate_transfer_day(
     LOGGER.info(f"  gangs (illicit CC>={args.min_gang_size}): {len(day_gangs)}")
 
     data = GraphData.from_graph(graph)
-    if data.feature_dim != int(det.theta_.shape[1]):
+    # theta is (H, K+1, d): the feature dimension is the LAST axis
+    if data.feature_dim != int(det.theta_.shape[-1]):
         raise ValueError(
             f"day {day} feature-dim {data.feature_dim} != trained filter "
-            f"feature-dim {int(det.theta_.shape[1])}; cannot apply frozen filter."
+            f"feature-dim {int(det.theta_.shape[-1])}; cannot apply frozen filter."
         )
 
     record: dict = {
@@ -380,15 +380,35 @@ def main() -> None:
         "across days).",
     )
     ap.add_argument("--tau", type=float, default=0.5, help="screening (0 = Cor 4.7)")
-    ap.add_argument("--epochs", type=int, default=1500, help="training epochs")
+    ap.add_argument("--epochs", type=int, default=2000, help="training epochs")
     ap.add_argument(
-        "--learning-rate", type=float, default=0.01, help="Adam learning rate"
+        "--learning-rate", type=float, default=0.02, help="Adam learning rate"
     )
-    ap.add_argument("--ridge", type=float, default=1e-3)
+    ap.add_argument("--ridge", type=float, default=1e-5)
     ap.add_argument(
-        "--optimizer", choices=["projected", "riemannian"], default="projected"
+        "--optimizer",
+        choices=["projected", "riemannian", "lbfgs"],
+        default="projected",
+        help="'projected'/'riemannian' = Adam (first-order); 'lbfgs' = full-batch "
+        "quasi-Newton -- the objective is deterministic and low-dimensional, so "
+        "L-BFGS reaches in tens of epochs what Adam needs thousands for "
+        "(unavailable with negative sampling, which makes the objective stochastic)",
     )
     ap.add_argument("--softmin-temperature", type=float, default=0.2)
+    ap.add_argument(
+        "--warm-start",
+        choices=["ones", "closed_form"],
+        default="ones",
+        help="'closed_form' initializes theta at the best single filter consistent "
+        "with the per-gang Theorem 6.2 optima instead of the flat low-pass",
+    )
+    ap.add_argument(
+        "--softmin-anneal",
+        type=float,
+        default=1.0,
+        help=">1 starts the soft-min temperature this many times higher and "
+        "anneals geometrically down to --softmin-temperature",
+    )
     ap.add_argument(
         "--capture-objective",
         choices=["lambda_min", "trace", "softmin_diag"],
@@ -421,46 +441,31 @@ def main() -> None:
     ap.add_argument("--structural-width", type=int, default=0)
     ap.add_argument(
         "--coarsen-target",
-        choices=[
-            "bank",
-            "indicators",
-            "dictionary",
-            "bank+dictionary",
-            "multihead",
-            "multihead-warm",
-            "attn",
-        ],
-        default="multihead-warm",
-        help="'bank' = span(Z); 'indicators' = v_hat projected onto span(Z) "
-        "(capped at the bank's capture); 'dictionary' = Theorem 6.2 closed-form "
-        "projection onto the FULL Chebyshev dictionary (per-gang capture "
-        "ceiling); 'bank+dictionary' = both concatenated (ceiling on train "
-        "gangs, bank span for held-out gangs); 'multihead' = span of --heads "
-        "filter banks trained cold by capture ascent (inductive); "
-        "'multihead-warm' = span of k-means-compressed closed-form gang filters, "
-        "zero training by default (inductive; the best transfer config); "
-        "'attn' = multihead-warm span + KQV-routed per-candidate columns "
-        "(routing frozen after training; candidate sets needed at eval).",
+        choices=["bank", "indicators", "dictionary", "bank+dictionary"],
+        default="bank",
+        help="'bank' = span(Z), the learned bank's own span (H*d columns, "
+        "inductive); 'indicators' = v_hat projected onto span(Z) (capped at the "
+        "bank's capture); 'dictionary' = Theorem 6.2 closed-form projection onto "
+        "the FULL Chebyshev dictionary (per-gang capture ceiling, needs candidate "
+        "node sets); 'bank+dictionary' = both concatenated.",
     )
     ap.add_argument(
         "--heads",
         type=int,
-        default=4,
-        help="number of filter heads for multihead/multihead-warm/attn targets "
-        "(fixed, independent of the number of training gangs)",
+        default=6,
+        help="number of filter heads H: the bank is Theta (H, K+1, d) and the "
+        "target is the concatenated span of its heads (H*d columns).  H=1 is the "
+        "single shared filter and reproduces the classic behaviour exactly; H>1 "
+        "removes the one-hop-profile-per-channel bottleneck so gangs stop "
+        "competing.  Same objective, epochs and optimizer either way.",
     )
     ap.add_argument(
-        "--head-epochs",
-        type=int,
-        default=100,
-        help="cold training epochs for --coarsen-target multihead",
-    )
-    ap.add_argument(
-        "--head-finetune",
-        type=int,
-        default=0,
-        help="gentle (lr/10) fine-tune epochs for warm heads (0 = frozen, "
-        "recommended: Adam destroys the closed-form structure at full lr)",
+        "--head-diversity",
+        type=float,
+        default=0.0,
+        help="weight of the head-decorrelation penalty (mean squared cosine "
+        "between distinct heads' per-channel filters).  0 relies on random-init "
+        "symmetry breaking alone; >0 guarantees the heads stay distinct.",
     )
     # --- coarsening ---
     ap.add_argument(
@@ -502,7 +507,7 @@ def main() -> None:
         "the largest epsilon gap split each step) and interpolated to every level.",
     )
     ap.add_argument("--reduction", type=float, default=0.3)
-    ap.add_argument("--epsilon", type=float, default=1.05)
+    ap.add_argument("--epsilon", type=float, default=0.95)
     ap.add_argument("--max-levels", type=int, default=10)
 
     ap.add_argument("--ward-stop", choices=["epsilon", "f1"], default="epsilon")
@@ -590,6 +595,8 @@ def main() -> None:
         ridge=args.ridge,
         optimizer=args.optimizer,
         softmin_temperature=args.softmin_temperature,
+        warm_start=args.warm_start,
+        softmin_anneal=args.softmin_anneal,
         capture_objective=args.capture_objective,
         label_weight=args.label_weight,
         conf_weight=args.conf_weight,
@@ -598,8 +605,7 @@ def main() -> None:
         structural_width=args.structural_width,
         coarsen_target=args.coarsen_target,
         heads=args.heads,
-        head_epochs=args.head_epochs,
-        head_finetune=args.head_finetune,
+        head_diversity=args.head_diversity,
         coarsening_method=args.coarsening_method,
         coarsening_laplacian=args.coarsening_laplacian,
         reduction=args.reduction,
@@ -727,10 +733,6 @@ def main() -> None:
         det_transfer = CollectiveBankDetector(replace(cfg, ward_stop="epsilon"))
         det_transfer.theta_ = det.theta_
         det_transfer.fit_info_ = det.fit_info_
-        # multihead/attn targets: reuse the TRAINING day's frozen heads (and
-        # routing keys) -- without this the transfer day would rebuild heads
-        # from its own gangs, which is neither inductive nor honest.
-        det_transfer.heads_state_ = det.heads_state_
 
         LOGGER.info("\n" + "=" * 74)
         LOGGER.info(

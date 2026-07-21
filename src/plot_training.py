@@ -43,6 +43,7 @@ def history_frame(fit: dict) -> pd.DataFrame:
         "objective": fit.get("margin_history") or [],
         "label_ce": fit.get("ce_history") or [],
         "neg_energy": fit.get("neg_history") or [],
+        "head_similarity": fit.get("head_sim_history") or [],
     }
     n = max((len(v) for v in cols.values()), default=0)
     if n == 0:
@@ -81,7 +82,8 @@ def plot_training_curves(
         return df
     pg = _per_gang_frame(fit)
     has_conf = "confusability" in df
-    panels = 2 + int(has_conf) + int(pg is not None)
+    has_heads = "head_similarity" in df
+    panels = 2 + int(has_conf) + int(has_heads) + int(pg is not None)
     fig, axes = plt.subplots(1, panels, figsize=(5.0 * panels, 4.0))
     axes = np.atleast_1d(axes)
     ax = iter(axes)
@@ -124,7 +126,18 @@ def plot_training_curves(
         a.set_ylabel("$\\chi$")
         a.legend(fontsize=7, frameon=False)
 
-    # 4. per-gang capture trajectories
+    # 4. head similarity: is the multi-head bank collapsing to one filter?
+    if has_heads:
+        a = next(ax)
+        a.plot(df.epoch, df.head_similarity, color="#B8860B", lw=1.6)
+        a.axhline(1.0, color="#AF5138", lw=1.0, ls=":", label="collapsed (identical)")
+        a.set_ylim(0, 1.05)
+        a.set_title(f"head similarity ({fit.get('heads', '?')} heads)")
+        a.set_xlabel("epoch")
+        a.set_ylabel("RMS cosine between heads")
+        a.legend(fontsize=7, frameon=False)
+
+    # 5. per-gang capture trajectories
     if pg is not None:
         a = next(ax)
         gcols = [c for c in pg.columns if c.startswith("gang_")]

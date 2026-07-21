@@ -450,14 +450,40 @@ def _m_apply(a_hat: torch.Tensor, signals: torch.Tensor, tau: float) -> torch.Te
     return out + tau * signals if tau else out
 
 
-def _filtered_bank(propagated: list[torch.Tensor], theta: torch.Tensor) -> torch.Tensor:
-    """Per-channel filter bank ``Z[:, a] = sum_k theta[k, a] (A_hat^k X)[:, a]``.
+def as_multihead(theta: torch.Tensor) -> torch.Tensor:
+    """Canonical filter shape ``(H, K+1, d)``; a legacy ``(K+1, d)`` becomes ``H=1``."""
 
-    ``propagated[k]`` is ``A_hat^k X`` of shape ``(N, d)`` and ``theta`` is
-    ``(K+1, d)``; each hop scales every channel by its own coefficient.
+    return theta.unsqueeze(0) if theta.dim() == 2 else theta
+
+
+def theta_degree(theta: torch.Tensor) -> int:
+    """Polynomial degree ``K`` of a filter in either layout."""
+
+    return as_multihead(theta).shape[1] - 1
+
+
+def _filtered_bank(propagated: list[torch.Tensor], theta: torch.Tensor) -> torch.Tensor:
+    """Filter bank of ``H`` heads: ``Z = [Z^(1) | ... | Z^(H)]``, shape ``(N, H*d)``.
+
+    Head ``h`` contributes ``Z^(h)[:, a] = sum_k theta[h, k, a] (phi_k(A_hat) X)[:, a]``
+    -- one hop-profile per (head, feature channel).  ``H = 1`` (or a legacy
+    ``(K+1, d)`` filter) reproduces the single shared bank exactly, so every
+    downstream consumer is unchanged in that case.
+
+    Multiple heads matter because the coarsening target is the *span* of these
+    columns: with one head all gangs must share one hop-profile per channel and
+    compete; with ``H`` heads each gang can align with whichever head suits its
+    motif, and the projection picks the combination per gang for free.  Duplicate
+    heads add no new directions to the span, so the objective has no incentive to
+    keep them equal -- see ``head_diversity`` in :func:`fit_collective_bank`.
     """
 
-    return sum(propagated[k] * theta[k].unsqueeze(0) for k in range(theta.shape[0]))
+    th = as_multihead(theta)
+    heads = [
+        sum(propagated[k] * th[h, k].unsqueeze(0) for k in range(th.shape[1]))
+        for h in range(th.shape[0])
+    ]
+    return heads[0] if len(heads) == 1 else torch.cat(heads, dim=1)
 
 
 def lanczos_stack(
@@ -979,7 +1005,8 @@ def _gang_confusability_leaky(
         # no halo to leak into -> falls back to the hard internal-support problem
         # (handled by the delta=0 path); return 0 rather than a degenerate solve.
         return chol.new_zeros(())
-    Y_H = torch.einsum("kia,ka->ia", Y, theta)  # (h, d)  M_tau Z restricted to H
+    # (h, H*d): M_tau Z restricted to the halo, all heads concatenated
+    Y_H = torch.einsum("kia,hka->iha", Y, as_multihead(theta)).reshape(Y.shape[1], -1)
     g_inv = torch.cholesky_solve(Y_H.T, chol)  # G_Z^+ Y_H^T   (d, h)
     a_h = Y_H @ g_inv  # w^T (Y_H G_Z^+ Y_H^T) w              (h, h)
     a_h = 0.5 * (a_h + a_h.T)
@@ -1019,7 +1046,10 @@ def _gang_confusability(
     s = q.shape[0]
     if s < 2:
         return chol.new_zeros(())
-    M = torch.einsum("ka,kia->ai", theta, Y)  # (d, s)
+    th = as_multihead(theta)
+    # (H, K+1, d) x (K+1, s, d) -> (H*d, s): head h's channel a row is
+    # sum_k theta[h,k,a] Y[k,:,a], i.e. the bank column (h,a) tested against z
+    M = torch.einsum("hka,kia->hai", th, Y).reshape(-1, Y.shape[1])
     g_inv_m = torch.cholesky_solve(M, chol)  # G_Z^+ M   (d, s)
     a_num = M.T @ g_inv_m  # z^T (M^T G_Z^+ M) z            (s, s)
     a_num = 0.5 * (a_num + a_num.T)
@@ -1092,17 +1122,20 @@ class _RiemannianAdam:
     returns the updated on-manifold ``theta``.
     """
 
-    def __init__(self, shape, lr, *, betas=(0.9, 0.999), eps=1e-8, dtype, device):
+    def __init__(self, shape, lr, *, betas=(0.9, 0.999), eps=1e-8, dtype, device,
+                 sphere_dim: int = 0):
         self.lr = float(lr)
         self.b1, self.b2 = betas
         self.eps = eps
         self.t = 0
+        # axis along which each unit sphere lives: the hop axis, i.e. 0 for a
+        # legacy (K+1, d) filter and 1 for the multi-head (H, K+1, d) layout
+        self.sd = int(sphere_dim)
         self.m = torch.zeros(shape, dtype=dtype, device=device)
         self.v = torch.zeros(shape, dtype=dtype, device=device)
 
-    @staticmethod
-    def _tangent(theta, g):  # remove the radial (per-column) component
-        return g - (g * theta).sum(0, keepdim=True) * theta
+    def _tangent(self, theta, g):  # remove the radial (per-sphere) component
+        return g - (g * theta).sum(self.sd, keepdim=True) * theta
 
     def step(self, theta, egrad):
         self.t += 1
@@ -1113,7 +1146,7 @@ class _RiemannianAdam:
         v_hat = self.v / (1 - self.b2**self.t)
         direction = self._tangent(theta, m_hat / (v_hat.sqrt() + self.eps))
         new = theta - self.lr * direction  # descend the loss
-        new = new / new.norm(dim=0, keepdim=True).clamp_min(1e-12)  # retraction
+        new = new / new.norm(dim=self.sd, keepdim=True).clamp_min(1e-12)  # retraction
         self.m = self._tangent(new, self.m)  # transport moment to the new point
         return new.detach()
 
@@ -1147,6 +1180,10 @@ def fit_collective_bank(
     label_weight: float = 0.0,
     label_y: "torch.Tensor | None" = None,
     label_idx: "torch.Tensor | None" = None,
+    warm_start: str = "ones",
+    softmin_anneal: float = 1.0,
+    heads: int = 1,
+    head_diversity: float = 0.0,
 ) -> dict:
     """Ascend ``lambda_min(Gamma(Theta))`` over the per-channel unit spheres.
 
@@ -1155,6 +1192,23 @@ def fit_collective_bank(
     normalizes in the forward pass (weight-norm style); ``"riemannian"`` optimizes
     ``theta`` directly on the product of per-channel spheres with
     :class:`_RiemannianAdam`, keeping the norm exact and the step geometry-aware.
+    ``"lbfgs"`` runs full-batch L-BFGS on the normalized parameterization: with the
+    N-independent kernel the objective is deterministic and low-dimensional
+    (``(K+1)d`` unknowns), i.e. exactly the regime where a quasi-Newton method
+    beats a diagonally-preconditioned first-order one -- Adam's per-coordinate
+    scaling carries no curvature information about the Gram's ill-conditioning,
+    which is what makes ``lambda_min`` ascent crawl.  (L-BFGS needs a
+    deterministic objective, so it falls back to Adam when negatives resample.)
+
+    ``warm_start="closed_form"`` initializes ``theta`` at the best single filter
+    consistent with the per-gang Theorem 6.2 optima: for each channel the top
+    left-singular vector of that channel's closed-form coefficient vectors across
+    the training gangs.  This starts the ascent inside the reachable set instead
+    of at the flat all-ones low-pass, and typically buys more than any optimizer
+    change.  ``softmin_anneal > 1`` starts at ``softmin_temperature *
+    softmin_anneal`` and geometrically anneals to the requested value: a warmer
+    soft-min spreads gradient over the whole low end of the spectrum, so early
+    steps move all the weakly-captured gangs instead of only the argmin one.
 
     With ``conf_weight`` (``beta``) ``> 0`` the objective becomes the collective
     *margin* of eq. 40, ``lambda_min(Gamma) - beta * max_j chi^tau_{R_Theta}(S_j)``:
@@ -1162,15 +1216,34 @@ def fit_collective_bank(
     the worst gang's retained internal-fluctuation energy so no gang's *parts*
     survive as a separate supernode (the necessity branch of Theorem 4.10).
 
-    Returns the learned ``theta`` (``(K+1, d)``, unit columns) plus the initial
-    and final objective and the optimization history.
+    ``heads = H > 1`` learns ``H`` independent filter banks at once; the target is
+    their concatenated span ``Z = [Z^(1) | ... | Z^(H)]`` (``H*d`` columns), so a
+    gang no longer has to share one hop-profile per channel with every other gang
+    -- the ``M_tau``-projection inside ``Gamma`` picks each gang's best combination
+    of heads for free.  **Everything else is unchanged**: same objective
+    (``capture_objective``, including ``lambda_min``), same confusability penalty,
+    same optimizer, same epochs.  ``heads = 1`` reproduces the single shared bank
+    bit-for-bit, so it is a strict generalization rather than a separate path.
+
+    Nothing in the objective forces two heads apart, but nothing rewards keeping
+    them together either: capture depends only on ``span(Z)``, and duplicate heads
+    contribute duplicate columns, i.e. no new directions -- so the all-heads-equal
+    configuration is a *critical point* that wastes ``(H-1) d`` of the capacity.
+    Escaping it needs symmetry breaking (the random init below) and, optionally,
+    an explicit push: ``head_diversity > 0`` adds
+    ``-head_diversity * mean_{h<h'} <theta_h, theta_h'>^2`` (mean squared cosine
+    between heads' per-channel filters) to the ascended objective.
+
+    Returns the learned ``theta`` (``(H, K+1, d)``, unit per-(head, channel)
+    columns) plus the initial and final objective and the optimization history.
     """
 
-    if len(train_patterns) > X.shape[1]:
+    heads = max(1, int(heads))
+    if len(train_patterns) > X.shape[1] * heads:
         LOGGER.warning(
-            f"  capacity: m_train={len(train_patterns)} > d={X.shape[1]}; "
+            f"  capacity: m_train={len(train_patterns)} > H*d={X.shape[1] * heads}; "
             "lambda_min(Gamma) is 0 by Theorem (Capacity threshold) -- raise "
-            "--feature-dim or lower --num-motifs / --train-ratio."
+            "--feature-dim / --heads or lower --num-motifs / --train-ratio."
         )
 
     dtype, device = a_hat.dtype, a_hat.device
@@ -1222,16 +1295,41 @@ def fit_collective_bank(
     )  # P: (K+1, K+1, d, d)
     rhs_kernel = (_pr.T @ m_vhat).reshape(degree + 1, d_feat, -1)  # Q: (K+1, d, m)
     del _pr, _mp
-    ridge_eye = ridge * torch.eye(d_feat, dtype=dtype, device=device)
+    n_col = d_feat * heads  # target width: one block of d columns per head
+    ridge_eye = ridge * torch.eye(n_col, dtype=dtype, device=device)
 
     def _gamma_and_chol(theta: torch.Tensor):
-        """``(Gamma, chol)`` from the precomputed kernel -- no O(N) work."""
-        g_z = torch.einsum("ka,lb,klab->ab", theta, theta, gram_kernel)
+        """``(Gamma, chol)`` from the precomputed kernel -- no O(N) work.
+
+        With ``H`` heads the channel Gram gains cross-head blocks:
+        ``g_z[(h,a), (g,b)] = sum_{k,l} theta[h,k,a] theta[g,l,b] P[k,l,a,b]``.
+        For ``H = 1`` this is exactly the single-head contraction.
+        """
+        th = as_multihead(theta)
+        g_z = torch.einsum("hka,glb,klab->hagb", th, th, gram_kernel).reshape(
+            n_col, n_col
+        )
         g_z = 0.5 * (g_z + g_z.T)
-        m = torch.einsum("ka,kaj->aj", theta, rhs_kernel)  # (d, m)
+        m = torch.einsum("hka,kaj->haj", th, rhs_kernel).reshape(n_col, -1)  # (H*d, m)
         chol = torch.linalg.cholesky(g_z + ridge_eye)
         gamma = m.T @ torch.cholesky_solve(m, chol)  # Vhat^T M Z (Z^T M Z)^+ Z^T M Vhat
         return 0.5 * (gamma + gamma.T), chol
+
+    def _diversity(theta: torch.Tensor) -> torch.Tensor:
+        """Mean squared cosine between distinct heads' per-channel filters.
+
+        Zero when every pair of heads is per-channel orthogonal, one when the
+        heads are identical -- subtracting it from the ascended objective pushes
+        the bank off the degenerate all-heads-equal critical point.
+        """
+        th = as_multihead(theta)
+        if th.shape[0] < 2:
+            return theta.new_zeros(())
+        # theta is already unit-norm per (head, channel), so the inner product
+        # over the hop axis is the cosine
+        cos = torch.einsum("hka,gka->hga", th, th)  # (H, H, d)
+        off = ~torch.eye(th.shape[0], dtype=torch.bool, device=th.device)
+        return (cos[off] ** 2).mean()
 
     # optional joint label head: restrict the propagated stack to the labelled rows
     # once, so the per-epoch CE costs O(K n_lab d) instead of O(K N d).
@@ -1267,14 +1365,46 @@ def fit_collective_bank(
     )
 
     torch.manual_seed(fit_seed)
-    raw = torch.nn.Parameter(
-        torch.ones(degree + 1, X.shape[1], dtype=dtype, device=device)
-    )
+    if warm_start == "closed_form" and len(train_patterns) > 0:
+        # per-gang Theorem 6.2 coefficients W_j = (T^T M T)^+ T^T M vhat_j, then
+        # the best SINGLE filter per channel: the top left-singular vector of that
+        # channel's {W_j[:, a]}_j (maximizes the summed squared alignment).
+        with torch.no_grad():
+            gram_full = torch.einsum("klab->kalb", gram_kernel).reshape(
+                (degree + 1) * d_feat, (degree + 1) * d_feat
+            )
+            rhs_full = rhs_kernel.reshape((degree + 1) * d_feat, -1)
+            evals_g, evecs_g = torch.linalg.eigh(0.5 * (gram_full + gram_full.T))
+            keep_g = evals_g > evals_g.max() * 1e-10
+            coeff = evecs_g[:, keep_g] @ (
+                (evecs_g[:, keep_g].T @ rhs_full) / evals_g[keep_g].unsqueeze(1)
+            )  # ((K+1)d, m)
+            W = coeff.reshape(degree + 1, d_feat, -1)  # (K+1, d, m)
+            # head h takes the h-th singular direction of each channel's closed-form
+            # coefficients: the heads start on an orthogonal frame by construction
+            init = torch.stack([
+                torch.stack([
+                    torch.linalg.svd(W[:, a, :], full_matrices=True)[0][:, min(h, degree)]
+                    for a in range(d_feat)
+                ], dim=1)
+                for h in range(heads)
+            ], dim=0)  # (H, K+1, d)
+            del gram_full, rhs_full, evals_g, evecs_g, coeff, W
+        raw = torch.nn.Parameter(init.contiguous())
+    else:
+        raw = torch.ones(heads, degree + 1, d_feat, dtype=dtype, device=device)
+        if heads > 1:
+            # all-heads-equal is a critical point of a span objective (duplicate
+            # heads add no directions), so break the symmetry at init
+            raw = raw + 0.5 * torch.randn(
+                heads, degree + 1, d_feat, dtype=dtype, device=device
+            )
+        raw = torch.nn.Parameter(raw)
 
     def _unit(theta_raw: torch.Tensor) -> torch.Tensor:
-        return theta_raw / theta_raw.norm(dim=0, keepdim=True).clamp_min(
-            torch.finfo(dtype).eps
-        )
+        """Unit norm per (head, feature channel) -- the hop axis is axis 1."""
+        th = as_multihead(theta_raw)
+        return th / th.norm(dim=1, keepdim=True).clamp_min(torch.finfo(dtype).eps)
 
     def _neg_softmax(embedding: torch.Tensor, l_vhat_neg, m_z=None) -> torch.Tensor:
         if l_vhat_neg is None:
@@ -1311,13 +1441,32 @@ def fit_collective_bank(
             else 0.0
         )
 
+    use_lbfgs = optimizer_kind == "lbfgs"
+    if use_lbfgs and neg_active:
+        LOGGER.warning(
+            "  optimizer=lbfgs needs a deterministic objective but negatives "
+            "resample every step -- falling back to projected Adam."
+        )
+        use_lbfgs, optimizer_kind = False, "projected"
     riemannian = optimizer_kind == "riemannian"
     if riemannian:
         theta_param = torch.nn.Parameter(_unit(raw).detach().clone())  # unit columns
         r_opt = _RiemannianAdam(
-            theta_param.shape, learning_rate, dtype=dtype, device=device
+            theta_param.shape, learning_rate, dtype=dtype, device=device,
+            sphere_dim=1,  # (H, K+1, d): each sphere lives on the hop axis
         )
         optimizer = None
+    elif use_lbfgs:
+        theta_param = None
+        optimizer = torch.optim.LBFGS(
+            (raw,),
+            lr=learning_rate if learning_rate > 0.1 else 1.0,
+            max_iter=20,
+            history_size=25,
+            line_search_fn="strong_wolfe",
+            tolerance_grad=1e-12,
+            tolerance_change=1e-14,
+        )
     else:
         theta_param = None
         optimizer = torch.optim.Adam((raw,), lr=learning_rate)
@@ -1338,16 +1487,53 @@ def fit_collective_bank(
     margin_history: list[float] = []
     ce_history: list[float] = []
     capture_min_history: list[float] = []
+    # RMS cosine between distinct heads: 1 = collapsed to one filter, 0 = orthogonal
+    head_sim_history: list[float] = []
     snapshots: list = []
     snap_interval = max(1, epochs // 20) if snapshot_interval > 0 else 0
     epoch_bar = tqdm(range(epochs), desc="fitting collective bank", leave=False)
+
+    def _capture_term(theta: torch.Tensor, temperature: float):
+        """``(pos_obj, gamma, chol)`` -- capture objective before the penalties."""
+
+        gamma_, chol_ = _gamma_and_chol(theta)  # N-independent (precomputed kernel)
+        # the hard lambda_min (T=0) or a differentiable soft-min over the whole
+        # low end of the spectrum (T>0)
+        obj = _capture_objective(gamma_, capture_objective, temperature)
+        if head_diversity > 0.0:
+            obj = obj - head_diversity * _diversity(theta)
+        return obj, gamma_, chol_
+
     for _ep in epoch_bar:
+        # geometric anneal of the soft-min temperature: warm early (gradient
+        # spread over the whole low end of the spectrum) -> sharp late.
+        temp_ep = softmin_temperature
+        if softmin_anneal > 1.0 and epochs > 1:
+            temp_ep = softmin_temperature * softmin_anneal ** (1.0 - _ep / (epochs - 1))
+
+        if use_lbfgs:
+            # L-BFGS runs its own inner iterations via the closure (each "epoch"
+            # is up to `max_iter` quasi-Newton steps with a strong-Wolfe line
+            # search); the bookkeeping below then records the accepted iterate.
+            def _closure():
+                optimizer.zero_grad(set_to_none=True)
+                obj_c, _, chol_c = _capture_term(_unit(raw), temp_ep)
+                if conf_active:
+                    obj_c = obj_c - conf_weight * collective_confusability(
+                        _unit(raw), None, a_hat, tau, ridge, conf_tables, eps,
+                        reduce=conf_reduce, chol=chol_c,
+                    )
+                if label_active:
+                    obj_c = obj_c - label_weight * F.cross_entropy(
+                        head(_filtered_bank(prop_lab, _unit(raw))), y_lab, weight=cls_w
+                    )
+                (-obj_c).backward()
+                return -obj_c
+
+            optimizer.step(_closure)
+
         theta = theta_param if riemannian else _unit(raw)
-        gamma, chol = _gamma_and_chol(theta)  # N-independent (precomputed kernel)
-        # lam_min = torch.linalg.eigvalsh(gamma)[0]
-        # objective ascended by the optimizer: the hard lambda_min (T=0) or a
-        # differentiable soft-min over the whole low end of the spectrum (T>0).
-        pos_obj = _capture_objective(gamma, capture_objective, softmin_temperature)
+        pos_obj, gamma, chol = _capture_term(theta, temp_ep)
 
         # eq. 40 margin: subtract the worst-gang confusability penalty from the
         # capture floor, so the same step lifts lambda_min AND shrinks chi.  The
@@ -1380,7 +1566,10 @@ def fit_collective_bank(
         else:
             ce_val = 0.0
 
-        if not neg_active:
+        if use_lbfgs:
+            # the closure already took the step (and the head's, if any)
+            ascent_grad, soft_neg_val = None, 0.0
+        elif not neg_active:
             if label_active:
                 # one backward for theta AND the head: both ascend pos_obj, so the
                 # head's Adam (which minimizes) is fed the negated ascent.
@@ -1418,8 +1607,10 @@ def fit_collective_bank(
             soft_neg_val = float(soft_neg.detach())
 
         # apply the ascent: Adam minimizes, so both optimizers get the negated
-        # ascent as the loss gradient.
-        if riemannian:
+        # ascent as the loss gradient.  (L-BFGS already stepped in its closure.)
+        if use_lbfgs:
+            pass
+        elif riemannian:
             with torch.no_grad():
                 theta_param.copy_(r_opt.step(theta_param.detach(), -ascent_grad))
         else:
@@ -1436,6 +1627,9 @@ def fit_collective_bank(
         capture_min_history.append(float(gamma_diag.min()))
         margin_history.append(float(pos_obj.detach()))
         ce_history.append(ce_val)
+        if heads > 1:
+            with torch.no_grad():
+                head_sim_history.append(float(_diversity(theta).sqrt()))
         epoch_bar.set_postfix(
             lambda_min=f"{value:.4g}", margin=f"{float(pos_obj.detach()):.4g}"
         )
@@ -1483,6 +1677,9 @@ def fit_collective_bank(
         "margin_history": margin_history,
         "ce_history": ce_history,
         "capture_min_history": capture_min_history,
+        "head_sim_history": head_sim_history,
+        "heads": heads,
+        "head_similarity": head_sim_history[-1] if head_sim_history else 0.0,
         "snapshots": snapshots,
         "n_train_patterns": len(train_patterns),
         "capture_objective": capture_objective,
@@ -1507,7 +1704,7 @@ def channel_gram_cond(
     solve needs no ridge and trains stably at large ``K``).
     """
 
-    propagated = _basis_stack(a_hat, X, theta.shape[0] - 1, basis, tau)
+    propagated = _basis_stack(a_hat, X, theta_degree(theta), basis, tau)
     Z = _filtered_bank(propagated, theta)
     g_z = Z.T @ _m_apply(a_hat, Z, tau)
     g_z = 0.5 * (g_z + g_z.T)
@@ -1566,7 +1763,7 @@ def build_bank_subspace(
     reconstruct them.  ``structural_width = 0`` leaves the target unchanged.
     """
 
-    propagated = _basis_stack(a_hat, X, theta.shape[0] - 1, basis, tau)
+    propagated = _basis_stack(a_hat, X, theta_degree(theta), basis, tau)
     Z = _filtered_bank(propagated, theta)  # (N, d)
 
     if coarsen_target == "bank":
@@ -1634,7 +1831,7 @@ def build_bank_subspace(
             device=a_hat.device,
             generator=gen,
         )
-        theta_bar = theta.mean(dim=1) if theta.dim() > 1 else theta  # (K+1,)
+        theta_bar = as_multihead(theta).mean(dim=(0, 2))  # (K+1,) mean over heads+channels
         prop_struct = _basis_stack(a_hat, omega, theta_bar.shape[0] - 1, basis, tau)
         z_struct = _filtered_bank(prop_struct, theta_bar)  # (N, structural_width)
         target = torch.cat([target, z_struct], dim=1)  # (N, m + structural_width)
@@ -1658,7 +1855,7 @@ def retained_energy(
     """
 
     _, m_vhat = _make_indicators(a_hat, adjacency, patterns, tau, indicator)
-    propagated = _basis_stack(a_hat, X, theta.shape[0] - 1, basis, tau)
+    propagated = _basis_stack(a_hat, X, theta_degree(theta), basis, tau)
     Z = _filtered_bank(propagated, theta)
     gamma = _collective_gamma(a_hat, Z, m_vhat, ridge, tau)
     diag = torch.diagonal(gamma).clamp(0.0, 1.0)
@@ -2314,7 +2511,7 @@ def run_classification_comparison(
     )
 
     # --- collective bank: frozen linear probe for labels; detection reused -----
-    propagated = _basis_stack(normalized, X, theta.shape[0] - 1, args.basis, tau)
+    propagated = _basis_stack(normalized, X, theta_degree(theta), args.basis, tau)
     Z_coll = _filtered_bank(propagated, theta)
     coll_cls = train_linear_head(
         Z_coll,
