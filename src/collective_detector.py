@@ -76,6 +76,25 @@ class DetectorConfig:
     # coarsener never merges non-adjacent gangs, so cross-gang separation is free
     # (Prop 8.5) and only neighbour separation (the confusability chi) is needed.
     capture_objective: str = "lambda_min"
+    # how the collective target is obtained:
+    #   "gradient"    -- ascend capture_objective (soft-min lambda_min etc.) by
+    #                    Adam/L-BFGS on the filter bank  (the classic path)
+    #   "closed-form" -- Theta_beta = (G + beta*W_all)^{-1} Bhat: one shared
+    #                    factorization + m linear solves, no eigen-ascent.  At
+    #                    beta=0 this is the EXACT maximizer of lambda_min(Gamma)
+    #                    over every target in the dictionary (Theorem A), and for
+    #                    beta>0 it comes with the certified sandwich
+    #                    N_beta <= Gamma <= N_0 plus chi <= (r_j-1)/beta.
+    #   "trace-ratio"  -- Dinkelbach/trace-ratio iteration on the SAME bank
+    #                     class: each step is d small (K+1)x(K+1) eigenproblems,
+    #                     heads come out orthogonal per channel by construction.
+    #                     Tens of eigensolves instead of hundreds of epochs.
+    collective_solver: str = "gradient"
+    pencil_beta: float = 0.0  # beta of the closed-form solver
+    trace_ratio_iters: int = 40  # iterations of the trace-ratio solver
+    # multi-graph training: "sample" (one graph per epoch, stochastic), "mean"
+    # (average over all graphs, deterministic) or "min" (worst graph, maximin)
+    day_aggregate: str = "sample"
     # number of filter heads H: the bank is Theta (H, K+1, d) and the target is
     # the concatenated span of the H heads (H*d columns).  heads=1 is the single
     # shared filter (identical to the pre-multi-head behaviour); H>1 lets gangs
@@ -194,6 +213,9 @@ class CollectiveBankDetector:
         self.config = config or DetectorConfig()
         self.theta_: torch.Tensor | None = None
         self.fit_info_: dict | None = None
+        # closed-form solver: dictionary coefficients (P, m), frozen and reused
+        # on transfer days exactly like ``theta_``
+        self.pencil_theta_: torch.Tensor | None = None
 
     # -- internals ---------------------------------------------------------- #
     def _negative_sampler(self, data: GraphData, train_patterns: list):
@@ -215,28 +237,107 @@ class CollectiveBankDetector:
             rng=np.random.default_rng(c.seed + 1),
         )
 
+    @staticmethod
+    def _as_day_specs(days, train_patterns) -> list:
+        """Normalize the two call shapes into one list of graph specs.
+
+        ``fit`` is day-list-native: ``[(label, GraphData, train_patterns,
+        test_patterns), ...]``.  Because a single graph is just a one-element
+        list, the convenience form ``fit(data, train_patterns)`` is accepted and
+        wrapped here -- this only reshapes the *arguments*; every solver below
+        then runs the same code for one graph and for many.
+        """
+
+        if isinstance(days, GraphData):
+            if train_patterns is None:
+                raise TypeError("fit(data, train_patterns) needs train_patterns")
+            return [("train", days, train_patterns, None)]
+        if train_patterns is not None:
+            raise TypeError(
+                "pass either fit(day_specs) or fit(data, train_patterns), not both"
+            )
+        specs = [(s[0], s[1], s[2], s[3] if len(s) > 3 else None) for s in days]
+        if not specs:
+            raise ValueError("fit() needs at least one training graph")
+        return specs
+
     # -- steps -------------------------------------------------------------- #
-    def fit(self, data: GraphData, train_patterns: list, *, label_y=None,
+    def fit(self, days, train_patterns: "list | None" = None, *, label_y=None,
             label_idx=None) -> "CollectiveBankDetector":
-        """Learn the filter bank ``Theta*`` on the *training* gangs.
+        """Learn the filter bank ``Theta*`` on one or more training graphs.
+
+        ``days`` is ``[(label, GraphData, train_patterns, test_patterns), ...]``
+        -- each entry one graph (a day, or a merged window).  A single graph is a
+        one-element list, so ``fit(data, train_patterns)`` is accepted as sugar
+        for exactly that; there is no separate single-graph code path.  Every
+        solver takes the whole list:
+
+        * ``gradient`` and ``trace-ratio`` draw one graph per step/iteration
+          (see ``config.day_aggregate`` for the mean/min alternatives);
+        * ``closed-form`` concatenates each graph's dictionary coefficients,
+          since ``Theta`` lives in the (graph-independent) dictionary basis and
+          the union of the graphs' optimal directions is a valid target on any
+          of them.
 
         ``label_y`` / ``label_idx`` optionally attach a supervised node head
-        (config ``label_weight`` > 0) trained jointly with the filter.
+        (config ``label_weight`` > 0) trained jointly with the filter; like the
+        negative sampler it is a single-graph feature.
         """
 
         c = self.config
+        specs = self._as_day_specs(days, train_patterns)
+
+        if c.collective_solver == "closed-form":
+            from src.margin_pencil import collective_pencil_theta
+
+            thetas, reports = [], {}
+            for lbl, d, pats, _te in specs:
+                th, rep = collective_pencil_theta(
+                    d.a_hat, d.adjacency, d.X, pats,
+                    degree=c.degree, tau=c.tau, beta=c.pencil_beta, basis=c.basis,
+                )
+                thetas.append(th)
+                reports[lbl] = rep
+            # one graph -> the single solve's own coefficients
+            self.pencil_theta_ = (
+                thetas[0] if len(thetas) == 1 else torch.cat(thetas, dim=1)
+            )
+            self.theta_ = None  # no filter bank is trained on this path
+            base = dict(reports[specs[-1][0]])
+            base["per_group"] = reports
+            base["train_days"] = [s[0] for s in specs]
+            self.fit_info_ = base
+            return self
+
+        if c.collective_solver == "trace-ratio":
+            from src.trace_ratio_bank import fit_trace_ratio_bank
+
+            self.fit_info_ = fit_trace_ratio_bank(
+                [(lbl, d.a_hat, d.adjacency, pats, d.X)
+                 for lbl, d, pats, _te in specs],
+                degree=c.degree, heads=c.heads, iters=c.trace_ratio_iters,
+                tau=c.tau, ridge=c.ridge, basis=c.basis,
+                softmin_temperature=c.softmin_temperature,
+                conf_weight=c.conf_weight,
+            )
+            self.theta_ = self.fit_info_["theta"]
+            return self
+
+        # The negative sampler is built from ONE graph's edges and node labels.
+        # It is passed through as-is: with several graphs ``fit_collective_bank``
+        # raises rather than applying one graph's negatives to whichever graph an
+        # epoch happened to draw.
+        neg_sampler = self._negative_sampler(specs[0][1], specs[0][2])
         self.fit_info_ = fit_collective_bank(
-            data.a_hat,
-            data.adjacency,
-            train_patterns,
-            data.X,
+            [(lbl, d.a_hat, d.adjacency, pats, d.X, te)
+             for lbl, d, pats, te in specs],
             degree=c.degree,
             epochs=c.epochs,
             learning_rate=c.learning_rate,
             ridge=c.ridge,
             fit_seed=c.seed,
             tau=c.tau,
-            neg_sampler=self._negative_sampler(data, train_patterns),
+            neg_sampler=neg_sampler,
             neg_weight=c.neg_weight,
             neg_temperature=c.neg_temperature,
             softmin_temperature=c.softmin_temperature,
@@ -254,6 +355,7 @@ class CollectiveBankDetector:
             label_weight=c.label_weight,
             label_y=label_y,
             label_idx=label_idx,
+            day_aggregate=c.day_aggregate,
         )
         self.theta_ = self.fit_info_["theta"]
         return self
@@ -261,8 +363,17 @@ class CollectiveBankDetector:
     def target_subspace(self, data: GraphData, train_patterns: list) -> torch.Tensor:
         """Coarsening target ``R = span(Z)`` from the learned filter (needs :meth:`fit`)."""
 
-        self._require_fit()
         c = self.config
+        if c.collective_solver == "closed-form":
+            from src.margin_pencil import apply_dictionary_theta
+
+            if self.pencil_theta_ is None:
+                raise RuntimeError("call fit(...) before target_subspace()")
+            return apply_dictionary_theta(
+                data.a_hat, data.X, self.pencil_theta_,
+                degree=c.degree, tau=c.tau, basis=c.basis,
+            )
+        self._require_fit()
         return build_bank_subspace(
             data.a_hat,
             data.adjacency,
@@ -280,8 +391,27 @@ class CollectiveBankDetector:
     def capture(self, data: GraphData, patterns: list) -> dict:
         """Per-gang retained ``M_tau``-energy (capture) of ``patterns``."""
 
-        self._require_fit()
         c = self.config
+        if c.collective_solver == "closed-form":
+            # no filter bank exists; measure the target subspace itself
+            from src.run_collective_bank_detection import _basis_retained_energy
+
+            basis = self.target_subspace(data, patterns)
+            e = _basis_retained_energy(
+                data.a_hat, data.adjacency, patterns, basis, c.ridge, c.tau,
+                indicator=c.indicator,
+            )
+            m_v = _train_gang_m_vhat(data.a_hat, data.adjacency, patterns, c.tau)
+            from src.run_collective_bank_detection import _collective_gamma
+
+            g = _collective_gamma(data.a_hat, basis, m_v, c.ridge, c.tau)
+            diag = torch.diagonal(g).clamp(0.0, 1.0)
+            return {
+                "per_gang_capture": [float(v) for v in diag],
+                "min_capture": float(diag.min()), "mean_capture": float(diag.mean()),
+                "lambda_min_gamma": float(torch.linalg.eigvalsh(g)[0]),
+            }
+        self._require_fit()
         return retained_energy(
             data.a_hat,
             data.adjacency,

@@ -417,7 +417,11 @@ def analyze_coarsening(
         "n_gangs": len(gangs),
         "n_coarse": coarsening.n_coarse,
         "epsilon": coarsening.epsilon,
-        "lambda_min": det.fit_info_["objective"],
+        # gradient fit reports "objective"; the closed-form collective solver
+        # reports the Theorem A/B triple instead (lambda_min of Gamma)
+        "lambda_min": det.fit_info_.get(
+            "objective", det.fit_info_.get("lambda_min_Gamma")
+        ),
     }
 
     # (1) per-gang PR

@@ -82,6 +82,77 @@ def _relocate_logger_file(out_dir: Path) -> None:
             pass
 
 
+def _parse_day_groups(spec: str) -> list:
+    """Day spec -> list of ``(lo, hi)`` windows, **one graph per window**.
+
+    The comma/dash distinction is the whole point:
+
+    * ``"26"``        -> ``[(26, 26)]``                     one graph
+    * ``"24,25,26"``  -> ``[(24,24), (25,25), (26,26)]``    three separate graphs
+    * ``"24-26"``     -> ``[(24, 26)]``                     ONE merged graph
+    * ``"24-25,28"``  -> ``[(24,25), (28,28)]``             two graphs
+
+    A dash merges the window into a single graph (gangs spanning the days become
+    one connected component); a comma keeps the days as independent graphs that
+    the trainer samples between.
+    """
+
+    groups: list = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part.lstrip("-"):
+            lo, hi = part.split("-", 1)
+            groups.append((int(lo), int(hi)))
+        else:
+            groups.append((int(part), int(part)))
+    return groups
+
+
+def _load_training_day(window, args, feature_columns):
+    """Load one training WINDOW ``(lo, hi)`` as a single graph + its gang split.
+
+    ``lo == hi`` is one day; ``lo < hi`` merges the window into one graph.  The
+    split uses the same ``--train-ratio`` and a window-specific seed, so every
+    group contributes its own held-out gangs that the filter never sees.
+    Returns ``(GraphData, train_patterns)``; ``(None, None)`` when empty.
+    """
+
+    lo, hi = window
+    A_unw, A_w, cls, nodes_df = build_graph(args.data_dir, lo, hi)
+    if args.feature_mode in ("wallet", "wallet+random"):
+        Xfeat = load_node_features(
+            args.data_dir, nodes_df, lo, hi, keep_columns=feature_columns
+        )
+        if args.feature_mode == "wallet+random":
+            Xfeat = torch.cat(
+                [
+                    Xfeat,
+                    random_structural_features(
+                        int(A_unw.shape[0]), args.random_width, args.seed + lo
+                    ),
+                ],
+                dim=1,
+            )
+    else:
+        Xfeat = random_structural_features(
+            int(A_unw.shape[0]), args.random_width, args.seed + lo
+        )
+    graph = build_torch_graph(A_w, A_unw, cls, Xfeat, weighted=False)
+    gang_sets = connected_components_sets(
+        A_unw, np.where(cls == 1)[0], args.min_gang_size
+    )
+    if not gang_sets:
+        LOGGER.warning(f"    days {lo}-{hi}: no gangs -> skipped")
+        return None, None, None
+    day_gangs = make_patterns(gang_sets, "alert", "gang", "g")
+    d_train, d_test = split_train_test(
+        day_gangs, args.train_ratio, np.random.default_rng(args.seed + lo)
+    )
+    return GraphData.from_graph(graph), d_train, d_test
+
+
 def _gang_diagnostic_rows(det, data, gangs, gang_sets, edge_index, day, node_to_super):
     """Per-gang structural stats + detection outcome for the missed-gang analysis.
 
@@ -280,11 +351,18 @@ def _evaluate_transfer_day(
     LOGGER.info(f"  gangs (illicit CC>={args.min_gang_size}): {len(day_gangs)}")
 
     data = GraphData.from_graph(graph)
-    # theta is (H, K+1, d): the feature dimension is the LAST axis
-    if data.feature_dim != int(det.theta_.shape[-1]):
+    # bank theta is (H, K+1, d) -> feature dim is the LAST axis; the closed-form
+    # solver has no bank, its coefficients are (P, m) with P = (K+1)*d instead
+    if det.theta_ is not None:
+        trained_d = int(det.theta_.shape[-1])
+    elif det.pencil_theta_ is not None:
+        trained_d = int(det.pencil_theta_.shape[0]) // (det.config.degree + 1)
+    else:
+        trained_d = data.feature_dim
+    if data.feature_dim != trained_d:
         raise ValueError(
             f"day {day} feature-dim {data.feature_dim} != trained filter "
-            f"feature-dim {int(det.theta_.shape[-1])}; cannot apply frozen filter."
+            f"feature-dim {trained_d}; cannot apply frozen filter."
         )
 
     record: dict = {
@@ -334,8 +412,34 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     # --- dataset ---
     ap.add_argument("--data-dir", default="data/elliptic_actors", type=Path)
-    ap.add_argument("--day-start", type=int, default=26)
-    ap.add_argument("--day-end", type=int, default=26)
+
+    ap.add_argument(
+        "--collective-solver",
+        choices=["gradient", "closed-form", "trace-ratio"],
+        default="gradient",
+        help="'gradient' = ascend --capture-objective (soft-min lambda_min) on "
+        "the filter bank; 'closed-form' = Theta_beta = (G + beta*W_all)^{-1} Bhat, "
+        "one shared factorization + m linear solves.  At --pencil-beta 0 the "
+        "closed form is the EXACT maximizer of lambda_min(Gamma) over every "
+        "target in the dictionary (Theorem A), so the minimax training is "
+        "provably unnecessary; beta>0 buys confusability suppression with the "
+        "certified sandwich N_beta <= Gamma <= N_0.  'trace-ratio' keeps the "
+        "BANK class (so it generalizes) but replaces Adam with a Dinkelbach "
+        "iteration: each step is d small (K+1)x(K+1) eigenproblems and the heads "
+        "come out orthogonal per channel, so it needs tens of eigensolves rather "
+        "than hundreds of epochs.",
+    )
+    ap.add_argument(
+        "--train-days",
+        default="22, 23, 24,25,26",
+        help="the ONLY day option.  A comma separates GRAPHS, a dash merges a "
+        "window into one graph: '26' = one day; '24,25,26' = three separate "
+        "graphs, one drawn per epoch so the filter must work across graphs; "
+        "'24-26' = the three days merged into a single graph (gangs spanning "
+        "days become one component); '24-25,28' = two graphs.  The LAST group is "
+        "the graph that is coarsened, reported on, and from which transfer days "
+        "continue.  All groups must share the feature dimension.",
+    )
     ap.add_argument("--min-gang-size", type=int, default=2)
     ap.add_argument("--weighted", action="store_true", default=False)
     ap.add_argument("--train-ratio", type=float, default=0.6)
@@ -380,9 +484,9 @@ def main() -> None:
         "across days).",
     )
     ap.add_argument("--tau", type=float, default=0.5, help="screening (0 = Cor 4.7)")
-    ap.add_argument("--epochs", type=int, default=2000, help="training epochs")
+    ap.add_argument("--epochs", type=int, default=500, help="training epochs")
     ap.add_argument(
-        "--learning-rate", type=float, default=0.02, help="Adam learning rate"
+        "--learning-rate", type=float, default=0.05, help="Adam learning rate"
     )
     ap.add_argument("--ridge", type=float, default=1e-5)
     ap.add_argument(
@@ -394,11 +498,34 @@ def main() -> None:
         "L-BFGS reaches in tens of epochs what Adam needs thousands for "
         "(unavailable with negative sampling, which makes the objective stochastic)",
     )
+    ap.add_argument(
+        "--day-aggregate",
+        choices=["sample", "mean", "min"],
+        default="min",
+        help="how multiple training graphs are combined each epoch: 'sample' "
+        "draws one (stochastic, the iterate never settles); 'mean' steps on the "
+        "average over all graphs (deterministic, settles); 'min' steps on the "
+        "worst graph (maximin, scale-robust when days disagree).",
+    )
+    ap.add_argument(
+        "--trace-ratio-iters",
+        type=int,
+        default=40,
+        help="iterations of the trace-ratio solver (each = d small eigensolves)",
+    )
+    ap.add_argument(
+        "--pencil-beta",
+        type=float,
+        default=0.0,
+        help="beta of the closed-form collective solver (0 = pure capture "
+        "optimum; larger suppresses confusability, cost bounded by the "
+        "reported optimality gap lambda_min(N_0) - lambda_min(N_beta))",
+    )
     ap.add_argument("--softmin-temperature", type=float, default=0.2)
     ap.add_argument(
         "--warm-start",
         choices=["ones", "closed_form"],
-        default="ones",
+        default="closed_form",
         help="'closed_form' initializes theta at the best single filter consistent "
         "with the per-gang Theorem 6.2 optima instead of the flat low-pass",
     )
@@ -435,9 +562,14 @@ def main() -> None:
         help="host (non-gang) nodes sampled per gang node as the negative class for "
         "the --label-weight head (only used when --label-weight > 0).",
     )
-    ap.add_argument("--conf-weight", type=float, default=10.0)
+    ap.add_argument(
+        "--conf-weight",
+        type=float,
+        default=10.0,
+        help="weight of the confusability penalty (soft-min chi) in the objective",
+    )
     ap.add_argument("--conf-reduce", choices=["max", "mean"], default="mean")
-    ap.add_argument("--conf-delta", type=float, default=0.0)
+    ap.add_argument("--conf-delta", type=float, default=0.00)
     ap.add_argument("--structural-width", type=int, default=0)
     ap.add_argument(
         "--coarsen-target",
@@ -452,7 +584,7 @@ def main() -> None:
     ap.add_argument(
         "--heads",
         type=int,
-        default=6,
+        default=8,
         help="number of filter heads H: the bank is Theta (H, K+1, d) and the "
         "target is the concatenated span of its heads (H*d columns).  H=1 is the "
         "single shared filter and reproduces the classic behaviour exactly; H>1 "
@@ -507,10 +639,10 @@ def main() -> None:
         "the largest epsilon gap split each step) and interpolated to every level.",
     )
     ap.add_argument("--reduction", type=float, default=0.3)
-    ap.add_argument("--epsilon", type=float, default=0.95)
+    ap.add_argument("--epsilon", type=float, default=1.0)
     ap.add_argument("--max-levels", type=int, default=10)
 
-    ap.add_argument("--ward-stop", choices=["epsilon", "f1"], default="epsilon")
+    ap.add_argument("--ward-stop", choices=["epsilon", "f1"], default="f1")
     ap.add_argument("--ward-num-cuts", type=int, default=500)
     ap.add_argument("--threshold", type=float, default=0.51)
     ap.add_argument("--max-normal-patterns", type=int, default=120)
@@ -518,6 +650,14 @@ def main() -> None:
     out_dir = f"results/elliptic_modular/{now}/"
     ap.add_argument("--out", default=out_dir, type=Path)
     args = ap.parse_args()
+    # --train-days is the single day option.  The last group is the graph that is
+    # coarsened / reported on; day_start..day_end are derived from it so every
+    # downstream consumer (output naming, transfer, JSON) is unchanged.
+    day_groups = _parse_day_groups(args.train_days)
+    if not day_groups:
+        ap.error("--train-days must name at least one day, e.g. '26' or '24,25,26'")
+    args.day_start, args.day_end = day_groups[-1]
+    args.day_groups = day_groups
 
     os.makedirs(args.out, exist_ok=True)
     torch.manual_seed(args.seed)
@@ -598,6 +738,10 @@ def main() -> None:
         warm_start=args.warm_start,
         softmin_anneal=args.softmin_anneal,
         capture_objective=args.capture_objective,
+        collective_solver=args.collective_solver,
+        pencil_beta=args.pencil_beta,
+        trace_ratio_iters=args.trace_ratio_iters,
+        day_aggregate=args.day_aggregate,
         label_weight=args.label_weight,
         conf_weight=args.conf_weight,
         conf_reduce=args.conf_reduce,
@@ -642,30 +786,115 @@ def main() -> None:
         f"K={cfg.degree}, opt={cfg.optimizer}, objective={cfg.capture_objective}"
         f"{f', label_w={cfg.label_weight:g}' if cfg.label_weight > 0 else ''}) …"
     )
-    result = det.run(
-        data,
-        gang_train,
-        gang_test,
-        all_patterns=gangs,
-        label_y=label_y,
-        label_idx=label_idx,
+
+    # Every solver takes the same list of training groups; only the LAST group
+    # is coarsened / reported on.  A single group routes to each solver's plain
+    # single-graph call, so `--train-days 26 --collective-solver gradient`
+    # reproduces the classic fit exactly.
+    day_specs = []
+    for grp in args.day_groups:
+        if grp == (args.day_start, args.day_end):
+            d_data, d_train, d_test = data, gang_train, gang_test  # already loaded
+        else:
+            d_data, d_train, d_test = _load_training_day(grp, args, feature_columns)
+            if d_train is None:
+                continue
+        day_specs.append(
+            (
+                f"{grp[0]}-{grp[1]}" if grp[0] != grp[1] else str(grp[0]),
+                d_data,
+                d_train,
+                d_test,
+            )
+        )
+    if not day_specs:
+        raise ValueError(f"--train-days {args.train_days} yielded no usable groups")
+    LOGGER.info(
+        f"  training groups: {[spec[0] for spec in day_specs]}"
+        f"{' (one drawn per epoch)' if len(day_specs) > 1 else ''}"
+        f"   |   coarsened + reported on: {day_specs[-1][0]}"
     )
 
-    fit = result["fit"]
-    LOGGER.info(
-        f"    capture ({cfg.capture_objective}) / lambda_min(Gamma): "
-        f"{fit['init_objective']:.4g} -> {fit['objective']:.4g}"
-    )
-    if cfg.conf_weight > 0:
+    det.fit(day_specs)
+
+    # Every training group is coarsened and scored, not just the reported one:
+    # with several graphs the single-group table hides how the shared filter
+    # actually does on the days it was trained on.
+    per_group_reports = {}
+    if len(day_specs) > 1:
+        LOGGER.info("\n" + "=" * 74)
         LOGGER.info(
-            f"    confusability chi: {fit['confusability_init']:.4g} -> {fit['confusability']:.4g}"
+            "PER-GROUP TRAINING-DAY PERFORMANCE (shared filter, own coarsening)"
         )
-    # loss / capture / confusability / per-gang capture over the fit
+        LOGGER.info("=" * 74)
+        LOGGER.info(
+            f"  {'group':<8}{'gangs':>7}{'recall':>9}{'precision':>11}"
+            f"{'f1':>8}{'detection':>11}{'det/tot':>10}"
+        )
+        LOGGER.info("  " + "-" * 62)
+        for lbl, g_data, g_train, _g_test in day_specs:
+            g_basis = det.target_subspace(g_data, g_train)
+            g_co, _ = det.coarsen(g_data, g_basis, g_train)
+            rep = det.evaluate(g_data, g_co, {"train": g_train})["train"]
+            rep["n_coarse"] = int(g_co.n_coarse)
+            rep["epsilon"] = float(g_co.epsilon)
+            per_group_reports[lbl] = rep
+            LOGGER.info(
+                f"  {lbl:<8}{rep['total']:>7}{rep['mean_recall']:>9.3f}"
+                f"{rep['mean_precision']:>11.3f}{rep['mean_f1']:>8.3f}"
+                f"{rep['detection_rate']:>11.1%}"
+                f"{rep['detected']:>5}/{rep['total']:<4}"
+            )
+
+    basis_ = det.target_subspace(data, gang_train)
+    coarsening, trajectory = det.coarsen(data, basis_, gang_train)
+    splits = {"train": gang_train, "test": gang_test, "all": gangs}
+    result = {
+        "config": cfg.to_dict(),
+        "theta": det.theta_,
+        "fit": det.fit_info_,
+        "basis": basis_,
+        "coarsening": coarsening,
+        "trajectory": trajectory,
+        "report": det.evaluate(data, coarsening, splits),
+        "captures": {n: det.capture(data, p) for n, p in splits.items() if p},
+        "per_group_report": per_group_reports,
+    }
+
+    fit = result["fit"]
+    if cfg.collective_solver == "closed-form":
+        LOGGER.info(
+            f"    closed-form collective solve (beta={cfg.pencil_beta:g}, "
+            f"P={fit['dictionary_dim']:,}, rank={fit['dictionary_rank']:,}):"
+        )
+        LOGGER.info(
+            f"      lambda_min: N_beta {fit['lambda_min_N_beta']:.6g} <= "
+            f"Gamma {fit['lambda_min_Gamma']:.6g} <= N_0 {fit['lambda_min_N0']:.6g}"
+            f"   [sandwich holds: {fit['sandwich_ok']}]"
+        )
+        LOGGER.info(
+            f"      optimality gap (headroom for ANY minimax): "
+            f"{fit['optimality_gap']:.6g}   max chi {max(fit['chi_cross_max']):.3e} "
+            f"<= bound {max(fit['chi_bound']):.3e}"
+        )
+    else:
+        LOGGER.info(
+            f"    capture ({cfg.capture_objective}) / lambda_min(Gamma): "
+            f"{fit['init_objective']:.4g} -> {fit['objective']:.4g}"
+        )
+        if cfg.conf_weight > 0:
+            LOGGER.info(
+                f"    confusability chi: {fit['confusability_init']:.4g} -> "
+                f"{fit['confusability']:.4g}"
+            )
+    # loss / capture / confusability / per-gang capture over the fit (the
+    # closed-form solver has no training trace, so this is a no-op there)
     fig = write_training_report(
         fit,
         args.out,
         title=(
-            f"collective bank fit -- elliptic++ d{args.day_start}-{args.day_end} "
+            f"collective bank fit -- elliptic++ train="
+            f"{'+'.join(spec[0] for spec in day_specs)} eval=d{args.day_end} "
             f"({cfg.capture_objective}, beta={cfg.conf_weight:g}, K={cfg.degree}, "
             f"tau={cfg.tau:g}, {len(gang_train)} train gangs)"
         ),
@@ -733,6 +962,8 @@ def main() -> None:
         det_transfer = CollectiveBankDetector(replace(cfg, ward_stop="epsilon"))
         det_transfer.theta_ = det.theta_
         det_transfer.fit_info_ = det.fit_info_
+        # closed-form solver: the frozen dictionary coefficients transfer too
+        det_transfer.pencil_theta_ = det.pencil_theta_
 
         LOGGER.info("\n" + "=" * 74)
         LOGGER.info(
@@ -853,8 +1084,23 @@ def main() -> None:
         "n_gangs": len(gangs),
         "n_train_gangs": len(gang_train),
         "config": cfg.to_dict(),
-        "lambda_min_init": fit["init_objective"],
-        "lambda_min_final": fit["objective"],
+        # the closed-form solver has no training trace; it reports the Theorem
+        # A/B triple instead (N_beta <= Gamma <= N_0) and its optimality gap
+        "lambda_min_init": fit.get("init_objective", fit.get("lambda_min_N_beta")),
+        "lambda_min_final": fit.get("objective", fit.get("lambda_min_Gamma")),
+        "closed_form": {
+            k: fit[k]
+            for k in (
+                "lambda_min_N0",
+                "lambda_min_N_beta",
+                "lambda_min_Gamma",
+                "optimality_gap",
+                "sandwich_ok",
+                "beta",
+            )
+            if k in fit
+        }
+        or None,
         "coarsening": {
             "n_original": co.n_original,
             "n_coarse": co.n_coarse,

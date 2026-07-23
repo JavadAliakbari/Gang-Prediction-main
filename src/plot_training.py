@@ -44,17 +44,26 @@ def history_frame(fit: dict) -> pd.DataFrame:
         "label_ce": fit.get("ce_history") or [],
         "neg_energy": fit.get("neg_history") or [],
         "head_similarity": fit.get("head_sim_history") or [],
+        "lambda_min_test": fit.get("history_test") or [],
+        "capture_mean_test": fit.get("energy_history_test") or [],
     }
     n = max((len(v) for v in cols.values()), default=0)
     if n == 0:
         return pd.DataFrame()
     data = {"epoch": np.arange(n)}
     for k, v in cols.items():
-        if len(v) == n and np.any(np.asarray(v, dtype=float) != 0.0):
-            data[k] = np.asarray(v, dtype=float)
+        arr = np.asarray(v, dtype=float) if len(v) == n else None
+        if arr is not None and (np.any(arr != 0.0) or np.any(np.isnan(arr))):
+            if not np.all(np.isnan(arr)):
+                data[k] = arr
     df = pd.DataFrame(data)
     if "objective" in df:
         df["loss"] = -df["objective"]
+    days = fit.get("epoch_days") or []
+    if len(days) == n:
+        # which graph each epoch stepped on: without this the multi-day trace
+        # looks like wild oscillation when it is really the between-day spread
+        df["day"] = list(days)
     return df
 
 
@@ -63,6 +72,10 @@ def _per_gang_frame(fit: dict) -> "pd.DataFrame | None":
 
     snaps = fit.get("snapshots") or []
     rows = [s for s in snaps if s.get("gamma_diag")]
+    # gang j on one graph is not gang j on another, so a multi-graph fit's
+    # snapshots are restricted to a single graph before being plotted
+    if rows and any(s.get("day") != rows[-1].get("day") for s in rows):
+        rows = [s for s in rows if s.get("day") == rows[-1].get("day")]
     if len(rows) < 2:
         return None
     m = len(rows[0]["gamma_diag"])
@@ -101,14 +114,20 @@ def plot_training_curves(
 
     # 2. capture: floor, mean, worst gang
     a = next(ax)
-    a.plot(df.epoch, df.lambda_min, color="#1F4E79", lw=1.8,
-           label="$\\lambda_{\\min}(\\Gamma)$  (collective floor)")
+    a.plot(df.epoch, df.lambda_min, color="#1F4E79", lw=1.6,
+           label="$\\lambda_{\\min}$ train")
+    if "lambda_min_test" in df:
+        a.plot(df.epoch, df.lambda_min_test, color="#1F4E79", lw=1.2, ls=":",
+               label="$\\lambda_{\\min}$ held-out")
     if "capture_mean" in df:
         a.plot(df.epoch, df.capture_mean, color="#2E7D5B", lw=1.4,
-               label="mean $C_j$")
+               label="mean $C_j$ train")
+    if "capture_mean_test" in df:
+        a.plot(df.epoch, df.capture_mean_test, color="#2E7D5B", lw=1.2, ls=":",
+               label="mean $C_j$ held-out")
     if "capture_min" in df:
-        a.plot(df.epoch, df.capture_min, color="#2E7D5B", lw=1.2, ls="--",
-               label="worst $C_j$")
+        a.plot(df.epoch, df.capture_min, color="#2E7D5B", lw=1.0, ls="--",
+               alpha=0.7, label="worst $C_j$ train")
     a.set_title("capture (retained $M_\\tau$-energy)")
     a.set_xlabel("epoch")
     a.set_ylabel("capture")
@@ -118,10 +137,15 @@ def plot_training_curves(
     if has_conf:
         a = next(ax)
         a.plot(df.epoch, df.confusability, color="#7A4EA8", lw=1.6, label="$\\chi$")
+        if "objective" in df:
+            # the quantity actually ascended (what the progress bar calls "obj"):
+            # soft-min lambda_min - beta*chi - diversity.  NOT mean(C) - chi.
+            a.plot(df.epoch, df.objective, color="#B8860B", lw=1.3,
+                   label="ascended objective")
         if "capture_mean" in df:
-            a.plot(df.epoch, df.capture_mean - df.confusability, color="#B8860B",
-                   lw=1.2, ls="--", label="margin $D = C - \\chi$")
-        a.set_title("confusability and margin")
+            a.plot(df.epoch, df.capture_mean - df.confusability, color="#8C8C8C",
+                   lw=1.0, ls="--", alpha=0.8, label="mean $C-\\chi$ (not the obj.)")
+        a.set_title("confusability and objective")
         a.set_xlabel("epoch")
         a.set_ylabel("$\\chi$")
         a.legend(fontsize=7, frameon=False)

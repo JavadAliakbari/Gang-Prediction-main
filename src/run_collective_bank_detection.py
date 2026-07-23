@@ -892,10 +892,41 @@ def _top_confuser(
     tmp = torch.linalg.solve_triangular(lc, a_r, upper=False)
     c = torch.linalg.solve_triangular(lc, tmp.T, upper=False).T
     c = 0.5 * (c + c.T)
-    y = torch.linalg.eigh(c).eigenvectors[:, -1]  # largest generalized eigenvalue
+    y = _sym_top_eigvec(c)  # largest generalized eigenvalue
     x = torch.linalg.solve_triangular(lc.T, y.unsqueeze(1), upper=True).squeeze(1)
     z = P @ x
     return z / z.norm().clamp_min(eps)
+
+
+# LAPACK convergence failures surface as torch._C._LinAlgError, which subclasses
+# RuntimeError; naming both keeps the catch working across torch versions.
+_LINALG_ERROR = (getattr(torch._C, "_LinAlgError", RuntimeError), RuntimeError)
+
+
+def _sym_top_eigvec(m: torch.Tensor) -> torch.Tensor:
+    """Top (largest-eigenvalue) eigenvector of a symmetric matrix, robustly.
+
+    ``torch.linalg.eigh`` uses LAPACK's divide-and-conquer ``syevd``, which can
+    fail to converge precisely when the leading eigenvalues are nearly
+    degenerate.  That is not a rare corner here: the S-procedure ``mu``-search in
+    :func:`_top_leaky_confuser` bisects *towards* the KKT boundary, and the
+    boundary is by definition where the maximizer switches, i.e. where the top
+    two eigenvalues cross.  So the closer the bisection gets to the answer, the
+    likelier ``syevd`` is to abort with "too many repeated eigenvalues".
+
+    On that failure we shift the matrix to positive semi-definite (Gershgorin
+    bound on ``|lambda|``) and take the top *singular* vector instead.  For a
+    symmetric PSD matrix the singular and eigen decompositions coincide, so this
+    returns the same vector via a different LAPACK path (``gesdd``), which does
+    not share ``syevd``'s degeneracy failure mode.
+    """
+
+    try:
+        return torch.linalg.eigh(m).eigenvectors[:, -1]
+    except _LINALG_ERROR:
+        shift = float(m.abs().sum(1).max()) + 1.0  # >= |lambda|_max by Gershgorin
+        eye = torch.eye(m.shape[0], dtype=m.dtype, device=m.device)
+        return torch.linalg.svd(m + shift * eye).U[:, 0]
 
 
 def _top_leaky_confuser(
@@ -954,7 +985,12 @@ def _top_leaky_confuser(
     p_lct_inv = torch.linalg.solve_triangular(lc, P.T, upper=False).T  # (h, h-1)
 
     def _top_y(mu):
-        return torch.linalg.eigh(ca - mu * ce).eigenvectors[:, -1]
+        # Scale by 1/(1+mu): eigenvectors are invariant under positive scaling, so
+        # this is the same KKT point, but the matrix norm stays O(|ca| + |ce|)
+        # instead of growing with mu.  Without it a large bracket hands ``eigh`` a
+        # matrix whose entries dwarf ``ca``, and the search degrades to solving
+        # ``-ce`` in floating point.
+        return _sym_top_eigvec((ca - mu * ce) / (1.0 + mu))
 
     def _leak(y):  # sign-consistent proxy for w^T E w
         return float(y @ (ce @ y))
@@ -967,11 +1003,18 @@ def _top_leaky_confuser(
     if _leak(y0) <= 1e-9:  # leak cap already slack -> unconstrained (on c) optimum
         return _back(y0)
     # bracket a mu with leak(mu) < 0, then bisect to the boundary leak(mu*) = 0
-    mu_hi = 1.0
+    mu_hi, bracketed = 1.0, False
     for _ in range(40):
         if _leak(_top_y(mu_hi)) < 0.0:
+            bracketed = True
             break
         mu_hi *= 2.0
+    if not bracketed:
+        # No mu enforces the leak cap (the cone is effectively empty for this
+        # gang at this Theta).  Returning the mu_hi iterate would be an arbitrary
+        # point on a failed search, so return the leak-minimizing direction: the
+        # most feasible vector available, and a continuous limit of the search.
+        return _back(_sym_top_eigvec(-ce))
     mu_lo = 0.0
     for _ in range(24):
         mu = 0.5 * (mu_lo + mu_hi)
@@ -1151,11 +1194,120 @@ class _RiemannianAdam:
         return new.detach()
 
 
-def fit_collective_bank(
+def _graph_bundle(
+    label,
     a_hat: torch.Tensor,
     adjacency: torch.Tensor,
     train_patterns: list,
     X: torch.Tensor,
+    test_patterns: "list | None",
+    *,
+    degree: int,
+    tau: float,
+    basis: str,
+    conf_active: bool,
+    conf_delta: float,
+    conf_halo_hops: int,
+    keep_dense: bool,
+) -> dict:
+    """All ``O(N)`` work for ONE graph, precomputed once.
+
+    Everything the epoch loop needs from a graph lives in the returned bundle, so
+    the loop itself is ``N``-independent no matter which graph it steps on:
+
+    * ``gram_kernel[k,l,a,b] = <phi_k x_a, M_tau phi_l x_b>``  (``P``)
+    * ``rhs_kernel[k,a,j]   = <phi_k x_a, M_tau vhat_j>``      (``Q``)
+    * ``rhs_test_kernel``   -- the same for the HELD-OUT gangs, so their ``Gamma``
+      is a genuine validation curve (the filter never sees their gradient)
+    * ``conf_tables``       -- the Theta-independent confusability tables (eq. 36)
+
+    ``keep_dense`` additionally retains the propagated dictionary stacks.  They
+    are ``(N, (K+1)d)`` each, i.e. the one genuinely large object here, and are
+    needed only by the features that resample signals every epoch (negatives) or
+    read rows of ``Z`` directly (the joint label head) plus the initial
+    ``O(N)`` objective -- so only the graphs that use them pay for them.
+    """
+
+    eps = torch.finfo(X.dtype).eps
+    V = degree_weighted_indicators(adjacency, train_patterns)  # (N, m)
+    l_v = _l_apply(a_hat, V)
+    phi = (V * l_v).sum(0).clamp_min(eps)  # Phi_j = ||v_j||_L^2 (conductance)
+    m_norm = (phi + tau).sqrt().unsqueeze(0)  # ||v_j||_{M_tau} = sqrt(Phi_j + tau)
+    m_vhat = (l_v + tau * V) / m_norm  # M_tau Vhat = (L + tau I) v_j / sqrt(Phi_j+tau)
+
+    propagated = _basis_stack(a_hat, X, degree, basis, tau)  # [phi_k(A_hat) X], k=0..K
+    # Screened dictionary stack [M_tau phi_k(A_hat) X] (K+1 sparse mat-vecs).  M_tau Z
+    # is linear in theta, so M_tau Z = _filtered_bank(m_prop, theta) each epoch -- no
+    # per-epoch sparse mat-vec in the Gram/confusability.
+    m_propagated = [_m_apply(a_hat, propagated[k], tau) for k in range(degree + 1)]
+
+    # N-independent Gram kernel.  The screened channel Gram and the RHS are
+    # quadratic / linear in the per-channel filter ``theta`` with theta-independent
+    # coefficients:
+    #   g_z[a,b] = Z[:,a]^T M_tau Z[:,b] = sum_{k,l} theta[k,a] theta[l,b] P[k,l,a,b],
+    #   m[a,j]   = Z[:,a]^T M_tau vhat_j = sum_k theta[k,a] Q[k,a,j],
+    # with P[k,l,a,b] = <phi_k X[:,a], M_tau phi_l X[:,b]> and
+    #      Q[k,a,j]   = <phi_k X[:,a], M_tau vhat_j>.
+    # Precomputing ``P`` (via one (K+1)d x (K+1)d Gram of the stacked dictionaries)
+    # and ``Q`` ONCE turns every epoch's Gram from an O(K N d) pass over the
+    # propagated stack into an O(K^2 d^2) einsum -- fully independent of N.
+    d_feat = X.shape[1]
+    _pr = torch.cat(propagated, dim=1)  # (N, (K+1) d), column k*d+a = phi_k X[:,a]
+    _mp = torch.cat(m_propagated, dim=1)  # (N, (K+1) d)
+    gram_kernel = (
+        (_pr.T @ _mp)  # ((K+1)d, (K+1)d)
+        .reshape(degree + 1, d_feat, degree + 1, d_feat)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )  # P: (K+1, K+1, d, d)
+    rhs_kernel = (_pr.T @ m_vhat).reshape(degree + 1, d_feat, -1)  # Q: (K+1, d, m)
+
+    rhs_test_kernel = None
+    if test_patterns:
+        v_t = degree_weighted_indicators(adjacency, test_patterns)
+        l_vt = _l_apply(a_hat, v_t)
+        phi_t = (v_t * l_vt).sum(0).clamp_min(eps)
+        m_vt = (l_vt + tau * v_t) / (phi_t + tau).sqrt().unsqueeze(0)
+        rhs_test_kernel = (_pr.T @ m_vt).reshape(degree + 1, d_feat, -1)
+    del _pr, _mp
+
+    conf_tables = (
+        build_confusability_tables(
+            a_hat,
+            adjacency,
+            train_patterns,
+            X,
+            tau=tau,
+            degree=degree,
+            basis=basis,
+            delta=conf_delta,
+            halo_hops=conf_halo_hops,
+        )
+        if conf_active and train_patterns
+        else []
+    )
+
+    return {
+        "label": label,
+        "a_hat": a_hat,
+        "adjacency": adjacency,
+        "X": X,
+        "patterns": train_patterns,
+        "m_vhat": m_vhat,
+        "gram_kernel": gram_kernel,
+        "rhs_kernel": rhs_kernel,
+        "rhs_test_kernel": rhs_test_kernel,
+        "conf_tables": conf_tables,
+        "propagated": propagated if keep_dense else None,
+        "m_propagated": m_propagated if keep_dense else None,
+        "m": len(train_patterns),
+        "m_test": len(test_patterns or []),
+        "n": int(X.shape[0]),
+    }
+
+
+def fit_collective_bank(
+    days: list,
     *,
     degree: int,
     epochs: int,
@@ -1184,8 +1336,32 @@ def fit_collective_bank(
     softmin_anneal: float = 1.0,
     heads: int = 1,
     head_diversity: float = 0.0,
+    day_aggregate: str = "sample",
 ) -> dict:
     """Ascend ``lambda_min(Gamma(Theta))`` over the per-channel unit spheres.
+
+    ``days`` is a list of ``(label, a_hat, adjacency, train_patterns, X)`` tuples,
+    optionally with a sixth ``test_patterns`` element.  **A single graph is a
+    one-element list** -- there is no separate single-graph path: the precompute
+    is a per-graph bundle loop and the epoch loop selects a bundle, which for
+    ``D = 1`` is the identity.  Every graph must share the feature dimension
+    ``d`` (the filter is shared); graph size and gang count may differ freely.
+
+    Training across graphs is the natural regularizer for the regime where the
+    in-sample objective and out-of-sample detection come apart: the filter must
+    work for gangs living on *different* graphs, so graph-specific structure
+    cannot be memorized.  ``day_aggregate`` picks what each epoch ascends:
+
+    * ``"sample"`` -- one graph drawn uniformly per epoch.  Stochastic gradient
+      ascent whose "minibatch" is a whole graph: unbiased for the average-over-
+      graphs objective ``E[capture_objective(Gamma_day(Theta))]`` and far cheaper
+      than summing every graph per step.
+    * ``"mean"``   -- average over all graphs (deterministic).
+    * ``"min"``    -- the worst graph only (maximin).
+
+    The price of several graphs is memory: the Gram kernel is ``(K+1)^2 d^2`` per
+    graph (~123 MB at K=32, d=119), and all graphs are held simultaneously, so the
+    count should stay modest.
 
     ``optimizer_kind`` chooses how the constraint ``||theta^(a)|| = 1`` is enforced:
     ``"projected"`` (default) optimizes an unconstrained ``raw`` with Adam and
@@ -1235,82 +1411,106 @@ def fit_collective_bank(
     between heads' per-channel filters) to the ascended objective.
 
     Returns the learned ``theta`` (``(H, K+1, d)``, unit per-(head, channel)
-    columns) plus the initial and final objective and the optimization history.
+    columns) plus the initial and final objective and the optimization history,
+    with a per-graph breakdown of the final objective in ``per_day``.
     """
 
+    if not days:
+        raise ValueError("days must be a non-empty list of graph specs")
+    if day_aggregate not in ("sample", "mean", "min"):
+        raise ValueError("day_aggregate must be 'sample', 'mean' or 'min'")
     heads = max(1, int(heads))
-    if len(train_patterns) > X.shape[1] * heads:
-        LOGGER.warning(
-            f"  capacity: m_train={len(train_patterns)} > H*d={X.shape[1] * heads}; "
-            "lambda_min(Gamma) is 0 by Theorem (Capacity threshold) -- raise "
-            "--feature-dim / --heads or lower --num-motifs / --train-ratio."
-        )
-
-    dtype, device = a_hat.dtype, a_hat.device
-    eps = torch.finfo(dtype).eps
-    V = degree_weighted_indicators(adjacency, train_patterns)  # (N, m)
-    l_v = _l_apply(a_hat, V)
-    phi = (V * l_v).sum(0).clamp_min(eps)  # Phi_j = ||v_j||_L^2 (conductance)
-    m_norm = (phi + tau).sqrt().unsqueeze(0)  # ||v_j||_{M_tau} = sqrt(Phi_j + tau)
-    m_vhat = (l_v + tau * V) / m_norm  # M_tau Vhat = (L + tau I) v_j / sqrt(Phi_j+tau)
 
     # negative "repeller" sets: their softmax-lambda_max is *minimized*, so ``R``
     # preserves none of them and the coarsening splits them apart.  The sets are
     # resampled every epoch (see ``neg_sampler``) so the bank cannot overfit a
     # single fixed batch of negatives.
     neg_active = neg_sampler is not None and neg_weight > 0.0
+    # optional joint supervised head on the same embedding, trained jointly with theta
+    label_active = label_weight > 0.0 and label_y is not None and label_idx is not None
+    # Both are genuinely single-graph features: the negative sampler is built from
+    # one graph's edge index and the label split indexes one graph's nodes.  Rather
+    # than silently applying them to whichever graph an epoch happened to draw,
+    # refuse the combination outright.
+    if len(days) > 1 and (neg_active or label_active):
+        which = " and ".join(
+            [n for n, on in (("neg_sampler", neg_active), ("label head", label_active)) if on]
+        )
+        raise ValueError(
+            f"{which} is a single-graph feature (it is built from one graph's "
+            f"nodes/edges) but {len(days)} graphs were given; drop it or fit on "
+            "one graph."
+        )
+
+    dtype, device = days[0][1].dtype, days[0][1].device
+    eps = torch.finfo(dtype).eps
+    d_feat = int(days[0][4].shape[1])
+    n_col = d_feat * heads  # target width: one block of d columns per head
+    conf_active = conf_weight > 0.0 and any(len(spec[3]) > 0 for spec in days)
+
+    if len(days) > 1:
+        LOGGER.info(
+            f"  multi-graph fit: building moment kernels for {len(days)} graphs "
+            f"(K={degree}, d={d_feat}, aggregate={day_aggregate}) ..."
+        )
+    bundles = []
+    for i, spec in enumerate(days):
+        label, a_hat_i, adjacency_i, patterns_i, X_i = spec[:5]
+        test_i = spec[5] if len(spec) > 5 else None
+        if int(X_i.shape[1]) != d_feat:
+            raise ValueError(
+                f"graph {label} has feature-dim {X_i.shape[1]} != {d_feat}; the "
+                "filter is shared so the feature dimension must match."
+            )
+        if len(patterns_i) > n_col:
+            LOGGER.warning(
+                f"  capacity: m_train={len(patterns_i)} > H*d={n_col}"
+                f"{f' on graph {label}' if len(days) > 1 else ''}; "
+                "lambda_min(Gamma) is 0 by Theorem (Capacity threshold) -- raise "
+                "--feature-dim / --heads or lower --num-motifs / --train-ratio."
+            )
+        bundles.append(
+            _graph_bundle(
+                label, a_hat_i, adjacency_i, patterns_i, X_i, test_i,
+                degree=degree, tau=tau, basis=basis, conf_active=conf_active,
+                conf_delta=conf_delta, conf_halo_hops=conf_halo_hops,
+                # the dense stacks are only ever read on the first graph (initial
+                # objective) and by the single-graph negatives / label head
+                keep_dense=(i == 0),
+            )
+        )
+        if len(days) > 1:
+            LOGGER.info(
+                f"    graph {label}: N={bundles[-1]['n']:,}  "
+                f"train gangs={bundles[-1]['m']}"
+            )
+
+    # the graph the O(N) initial objective and the single-graph features read
+    first = bundles[0]
+    ridge_eye = ridge * torch.eye(n_col, dtype=dtype, device=device)
 
     def _neg_l_vhat(sets: "list | None"):
         if not sets:
             return None
-        v_neg = _degree_weighted_columns(adjacency, sets)
-        l_v_neg = _l_apply(a_hat, v_neg)
+        v_neg = _degree_weighted_columns(first["adjacency"], sets)
+        l_v_neg = _l_apply(first["a_hat"], v_neg)
         phi_neg = (v_neg * l_v_neg).sum(0).clamp_min(eps)
         return (l_v_neg + tau * v_neg) / (phi_neg + tau).sqrt().unsqueeze(0)
 
-    propagated = _basis_stack(a_hat, X, degree, basis, tau)  # [phi_k(A_hat) X], k=0..K
-    # Screened dictionary stack [M_tau phi_k(A_hat) X], precomputed ONCE (K+1 sparse
-    # mat-vecs).  M_tau Z is linear in theta, so M_tau Z = _filtered_bank(m_prop,
-    # theta) each epoch -- no per-epoch sparse mat-vec in the Gram/confusability.
-    m_propagated = [_m_apply(a_hat, propagated[k], tau) for k in range(degree + 1)]
-
-    # N-independent Gram kernel.  The screened channel Gram and the RHS are
-    # quadratic / linear in the per-channel filter ``theta`` with theta-independent
-    # coefficients:
-    #   g_z[a,b] = Z[:,a]^T M_tau Z[:,b] = sum_{k,l} theta[k,a] theta[l,b] P[k,l,a,b],
-    #   m[a,j]   = Z[:,a]^T M_tau vhat_j = sum_k theta[k,a] Q[k,a,j],
-    # with P[k,l,a,b] = <phi_k X[:,a], M_tau phi_l X[:,b]> and
-    #      Q[k,a,j]   = <phi_k X[:,a], M_tau vhat_j>.
-    # Precomputing ``P`` (via one (K+1)d x (K+1)d Gram of the stacked dictionaries)
-    # and ``Q`` ONCE turns every epoch's Gram from an O(K N d) pass over the
-    # propagated stack into an O(K^2 d^2) einsum -- fully independent of N.
-    d_feat = X.shape[1]
-    _pr = torch.cat(propagated, dim=1)  # (N, (K+1) d), column k*d+a = phi_k X[:,a]
-    _mp = torch.cat(m_propagated, dim=1)  # (N, (K+1) d)
-    gram_kernel = (
-        (_pr.T @ _mp)  # ((K+1)d, (K+1)d)
-        .reshape(degree + 1, d_feat, degree + 1, d_feat)
-        .permute(0, 2, 1, 3)
-        .contiguous()
-    )  # P: (K+1, K+1, d, d)
-    rhs_kernel = (_pr.T @ m_vhat).reshape(degree + 1, d_feat, -1)  # Q: (K+1, d, m)
-    del _pr, _mp
-    n_col = d_feat * heads  # target width: one block of d columns per head
-    ridge_eye = ridge * torch.eye(n_col, dtype=dtype, device=device)
-
-    def _gamma_and_chol(theta: torch.Tensor):
-        """``(Gamma, chol)`` from the precomputed kernel -- no O(N) work.
+    def _gamma_and_chol(theta: torch.Tensor, bundle: dict, rhs_key="rhs_kernel"):
+        """``(Gamma, chol)`` on one graph, from its precomputed kernel -- no O(N) work.
 
         With ``H`` heads the channel Gram gains cross-head blocks:
         ``g_z[(h,a), (g,b)] = sum_{k,l} theta[h,k,a] theta[g,l,b] P[k,l,a,b]``.
-        For ``H = 1`` this is exactly the single-head contraction.
+        For ``H = 1`` this is exactly the single-head contraction.  ``rhs_key``
+        selects the training gangs or the held-out ones (the validation curve).
         """
         th = as_multihead(theta)
-        g_z = torch.einsum("hka,glb,klab->hagb", th, th, gram_kernel).reshape(
-            n_col, n_col
-        )
+        g_z = torch.einsum(
+            "hka,glb,klab->hagb", th, th, bundle["gram_kernel"]
+        ).reshape(n_col, n_col)
         g_z = 0.5 * (g_z + g_z.T)
-        m = torch.einsum("hka,kaj->haj", th, rhs_kernel).reshape(n_col, -1)  # (H*d, m)
+        m = torch.einsum("hka,kaj->haj", th, bundle[rhs_key]).reshape(n_col, -1)
         chol = torch.linalg.cholesky(g_z + ridge_eye)
         gamma = m.T @ torch.cholesky_solve(m, chol)  # Vhat^T M Z (Z^T M Z)^+ Z^T M Vhat
         return 0.5 * (gamma + gamma.T), chol
@@ -1333,11 +1533,11 @@ def fit_collective_bank(
 
     # optional joint label head: restrict the propagated stack to the labelled rows
     # once, so the per-epoch CE costs O(K n_lab d) instead of O(K N d).
-    label_active = label_weight > 0.0 and label_y is not None and label_idx is not None
     head = None
     if label_active:
-        prop_lab = [propagated[k][label_idx] for k in range(degree + 1)]
-        head = torch.nn.Linear(X.shape[1], 2).to(dtype=dtype, device=device)
+        prop_lab = [first["propagated"][k][label_idx] for k in range(degree + 1)]
+        # the head sees the full bank, i.e. all H heads concatenated (n_col = H*d)
+        head = torch.nn.Linear(n_col, 2).to(dtype=dtype, device=device)
         head_opt = torch.optim.Adam(
             head.parameters(), lr=learning_rate, weight_decay=5e-4
         )
@@ -1345,41 +1545,32 @@ def fit_collective_bank(
         counts = torch.bincount(y_lab, minlength=2).to(dtype=dtype)
         cls_w = (counts.sum() / counts.clamp_min(1.0)) / 2.0
 
-    # confusability regularizer (eq. 40): precompute the Theta-independent per-gang
-    # tables once; the penalty -beta*max_j chi(S_j) is added to the margin below.
-    conf_active = conf_weight > 0.0 and len(train_patterns) > 0
-    conf_tables = (
-        build_confusability_tables(
-            a_hat,
-            adjacency,
-            train_patterns,
-            X,
-            tau=tau,
-            degree=degree,
-            basis=basis,
-            delta=conf_delta,
-            halo_hops=conf_halo_hops,
-        )
-        if conf_active
-        else []
-    )
-
     torch.manual_seed(fit_seed)
-    if warm_start == "closed_form" and len(train_patterns) > 0:
+    if warm_start == "closed_form" and any(b["m"] > 0 for b in bundles):
         # per-gang Theorem 6.2 coefficients W_j = (T^T M T)^+ T^T M vhat_j, then
         # the best SINGLE filter per channel: the top left-singular vector of that
-        # channel's {W_j[:, a]}_j (maximizes the summed squared alignment).
+        # channel's {W_j[:, a]}_j (maximizes the summed squared alignment).  Each
+        # graph contributes its own gangs' coefficients to that channel stack, so
+        # with one graph this is exactly the classic init.
         with torch.no_grad():
-            gram_full = torch.einsum("klab->kalb", gram_kernel).reshape(
-                (degree + 1) * d_feat, (degree + 1) * d_feat
-            )
-            rhs_full = rhs_kernel.reshape((degree + 1) * d_feat, -1)
-            evals_g, evecs_g = torch.linalg.eigh(0.5 * (gram_full + gram_full.T))
-            keep_g = evals_g > evals_g.max() * 1e-10
-            coeff = evecs_g[:, keep_g] @ (
-                (evecs_g[:, keep_g].T @ rhs_full) / evals_g[keep_g].unsqueeze(1)
-            )  # ((K+1)d, m)
-            W = coeff.reshape(degree + 1, d_feat, -1)  # (K+1, d, m)
+            per_graph_w = []
+            for b in bundles:
+                gram_full = torch.einsum("klab->kalb", b["gram_kernel"]).reshape(
+                    (degree + 1) * d_feat, (degree + 1) * d_feat
+                )
+                rhs_full = b["rhs_kernel"].reshape((degree + 1) * d_feat, -1)
+                evals_g, evecs_g = torch.linalg.eigh(0.5 * (gram_full + gram_full.T))
+                keep_g = evals_g > evals_g.max() * 1e-10
+                coeff = evecs_g[:, keep_g] @ (
+                    (evecs_g[:, keep_g].T @ rhs_full) / evals_g[keep_g].unsqueeze(1)
+                )  # ((K+1)d, m)
+                per_graph_w.append(coeff.reshape(degree + 1, d_feat, -1))
+                del gram_full, rhs_full, evals_g, evecs_g, coeff
+            W = (
+                per_graph_w[0]
+                if len(per_graph_w) == 1
+                else torch.cat(per_graph_w, dim=2)
+            )  # (K+1, d, sum_i m_i)
             # head h takes the h-th singular direction of each channel's closed-form
             # coefficients: the heads start on an orthogonal frame by construction
             init = torch.stack([
@@ -1389,7 +1580,7 @@ def fit_collective_bank(
                 ], dim=1)
                 for h in range(heads)
             ], dim=0)  # (H, K+1, d)
-            del gram_full, rhs_full, evals_g, evecs_g, coeff, W
+            del per_graph_w, W
         raw = torch.nn.Parameter(init.contiguous())
     else:
         raw = torch.ones(heads, degree + 1, d_feat, dtype=dtype, device=device)
@@ -1412,14 +1603,19 @@ def fit_collective_bank(
         gamma_neg = (
             _collective_gamma_mz(embedding, m_z, l_vhat_neg, ridge)
             if m_z is not None
-            else _collective_gamma(a_hat, embedding, l_vhat_neg, ridge, tau)
+            else _collective_gamma(first["a_hat"], embedding, l_vhat_neg, ridge, tau)
         )
         return _soft_lambda_max(gamma_neg, neg_temperature, sharpen=neg_sharpen)
 
+    # baseline on the first graph, via the O(N) embedding rather than the kernel
     with torch.no_grad():
-        Z0 = _filtered_bank(propagated, _unit(raw))
+        Z0 = _filtered_bank(first["propagated"], _unit(raw))
         init_obj = float(
-            torch.linalg.eigvalsh(_collective_gamma(a_hat, Z0, m_vhat, ridge, tau))[0]
+            torch.linalg.eigvalsh(
+                _collective_gamma(
+                    first["a_hat"], Z0, first["m_vhat"], ridge, tau
+                )
+            )[0]
         )
         init_neg = float(
             _neg_softmax(Z0, _neg_l_vhat(neg_sampler() if neg_active else None))
@@ -1429,23 +1625,36 @@ def fit_collective_bank(
                 collective_confusability(
                     _unit(raw),
                     Z0,
-                    a_hat,
+                    first["a_hat"],
                     tau,
                     ridge,
-                    conf_tables,
+                    first["conf_tables"],
                     eps,
                     reduce=conf_reduce,
                 )
             )
-            if conf_active
+            if conf_active and first["conf_tables"]
             else 0.0
         )
+        del Z0
+    # the dense stacks exist only for the baseline above and the single-graph
+    # features; with several graphs nothing reads them again, so drop the
+    # (N, (K+1)d) pair rather than carrying it through the whole fit.
+    if len(bundles) > 1:
+        first["propagated"] = first["m_propagated"] = None
 
     use_lbfgs = optimizer_kind == "lbfgs"
     if use_lbfgs and neg_active:
         LOGGER.warning(
             "  optimizer=lbfgs needs a deterministic objective but negatives "
             "resample every step -- falling back to projected Adam."
+        )
+        use_lbfgs, optimizer_kind = False, "projected"
+    if use_lbfgs and len(bundles) > 1 and day_aggregate == "sample":
+        LOGGER.warning(
+            "  optimizer=lbfgs needs a deterministic objective but "
+            "day_aggregate='sample' redraws a graph every step -- falling back "
+            "to projected Adam (use day_aggregate='mean' to keep L-BFGS)."
         )
         use_lbfgs, optimizer_kind = False, "projected"
     riemannian = optimizer_kind == "riemannian"
@@ -1489,20 +1698,76 @@ def fit_collective_bank(
     capture_min_history: list[float] = []
     # RMS cosine between distinct heads: 1 = collapsed to one filter, 0 = orthogonal
     head_sim_history: list[float] = []
+    # held-out Gamma on the stepped graph: the filter never sees these gangs'
+    # gradient, so this is a genuine validation curve (nan when none were given)
+    history_test: list[float] = []
+    energy_history_test: list[float] = []
+    # which graph each epoch stepped on
+    day_history: list = []
     snapshots: list = []
     snap_interval = max(1, epochs // 20) if snapshot_interval > 0 else 0
+    day_rng = np.random.default_rng(int(fit_seed))
     epoch_bar = tqdm(range(epochs), desc="fitting collective bank", leave=False)
 
-    def _capture_term(theta: torch.Tensor, temperature: float):
+    def _capture_term(theta: torch.Tensor, temperature: float, bundle: dict):
         """``(pos_obj, gamma, chol)`` -- capture objective before the penalties."""
 
-        gamma_, chol_ = _gamma_and_chol(theta)  # N-independent (precomputed kernel)
+        # N-independent (precomputed per-graph kernel)
+        gamma_, chol_ = _gamma_and_chol(theta, bundle)
         # the hard lambda_min (T=0) or a differentiable soft-min over the whole
         # low end of the spectrum (T>0)
         obj = _capture_objective(gamma_, capture_objective, temperature)
         if head_diversity > 0.0:
             obj = obj - head_diversity * _diversity(theta)
         return obj, gamma_, chol_
+
+    def _graph_objective(theta: torch.Tensor, temperature: float, bundle: dict):
+        """``(obj, gamma, chol, conf_val)`` on ONE graph: capture minus eq. 40's chi.
+
+        The eq. 40 margin subtracts the worst-gang confusability penalty from the
+        capture floor, so the same step lifts lambda_min AND shrinks chi.  The
+        confusability reuses the Gram's Cholesky factor -- also N-independent.
+        """
+
+        obj, gamma_, chol_ = _capture_term(theta, temperature, bundle)
+        if not (conf_active and bundle["conf_tables"]):
+            return obj, gamma_, chol_, 0.0
+        conf = collective_confusability(
+            theta,
+            None,
+            bundle["a_hat"],
+            tau,
+            ridge,
+            bundle["conf_tables"],
+            eps,
+            reduce=conf_reduce,
+            chol=chol_,
+        )
+        return obj - conf_weight * conf, gamma_, chol_, float(conf.detach())
+
+    def _positive(theta: torch.Tensor, temperature: float, drawn: "dict | None"):
+        """The epoch's ascended objective over the graph list.
+
+        ``drawn`` is the graph sampled for this epoch under ``day_aggregate=
+        "sample"``; ``None`` means aggregate over every graph.  With a single
+        graph both routes reduce to that graph's own objective, so ``D = 1`` is
+        the same computation the classic single-graph fit performed, not an
+        approximation of it.  Returns ``(obj, gamma, chol, bundle, conf_val)``
+        where the reported ``gamma``/``conf_val`` belong to the binding graph.
+        """
+
+        if drawn is not None:
+            obj, gamma_, chol_, conf_v = _graph_objective(theta, temperature, drawn)
+            return obj, gamma_, chol_, drawn, conf_v
+        per = [_graph_objective(theta, temperature, b) for b in bundles]
+        objs = [p[0] for p in per]
+        if day_aggregate == "min":  # maximin: step on the worst graph only
+            k = int(torch.stack([o.detach() for o in objs]).argmin())
+            obj = objs[k]
+        else:  # "mean": step on every graph, report the weakest
+            k = int(np.argmin([float(torch.linalg.eigvalsh(p[1])[0]) for p in per]))
+            obj = torch.stack(objs).mean()
+        return obj, per[k][1], per[k][2], bundles[k], per[k][3]
 
     for _ep in epoch_bar:
         # geometric anneal of the soft-min temperature: warm early (gradient
@@ -1511,18 +1776,22 @@ def fit_collective_bank(
         if softmin_anneal > 1.0 and epochs > 1:
             temp_ep = softmin_temperature * softmin_anneal ** (1.0 - _ep / (epochs - 1))
 
+        # one graph per epoch under "sample" -- drawn once so L-BFGS's inner
+        # iterations all step on the same graph.  With one graph this draw is the
+        # identity.
+        drawn = (
+            bundles[int(day_rng.integers(len(bundles)))]
+            if day_aggregate == "sample"
+            else None
+        )
+
         if use_lbfgs:
             # L-BFGS runs its own inner iterations via the closure (each "epoch"
             # is up to `max_iter` quasi-Newton steps with a strong-Wolfe line
             # search); the bookkeeping below then records the accepted iterate.
-            def _closure():
+            def _closure(_drawn=drawn):
                 optimizer.zero_grad(set_to_none=True)
-                obj_c, _, chol_c = _capture_term(_unit(raw), temp_ep)
-                if conf_active:
-                    obj_c = obj_c - conf_weight * collective_confusability(
-                        _unit(raw), None, a_hat, tau, ridge, conf_tables, eps,
-                        reduce=conf_reduce, chol=chol_c,
-                    )
+                obj_c, _, _, _, _ = _positive(_unit(raw), temp_ep, _drawn)
                 if label_active:
                     obj_c = obj_c - label_weight * F.cross_entropy(
                         head(_filtered_bank(prop_lab, _unit(raw))), y_lab, weight=cls_w
@@ -1533,27 +1802,7 @@ def fit_collective_bank(
             optimizer.step(_closure)
 
         theta = theta_param if riemannian else _unit(raw)
-        pos_obj, gamma, chol = _capture_term(theta, temp_ep)
-
-        # eq. 40 margin: subtract the worst-gang confusability penalty from the
-        # capture floor, so the same step lifts lambda_min AND shrinks chi.  The
-        # confusability reuses the Gram's Cholesky factor -- also N-independent.
-        if conf_active:
-            conf = collective_confusability(
-                theta,
-                None,
-                a_hat,
-                tau,
-                ridge,
-                conf_tables,
-                eps,
-                reduce=conf_reduce,
-                chol=chol,
-            )
-            pos_obj = pos_obj - conf_weight * conf
-            conf_val = float(conf.detach())
-        else:
-            conf_val = 0.0
+        pos_obj, gamma, _, bundle, conf_val = _positive(theta, temp_ep, drawn)
 
         # optional supervised head on the SAME embedding, trained jointly.  Only the
         # labelled rows of Z are needed, so this stays cheap (the propagated stack is
@@ -1588,8 +1837,8 @@ def fit_collective_bank(
             # fresh negatives every epoch -> stochastic repeller (no overfitting).
             # Negatives resample new indicators each step, so they still need the
             # full embedding Z / M_tau Z (built here only when negatives are on).
-            Z = _filtered_bank(propagated, theta)
-            m_z = _filtered_bank(m_propagated, theta)
+            Z = _filtered_bank(first["propagated"], theta)
+            m_z = _filtered_bank(first["m_propagated"], theta)
             l_vhat_neg = _neg_l_vhat(neg_sampler())
             soft_neg = _neg_softmax(Z, l_vhat_neg, m_z=m_z)
             # Take the two gradients separately so the negative step can be made
@@ -1627,11 +1876,24 @@ def fit_collective_bank(
         capture_min_history.append(float(gamma_diag.min()))
         margin_history.append(float(pos_obj.detach()))
         ce_history.append(ce_val)
+        day_history.append(bundle["label"])
+        # held-out gangs on the stepped graph: no gradient, so this is a pure
+        # validation reading of the same iterate
+        lam_te = cap_te = float("nan")
+        if bundle["rhs_test_kernel"] is not None:
+            with torch.no_grad():
+                g_te, _ = _gamma_and_chol(theta, bundle, rhs_key="rhs_test_kernel")
+                lam_te = float(torch.linalg.eigvalsh(g_te)[0])
+                cap_te = float(torch.diagonal(g_te).clamp(0.0, 1.0).mean())
+        history_test.append(lam_te)
+        energy_history_test.append(cap_te)
         if heads > 1:
             with torch.no_grad():
                 head_sim_history.append(float(_diversity(theta).sqrt()))
         epoch_bar.set_postfix(
-            lambda_min=f"{value:.4g}", margin=f"{float(pos_obj.detach()):.4g}"
+            lambda_min=f"{value:.4g}", margin=f"{float(pos_obj.detach()):.4g}",
+            **({"graph": str(bundle["label"])} if len(bundles) > 1 else {}),
+            **({"lam_te": f"{lam_te:.4g}"} if lam_te == lam_te else {}),
         )
         if snap_interval > 0 and (_ep % snap_interval == 0 or _ep == epochs - 1):
             snapshots.append(
@@ -1640,6 +1902,8 @@ def fit_collective_bank(
                     "theta": theta.detach().clone(),
                     "lam_min": value,
                     "gamma_diag": torch.diagonal(gamma.detach()).clamp(0, 1).tolist(),
+                    # the per-gang panel is only comparable within one graph
+                    "day": bundle["label"],
                 }
             )
         # snapshot by the FULL objective actually being ascended (capture term -
@@ -1659,6 +1923,28 @@ def fit_collective_bank(
                 else _unit(raw).detach().clone()
             )
 
+    # the objective on EVERY graph at the retained iterate: with one graph this is
+    # just a breakdown of ``objective``, with several it shows the spread the
+    # shared filter actually achieved.
+    per_day = {}
+    with torch.no_grad():
+        for b in bundles:
+            g, _ = _gamma_and_chol(best_theta, b)
+            dg = torch.diagonal(g).clamp(0.0, 1.0)
+            per_day[str(b["label"])] = {
+                "lambda_min": float(torch.linalg.eigvalsh(g)[0]),
+                "mean_capture": float(dg.mean()),
+                "min_capture": float(dg.min()),
+                "n_train_gangs": b["m"],
+            }
+    if len(bundles) > 1:
+        LOGGER.info("  per-graph objective at the retained filter:")
+        for lbl, v in per_day.items():
+            LOGGER.info(
+                f"    graph {lbl}: lambda_min={v['lambda_min']:.4g}  "
+                f"mean C={v['mean_capture']:.4g}  ({v['n_train_gangs']} gangs)"
+            )
+
     return {
         "theta": best_theta,
         "init_objective": init_obj,
@@ -1671,6 +1957,8 @@ def fit_collective_bank(
         "neg_objective": best_neg,
         "neg_objective_mean": float(np.mean(neg_history)) if neg_history else 0.0,
         "history": history,
+        "history_test": history_test,
+        "energy_history_test": energy_history_test,
         "neg_history": neg_history,
         "conf_history": conf_history,
         "energy_history": energy_history,
@@ -1681,10 +1969,14 @@ def fit_collective_bank(
         "heads": heads,
         "head_similarity": head_sim_history[-1] if head_sim_history else 0.0,
         "snapshots": snapshots,
-        "n_train_patterns": len(train_patterns),
+        "n_train_patterns": sum(b["m"] for b in bundles),
         "capture_objective": capture_objective,
         "conf_weight": conf_weight,
         "label_weight": label_weight,
+        "train_days": [str(b["label"]) for b in bundles],
+        "epoch_days": day_history,
+        "day_aggregate": day_aggregate,
+        "per_day": per_day,
     }
 
 
@@ -2633,10 +2925,7 @@ def run_for_tau(
 
     # 4. learn the filter bank on the training motifs -------------------------
     fit = fit_collective_bank(
-        normalized,
-        adjacency,
-        train_patterns,
-        X,
+        [("train", normalized, adjacency, train_patterns, X)],
         degree=args.degree,
         epochs=args.epochs,
         learning_rate=args.learning_rate,

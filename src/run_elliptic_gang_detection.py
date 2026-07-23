@@ -564,10 +564,7 @@ def main() -> None:
     )
     X2 = (X2 - X2.mean(0, keepdim=True)) / X2.std(0, keepdim=True).clamp_min(1e-8)
     bank_fit = fit_collective_bank(
-        normalized,
-        adjacency,
-        gang_train,
-        X2,
+        [("train", normalized, adjacency, gang_train, X2)],
         # Xf,
         degree=args.degree,
         epochs=bank_epochs,
