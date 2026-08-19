@@ -869,10 +869,7 @@ def main() -> None:
                 rng=np.random.default_rng(seed + 1),
             )
         bank_fit = fit_collective_bank(
-            normalized,
-            adjacency,
-            alert_train_patterns,
-            X,
+            [("train", normalized, adjacency, alert_train_patterns, X)],
             degree=args.degree,
             epochs=args.bank_epochs,
             learning_rate=args.bank_learning_rate,

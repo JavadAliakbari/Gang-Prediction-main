@@ -235,7 +235,7 @@ def _write_missed_gang_diagnostics(rows: list, out: Path) -> None:
     LOGGER.info(f"missed-gang CSV + plot + summary -> {out}")
 
 
-def _run_pr_sweep(det, data, basis, gang_sets, tag, args) -> "dict | None":
+def _run_pr_sweep(det, data, basis, gang_sets, tag, args, dataset="elliptic++") -> "dict | None":
     """Full incremental Ward PR-sweep for one graph (training day-range or a transfer day).
 
     Walks the whole Ward merge order (finest -> 2 clusters) recording every metric
@@ -244,6 +244,10 @@ def _run_pr_sweep(det, data, basis, gang_sets, tag, args) -> "dict | None":
     constant, sampled at B adaptively-placed levels (largest-gap bisection) and
     interpolated to every level; otherwise it is the free cumulative Ward
     distortion.  Reuses the already-computed ``basis`` -- no extra coarsening.
+
+    ``dataset`` only labels the figure (so the synthetic driver in
+    :mod:`src.run_synthetic_modular` can share this sweep verbatim rather than
+    keeping a second copy of it).
     """
 
     from src.ward_pr_sweep import (
@@ -275,7 +279,7 @@ def _run_pr_sweep(det, data, basis, gang_sets, tag, args) -> "dict | None":
     pd.DataFrame(traj).to_csv(args.out / f"pr_sweep_{tag}.csv", index=False)
     auc, _ = plot_sweep(
         traj,
-        f"elliptic++ {tag}",
+        f"{dataset} {tag}",
         args.out / f"pr_sweep_{tag}.png",
         eps_budget=args.epsilon,
         eps_key=eps_key,
@@ -1107,6 +1111,9 @@ def main() -> None:
             "epsilon": co.epsilon,
         },
         "report": result["report"],
+        # how the SHARED filter did on each training group's own graph (empty for a
+        # single group); printed above, kept here so the export path can read it
+        "per_group_report": result.get("per_group_report") or None,
         "transfer": {
             # per-gang diagnostic rows live in the CSV, not here (keeps JSON small)
             "days": [

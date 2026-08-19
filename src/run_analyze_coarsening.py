@@ -50,7 +50,7 @@ from src.run_elliptic_gang_detection import (
     load_node_features,
     split_train_test,
 )
-from src.run_elliptic_modular import _random_structural_features
+from src.run_elliptic_modular import random_structural_features
 
 
 # --------------------------------------------------------------------------- #
@@ -95,7 +95,7 @@ def main() -> None:
             args.data_dir, nodes_df, args.day_start, args.day_end
         )
     else:
-        Xfeat = _random_structural_features(
+        Xfeat = random_structural_features(
             int(A_unw.shape[0]), args.random_width, args.seed
         )
     graph = build_torch_graph(A_w, A_unw, cls, Xfeat, weighted=False)

@@ -319,7 +319,7 @@ def main() -> None:
     ap.add_argument(
         "--motif-density",
         type=float,
-        default=0.3,
+        default=0.4,
         help="edge density of 'random' motifs (1.0 = clique)",
     )
     ap.add_argument(

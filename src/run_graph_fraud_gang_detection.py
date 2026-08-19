@@ -52,6 +52,7 @@ from scipy.sparse.csgraph import connected_components
 
 from src.run_elliptic_gang_conductance import random_connected_set
 from src.pattern_models import create_pattern
+from src.plot_training import write_training_report
 from src.run_elliptic_gang_detection import (
     coarsen_and_count,
     make_patterns,
@@ -119,7 +120,7 @@ def _jaccard(recall: float, precision: float) -> float:
 
 
 def coarsen_and_metrics(
-    name, basis, *, adjacency, labels, eval_gangs, top5_gangs, args
+    name, basis, *, adjacency, labels, eval_gangs, top5_gangs, args, control_sets=None
 ):
     """One coarsening -> detection rate + per-community best-match F1 / Jaccard.
 
@@ -178,6 +179,10 @@ def coarsen_and_metrics(
     f1a, jaca, deta, reca, preca = per_set(eval_gangs)
     out = {
         "encoder": name,
+        # the coarsening itself, reused by the diagnostics/selectivity panels so
+        # nothing downstream has to coarsen the graph a second time ("_" keys are
+        # stripped from the JSON payload)
+        "_n2s": n2s,
         "n_coarse": co.n_coarse,
         "epsilon_actual": co.epsilon,
         "n_gangs": len(eval_gangs),
@@ -197,6 +202,29 @@ def coarsen_and_metrics(
             "precision": preca.tolist(),
         },
     }
+    # Selectivity control: the size-matched random connected sets are scored with
+    # the SAME coarsening.  Without this the detection rate is uninterpretable --
+    # a coarsening fine enough to collapse every small set "detects" everything
+    # (the diagnosis the Elliptic++ non-gang panel exists to make).
+    if control_sets:
+        f1n, _, detn, recn, precn = per_set(control_sets)
+        out.update(
+            {
+                "n_controls": len(control_sets),
+                "control_collapse_rate": float(detn.mean()),
+                "control_mean_recall": float(recn.mean()),
+                "control_mean_precision": float(precn.mean()),
+                "control_meanF1": float(f1n.mean()),
+                # detection rate minus the rate at which a random size-matched set
+                # collapses: what the target subspace buys over pure resolution
+                "selectivity_gap": float(deta.mean() - detn.mean()),
+                "_per_control": {
+                    "detected": detn.astype(int).tolist(),
+                    "f1": f1n.tolist(),
+                },
+            }
+        )
+
     if top5_gangs:
         f1t, jact, _, rect, prect = per_set(top5_gangs)
         out.update(
@@ -308,6 +336,180 @@ def community_diagnostics(
             f"    {f:<13} detected_med={dm:>9.3g}  missed_med={mm_:>9.3g}  AUC={a:.2f}"
         )
     return df
+
+
+def elliptic_style_panels(name, row, df, adjacency, gang_sets, args, out):
+    """Elliptic²⁺-style panels: per-community PR, selectivity, conductance.
+
+    Mirrors the three diagnostics that made the Elliptic\texttt{++} report readable
+    (``1_gang_precision_recall``, ``3_conductance``, ``4_nongang_precision_recall``),
+    reusing the coarsening already computed in :func:`coarsen_and_metrics` -- the
+    graph is never coarsened twice.  Returns a dict of the scalars it plots so the
+    JSON report and the LaTeX export can pick them up.
+    """
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    from src.analyze_elliptic_coarsening import (
+        dominant_supernode,
+        supernode_conductance,
+    )
+
+    n2s = row["_n2s"]
+    thr = args.threshold
+    summary: dict = {}
+
+    fig, axes = plt.subplots(1, 4, figsize=(21, 4.6))
+
+    # ---- (1) per-community precision/recall, detected vs missed ---------------
+    ax = axes[0]
+    for lab, sub, c in (
+        ("detected", df[df.detected == 1], "tab:green"),
+        ("missed", df[df.detected == 0], "tab:red"),
+    ):
+        ax.scatter(sub.recall, sub.precision, s=12, alpha=0.55, color=c, label=lab)
+    ax.axvline(thr, color="k", ls=":", lw=1)
+    ax.axhline(thr, color="k", ls=":", lw=1)
+    ax.set_xlabel("recall")
+    ax.set_ylabel("precision")
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_title(
+        f"(1) per-community PR  (detected {int(df.detected.sum())}/{len(df)}"
+        f" = {df.detected.mean():.0%})\ndotted = threshold {thr:g}"
+    )
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # ---- (2) selectivity: communities vs size-matched random connected sets ---
+    ax = axes[1]
+    if "control_collapse_rate" in row:
+        g, n = df.detected.mean(), row["control_collapse_rate"]
+        bars = ax.bar(
+            ["ground-truth\ncommunities", "random\nsize-matched"],
+            [g, n],
+            color=["tab:green", "tab:gray"],
+            alpha=0.85,
+        )
+        for b, v in zip(bars, (g, n)):
+            ax.text(
+                b.get_x() + b.get_width() / 2,
+                v + 0.02,
+                f"{v:.1%}",
+                ha="center",
+                fontsize=10,
+            )
+        ax.set_ylim(0, 1.05)
+        ax.set_ylabel("collapse rate (single supernode)")
+        ax.set_title(
+            f"(2) selectivity: gap = {row['selectivity_gap']:+.1%}\n"
+            "a detector needs the left bar above the right"
+        )
+        summary["selectivity_gap"] = float(row["selectivity_gap"])
+        summary["control_collapse_rate"] = float(n)
+    else:
+        ax.set_axis_off()
+    ax.grid(axis="y", alpha=0.3)
+
+    # ---- (3) supernode conductance: community-carrying vs background ----------
+    ax = axes[2]
+    phi_s, _vol, sizes = supernode_conductance(adjacency, n2s)
+    keep = sizes >= 2  # singletons have no interior, their conductance is trivial
+    carriers = sorted({dominant_supernode(n2s, list(S)) for S in gang_sets})
+    is_carrier = torch.zeros(phi_s.shape[0], dtype=torch.bool)
+    is_carrier[torch.as_tensor(carriers, dtype=torch.long)] = True
+    phi_g = phi_s[keep & is_carrier].numpy()
+    phi_b = phi_s[keep & ~is_carrier].numpy()
+    bins = np.linspace(0, 1, 41)
+    if phi_b.size:
+        ax.hist(
+            phi_b,
+            bins=bins,
+            density=True,
+            alpha=0.55,
+            color="tab:gray",
+            label=f"background (n={phi_b.size:,})",
+        )
+    if phi_g.size:
+        ax.hist(
+            phi_g,
+            bins=bins,
+            density=True,
+            alpha=0.65,
+            color="tab:green",
+            label=f"community-carrying (n={phi_g.size:,})",
+        )
+        ax.axvline(
+            np.median(phi_g),
+            color="tab:green",
+            ls="--",
+            label=f"median $\\Phi$={np.median(phi_g):.3f}",
+        )
+        summary["supernode_phi_community_median"] = float(np.median(phi_g))
+    if phi_b.size:
+        ax.axvline(
+            np.median(phi_b),
+            color="k",
+            ls=":",
+            label=f"bg median $\\Phi$={np.median(phi_b):.3f}",
+        )
+        summary["supernode_phi_background_median"] = float(np.median(phi_b))
+    ax.set_xlabel(r"supernode conductance $\Phi$")
+    ax.set_ylabel("density")
+    ax.set_title("(3) coarsened-supernode conductance (size $\\geq$ 2)")
+    ax.legend(fontsize=7)
+    ax.grid(alpha=0.3)
+
+    # ---- (4) detection rate vs community size (the confound to watch) --------
+    ax = axes[3]
+    edges = [1, 5, 10, 20, 50, 10**9]
+    labels_ = ["2-5", "6-10", "11-20", "21-50", "51+"]
+    b = df.copy()
+    b["band"] = pd.cut(b["size"], bins=edges, labels=labels_, right=True)
+    g = (
+        b.groupby("band", observed=True)
+        .agg(
+            rate=("detected", "mean"), n=("detected", "size"), med_phi=("Phi", "median")
+        )
+        .reset_index()
+    )
+    ax.plot(range(len(g)), g.rate, "o-", color="tab:green", label="detection rate")
+    ax.plot(range(len(g)), g.med_phi, "s--", color="tab:red", label=r"median $\Phi$")
+    for i, (r_, n_) in enumerate(zip(g.rate, g.n)):
+        ax.annotate(
+            f"n={n_}",
+            (i, r_),
+            textcoords="offset points",
+            xytext=(0, 7),
+            ha="center",
+            fontsize=7,
+        )
+    ax.set_xticks(range(len(g)))
+    ax.set_xticklabels(g.band.astype(str))
+    ax.set_ylim(0, 1.05)
+    ax.set_xlabel("community size")
+    ax.set_title("(4) detection vs size (is it size or structure?)")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    fig.suptitle(f"Elliptic-style panels — {args.dataset} [{name}]", fontsize=13)
+    fig.tight_layout()
+    path = out / f"panels_{args.dataset}_{name}.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    g.to_csv(out / f"by_size_{args.dataset}_{name}.csv", index=False)
+    LOGGER.info(f"  Elliptic-style panels -> {path}")
+    if "selectivity_gap" in summary:
+        LOGGER.info(
+            f"    selectivity: communities {df.detected.mean():.1%} vs random "
+            f"{summary['control_collapse_rate']:.1%}  "
+            f"(gap {summary['selectivity_gap']:+.1%})"
+        )
+    return summary
 
 
 def _plot_community_diag(df, membership, tag, path):
@@ -639,6 +841,25 @@ def fit_bank_basis(graph, normalized, adjacency, Xf, gang_tr, args):
         f"    capture ({cfg.capture_objective}) / lambda_min: "
         f"{fi['init_objective']:.4g} -> {fi['objective']:.4g}"
     )
+    if cfg.conf_weight > 0:
+        LOGGER.info(
+            f"    confusability chi: {fi['confusability_init']:.4g} -> "
+            f"{fi['confusability']:.4g}"
+        )
+    # loss / capture / confusability trace of the fit (the same training report the
+    # Elliptic and synthetic drivers write, so the three are directly comparable)
+    fig = write_training_report(
+        fi,
+        args.out,
+        tag=args.dataset,
+        title=(
+            f"collective bank fit -- {args.dataset} "
+            f"({cfg.capture_objective}, beta={cfg.conf_weight:g}, K={cfg.degree}, "
+            f"tau={cfg.tau:g}, d={data.feature_dim}, {len(gang_tr)} train communities)"
+        ),
+    )
+    if fig is not None:
+        LOGGER.info(f"    training curves + history CSV -> {fig}")
     return det.target_subspace(data, gang_tr)
 
 
@@ -656,7 +877,7 @@ def main() -> None:
             "comlj",
             "comorkut",
         ],
-        default="amazon",
+        default="comamazon",
     )
     ap.add_argument("--data-dir", default="data/graph_fraud", type=Path)
     ap.add_argument("--comamazon-dir", default="data/community", type=Path)
@@ -695,7 +916,7 @@ def main() -> None:
     ap.add_argument("--learning-rate", type=float, default=0.02)
     ap.add_argument("--ridge", type=float, default=1e-3)
     ap.add_argument("--reduction", type=float, default=0.99)
-    ap.add_argument("--epsilon", type=float, default=0.5)
+    ap.add_argument("--epsilon", type=float, default=0.4)
     ap.add_argument("--threshold", type=float, default=0.51)
     ap.add_argument("--max-levels", type=int, default=5)
     ap.add_argument("--max-contraction-size", type=int, default=4)
@@ -745,7 +966,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--pr-sweep",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="walk the full Ward merge order (finest -> 2 clusters), recording "
         "recall/precision/f1/jaccard/detection and epsilon at every level; "
@@ -765,7 +986,7 @@ def main() -> None:
     # --- collective-bank encoder (the modular CollectiveBankDetector algorithm) ---
     ap.add_argument(
         "--use-bank",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="also fit the modular collective filter-bank (Chebyshev bank + "
         "confusability) and add its target subspace as an encoder, scored by the "
@@ -773,7 +994,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--bank-only",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="skip the legacy structural/joint encoders; run only the collective "
         "bank (implies --use-bank).",
@@ -860,7 +1081,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--diagnostics",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="write per-community diagnostic plots + CSV (Elliptic-style "
         "detected-vs-missed by size/conductance/density/mbar1/overlap, plus the "
@@ -954,10 +1175,14 @@ def main() -> None:
     # large com-Amazon graph; detection is still evaluated over all gangs.
     gang_tr, norm_tr = gang_tr[: args.max_retain], norm_tr[: args.max_retain]
     retain = gang_tr + norm_tr
-    eval_patterns = gangs + norm_te
+    # Selectivity control: random size-matched connected sets that were never fitted
+    # on.  The bank fits on gangs only, so with --bank-only every normal qualifies;
+    # the legacy encoders consume ``norm_tr``, so there only the held-out half does.
+    control_sets = normals if args.bank_only else norm_te
     LOGGER.info(
         f"  fitting theta on {len(gang_tr)} gangs + {len(norm_tr)} normals; "
-        f"evaluating detection over all {len(gangs)} gangs"
+        f"evaluating detection over all {len(gangs)} gangs "
+        f"({len(control_sets)} held-out random sets as the selectivity control)"
     )
 
     graph = build_graph_obj(A, X, y)
@@ -1045,36 +1270,48 @@ def main() -> None:
             eval_gangs=gangs,
             top5_gangs=top5_patterns,
             args=args,
+            control_sets=control_sets,
         )
         for name, basis in encoders
     ]
 
     out_json = args.out / f"gang_detection_{args.dataset}.json"
-    out_json.write_text(
-        json.dumps(
-            {
-                "dataset": args.dataset,
-                "n_nodes": graph.num_nodes,
-                "n_edges": int(graph.edge_index.shape[1]),
-                "n_gangs": len(gangs),
-                "epsilon": args.epsilon,
-                "coarsening_method": args.coarsening_method,
-                # strip the internal per-community arrays (kept in the diagnostics CSV)
-                "encoders": [
-                    {k: v for k, v in r.items() if not k.startswith("_")} for r in rows
-                ],
-            },
-            indent=2,
+
+    def _dump_report() -> None:
+        """Write the JSON report; called after the diagnostics enrich ``rows``."""
+        out_json.write_text(
+            json.dumps(
+                {
+                    "dataset": args.dataset,
+                    "n_nodes": graph.num_nodes,
+                    "n_edges": int(graph.edge_index.shape[1]),
+                    "n_gangs": len(gangs),
+                    "n_communities_total": (
+                        len(all_communities) if all_communities is not None else None
+                    ),
+                    "epsilon": args.epsilon,
+                    "coarsening_method": args.coarsening_method,
+                    "ward_stop": args.ward_stop,
+                    "threshold": args.threshold,
+                    # strip the internal per-community arrays (kept in the CSVs)
+                    "encoders": [
+                        {k: v for k, v in r.items() if not k.startswith("_")}
+                        for r in rows
+                    ],
+                },
+                indent=2,
+            )
+            + "\n"
         )
-        + "\n"
-    )
+
+    _dump_report()  # early write so a crash in the panels still leaves a report
 
     # --- per-community diagnostics (reuse each encoder's coarsening; no re-coarsen) --
     if args.diagnostics:
         overlap_src = all_communities if all_communities is not None else gang_sets
         membership = membership_counts(overlap_src, graph.num_nodes)
         for r in rows:
-            community_diagnostics(
+            df_diag = community_diagnostics(
                 r["encoder"],
                 r["_per_gang"],
                 gang_sets,
@@ -1085,6 +1322,14 @@ def main() -> None:
                 args,
                 args.out,
             )
+            # Elliptic-style PR / selectivity / conductance panels on the SAME
+            # coarsening; the scalars go back into the JSON report.
+            r.update(
+                elliptic_style_panels(
+                    r["encoder"], r, df_diag, adjacency, gang_sets, args, args.out
+                )
+            )
+        _dump_report()  # re-write with the panel scalars folded in
 
     # --- full incremental Ward PR-sweep (every metric at every coarsening level) --
     if args.pr_sweep:
