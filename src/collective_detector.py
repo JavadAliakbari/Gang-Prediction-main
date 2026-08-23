@@ -90,8 +90,26 @@ class DetectorConfig:
     #                     class: each step is d small (K+1)x(K+1) eigenproblems,
     #                     heads come out orthogonal per channel by construction.
     #                     Tens of eigensolves instead of hundreds of epochs.
+    #   "aeq"         -- the signal-to-confusion generalized eigenproblem
+    #                    A_eq w = lambda (H + rho I) w with A_eq = Bbar(Bbar^T
+    #                    Bbar + alpha I)^{-1} Bbar^T and H the group-size
+    #                    normalized mean confusability.  One eigendecomposition,
+    #                    global optimum, still informative when m > d (where
+    #                    lambda_min is identically 0), and every retained
+    #                    direction carries an interpretable capture-per-
+    #                    confusability eigenvalue.
     collective_solver: str = "gradient"
     pencil_beta: float = 0.0  # beta of the closed-form solver
+    # --- A_eq pencil (collective_solver="aeq") -------------------------------
+    aeq_alpha: float = 1e-3  # ridge inside A_eq (0+ = projector onto span Bbar)
+    aeq_rho: float = 1e-3  # ridge on H; keeps the ratio finite on ker H
+    aeq_width: int = 0  # target width d (0 = m, one per training group)
+    aeq_lambda_floor: float = 0.0  # drop directions with lambda_k below this
+    aeq_reweight_iters: int = 0  # >0: reweight H towards the worst-case chi
+    aeq_kappa: float = 5.0  # sharpness of the reweighting softmax
+    # "relative": rho is a multiple of the mean eigenvalue tr(H)/r (scale-free
+    # across graphs); "absolute": rho as written
+    aeq_rho_scale: str = "relative"
     trace_ratio_iters: int = 40  # iterations of the trace-ratio solver
     # multi-graph training: "sample" (one graph per epoch, stochastic), "mean"
     # (average over all graphs, deterministic) or "min" (worst graph, maximin)
@@ -278,6 +296,7 @@ class CollectiveBankDetector:
         *,
         label_y=None,
         label_idx=None,
+        signal_patterns=None,
     ) -> "CollectiveBankDetector":
         """Learn the filter bank ``Theta*`` on one or more training graphs.
 
@@ -294,6 +313,12 @@ class CollectiveBankDetector:
           the union of the graphs' optimal directions is a valid target on any
           of them.
 
+        ``signal_patterns`` (``collective_solver="aeq"`` only) are extra groups
+        whose indicators widen ``A_eq``'s signal span -- a list for a single
+        graph, or a ``{day_label: list}`` mapping for several.  ``A_eq``'s rank
+        is the number of signal groups, so without them the target can be
+        neither wider than ``m`` nor able to hold a group it never saw.
+
         ``label_y`` / ``label_idx`` optionally attach a supervised node head
         (config ``label_weight`` > 0) trained jointly with the filter; like the
         negative sampler it is a single-graph feature.
@@ -302,21 +327,43 @@ class CollectiveBankDetector:
         c = self.config
         specs = self._as_day_specs(days, train_patterns)
 
-        if c.collective_solver == "closed-form":
-            from src.margin_pencil import collective_pencil_theta
+        if c.collective_solver in ("closed-form", "aeq"):
+            from src.margin_pencil import aeq_pencil_theta, collective_pencil_theta
 
             thetas, reports = [], {}
             for lbl, d, pats, _te in specs:
-                th, rep = collective_pencil_theta(
-                    d.a_hat,
-                    d.adjacency,
-                    d.X,
-                    pats,
-                    degree=c.degree,
-                    tau=c.tau,
-                    beta=c.pencil_beta,
-                    basis=c.basis,
-                )
+                if c.collective_solver == "aeq":
+                    sig = (signal_patterns.get(lbl)
+                           if isinstance(signal_patterns, dict) else signal_patterns)
+                    th, rep = aeq_pencil_theta(
+                        d.a_hat,
+                        d.adjacency,
+                        d.X,
+                        pats,
+                        signal_patterns=sig,
+                        degree=c.degree,
+                        tau=c.tau,
+                        alpha=c.aeq_alpha,
+                        rho=c.aeq_rho,
+                        width=c.aeq_width,
+                        lambda_floor=c.aeq_lambda_floor,
+                        reweight_iters=c.aeq_reweight_iters,
+                        kappa=c.aeq_kappa,
+                        rho_scale=c.aeq_rho_scale,
+                        beta=c.pencil_beta,
+                        basis=c.basis,
+                    )
+                else:
+                    th, rep = collective_pencil_theta(
+                        d.a_hat,
+                        d.adjacency,
+                        d.X,
+                        pats,
+                        degree=c.degree,
+                        tau=c.tau,
+                        beta=c.pencil_beta,
+                        basis=c.basis,
+                    )
                 thetas.append(th)
                 reports[lbl] = rep
             # one graph -> the single solve's own coefficients
@@ -387,7 +434,7 @@ class CollectiveBankDetector:
         """Coarsening target ``R = span(Z)`` from the learned filter (needs :meth:`fit`)."""
 
         c = self.config
-        if c.collective_solver == "closed-form":
+        if c.collective_solver in ("closed-form", "aeq"):
             from src.margin_pencil import apply_dictionary_theta
 
             if self.pencil_theta_ is None:
@@ -419,7 +466,7 @@ class CollectiveBankDetector:
         """Per-gang retained ``M_tau``-energy (capture) of ``patterns``."""
 
         c = self.config
-        if c.collective_solver == "closed-form":
+        if c.collective_solver in ("closed-form", "aeq"):
             # no filter bank exists; measure the target subspace itself
             from src.run_collective_bank_detection import _basis_retained_energy
 

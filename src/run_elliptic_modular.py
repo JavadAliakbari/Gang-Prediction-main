@@ -421,7 +421,7 @@ def main() -> None:
 
     ap.add_argument(
         "--collective-solver",
-        choices=["gradient", "closed-form", "trace-ratio"],
+        choices=["gradient", "closed-form", "trace-ratio", "aeq"],
         default="gradient",
         help="'gradient' = ascend --capture-objective (soft-min lambda_min) on "
         "the filter bank; 'closed-form' = Theta_beta = (G + beta*W_all)^{-1} Bhat, "
@@ -433,7 +433,87 @@ def main() -> None:
         "BANK class (so it generalizes) but replaces Adam with a Dinkelbach "
         "iteration: each step is d small (K+1)x(K+1) eigenproblems and the heads "
         "come out orthogonal per channel, so it needs tens of eigensolves rather "
-        "than hundreds of epochs.",
+        "than hundreds of epochs.  'aeq' solves the signal-to-confusion "
+        "generalized eigenproblem A_eq w = lambda (H + rho I) w instead of the "
+        "max-min certificate: A_eq = Bbar (Bbar^T Bbar + alpha I)^{-1} Bbar^T is "
+        "the (nearly) group-indicator projector, H the |S_j|-1 normalized mean "
+        "confusability, and each retained direction has an interpretable capture-"
+        "per-confusability eigenvalue.  One eigendecomposition, global optimum, "
+        "and unlike lambda_min it stays informative when m > d.",
+    )
+    # --- A_eq pencil (--collective-solver aeq) ---
+    ap.add_argument(
+        "--aeq-alpha",
+        type=float,
+        default=1e-3,
+        help="ridge inside A_eq; alpha -> 0 makes A_eq the projector onto the "
+        "realizable group-indicator span (treats independent group combinations "
+        "equally instead of weighting by how strongly a group appears). Keep it "
+        "small but nonzero when the indicators are nearly dependent.",
+    )
+    ap.add_argument(
+        "--aeq-rho",
+        type=float,
+        default=1e-3,
+        help="ridge on the aggregate confusability H; prevents unstable ratios "
+        "where H has a null space",
+    )
+    ap.add_argument(
+        "--aeq-width",
+        type=int,
+        default=0,
+        help="target width d (0 = one direction per training gang, matching the "
+        "closed-form solver's width)",
+    )
+    ap.add_argument(
+        "--aeq-lambda-floor",
+        type=float,
+        default=0.0,
+        help="drop directions whose distinguishability lambda_k falls below this "
+        "(0 = keep all --aeq-width); the generalized eigenvalues quantify how "
+        "many filters are actually useful",
+    )
+    ap.add_argument(
+        "--aeq-reweight-iters",
+        type=int,
+        default=0,
+        help=">0 walks the mean confusability penalty towards the worst case: "
+        "solve, evaluate every chi_j, set omega_j = softmax(kappa*chi_j), rebuild "
+        "H and solve again.  Each iteration is still one eigenproblem.",
+    )
+    ap.add_argument(
+        "--aeq-signal-communities",
+        type=int,
+        default=0,
+        help="widen A_eq's signal operator with this many LABEL-FREE community "
+        "indicators (k-means on the smoothed features).  A_eq's rank is the "
+        "number of signal groups, so with gangs alone the target can be neither "
+        "wider than m nor able to hold a gang it never saw -- col(A_eq) is "
+        "exactly the training gangs' indicator span.  The extra groups enter "
+        "A_eq only; H stays built from the training gangs.",
+    )
+    ap.add_argument(
+        "--aeq-signal-normals",
+        action="store_true",
+        default=False,
+        help="also add the licit components (--max-normal-patterns) to A_eq's "
+        "signal operator",
+    )
+    ap.add_argument(
+        "--aeq-rho-scale",
+        choices=["relative", "absolute"],
+        default="relative",
+        help="'relative' reads --aeq-rho as a multiple of the mean nonzero "
+        "eigenvalue tr(H)/rank(H), so the ridge means the same thing on every "
+        "day; 'absolute' "
+        "uses it as written",
+    )
+    ap.add_argument(
+        "--aeq-kappa",
+        type=float,
+        default=5.0,
+        help="sharpness of the --aeq-reweight-iters softmax (larger = closer to "
+        "the maximum over groups)",
     )
     ap.add_argument(
         "--train-days",
@@ -651,7 +731,7 @@ def main() -> None:
     ap.add_argument("--epsilon", type=float, default=1.0)
     ap.add_argument("--max-levels", type=int, default=10)
 
-    ap.add_argument("--ward-stop", choices=["epsilon", "f1"], default="f1")
+    ap.add_argument("--ward-stop", choices=["epsilon", "f1"], default="epsilon")
     ap.add_argument("--ward-num-cuts", type=int, default=500)
     ap.add_argument("--threshold", type=float, default=0.51)
     # --- Smooth Dual Ward (coarsening_method="dual-ward"; see src.smooth_dual_ward) ---
@@ -788,6 +868,13 @@ def main() -> None:
         capture_objective=args.capture_objective,
         collective_solver=args.collective_solver,
         pencil_beta=args.pencil_beta,
+        aeq_alpha=args.aeq_alpha,
+        aeq_rho=args.aeq_rho,
+        aeq_width=args.aeq_width,
+        aeq_lambda_floor=args.aeq_lambda_floor,
+        aeq_reweight_iters=args.aeq_reweight_iters,
+        aeq_kappa=args.aeq_kappa,
+        aeq_rho_scale=args.aeq_rho_scale,
         trace_ratio_iters=args.trace_ratio_iters,
         day_aggregate=args.day_aggregate,
         label_weight=args.label_weight,
@@ -867,7 +954,34 @@ def main() -> None:
         f"   |   coarsened + reported on: {day_specs[-1][0]}"
     )
 
-    det.fit(day_specs)
+    # A_eq signal enrichment: extra indicator columns per training graph.  The
+    # rank of A_eq is the number of signal groups, so this is what lets the
+    # target be wider than m and stop being a basis for these gangs specifically.
+    signal_patterns = None
+    if cfg.collective_solver == "aeq" and (
+        args.aeq_signal_communities > 0 or args.aeq_signal_normals
+    ):
+        from src.margin_pencil import community_patterns
+
+        signal_patterns = {}
+        for lbl, d_data, _d_train, _d_test in day_specs:
+            extra = []
+            if args.aeq_signal_communities > 0:
+                extra += community_patterns(
+                    d_data.a_hat,
+                    d_data.X,
+                    n_clusters=args.aeq_signal_communities,
+                    seed=args.seed,
+                )
+            if args.aeq_signal_normals and lbl == day_specs[-1][0]:
+                extra += normals
+            signal_patterns[lbl] = extra
+        LOGGER.info(
+            "  A_eq signal groups: "
+            + ", ".join(f"{k}: +{len(v)}" for k, v in signal_patterns.items())
+        )
+
+    det.fit(day_specs, signal_patterns=signal_patterns)
 
     # Every training group is coarsened and scored, not just the reported one:
     # with several graphs the single-group table hides how the shared filter
@@ -914,7 +1028,39 @@ def main() -> None:
     }
 
     fit = result["fit"]
-    if cfg.collective_solver == "closed-form":
+    if cfg.collective_solver == "aeq":
+        LOGGER.info(
+            f"    A_eq signal-to-confusion pencil (alpha={cfg.aeq_alpha:g}, "
+            f"rho={cfg.aeq_rho:g}[{cfg.aeq_rho_scale}]={fit['rho_used']:.3g}, "
+            f"d={fit['width']}, P={fit['dictionary_dim']:,}, "
+            f"rank={fit['dictionary_rank']:,}):"
+        )
+        ev = fit["eigenvalues"]
+        LOGGER.info(
+            f"      distinguishability lambda_k: max {max(ev):.4g}  "
+            f"median {float(np.median(ev)):.4g}  min {min(ev):.4g}"
+        )
+        LOGGER.info(
+            f"      signal groups: {fit['n_signal']} "
+            f"({fit['n_extra_signal']} beyond the training gangs)"
+        )
+        LOGGER.info(
+            f"      certificate: lambda_min(Gamma) {fit['lambda_min_Gamma']:.6g} "
+            f"(Theorem A ceiling {fit['lambda_min_N0']:.6g})  "
+            f"max chi {fit['chi_subspace_max']:.4g}  "
+            f"margin {fit['margin']:.6g}  tr(Gamma) {fit['trace_Gamma']:.4g}"
+        )
+        if cfg.aeq_reweight_iters > 0:
+            h = fit["reweight_history"]
+            LOGGER.info(
+                "      reweighting: "
+                + "  ".join(
+                    f"[{r['iter']}] chi_max={r['chi_max']:.3g} "
+                    f"margin={r['margin']:.4g}"
+                    for r in h
+                )
+            )
+    elif cfg.collective_solver == "closed-form":
         LOGGER.info(
             f"    closed-form collective solve (beta={cfg.pencil_beta:g}, "
             f"P={fit['dictionary_dim']:,}, rank={fit['dictionary_rank']:,}):"
@@ -928,6 +1074,11 @@ def main() -> None:
             f"      optimality gap (headroom for ANY minimax): "
             f"{fit['optimality_gap']:.6g}   max chi {max(fit['chi_cross_max']):.3e} "
             f"<= bound {max(fit['chi_bound']):.3e}"
+        )
+        LOGGER.info(
+            f"      certificate: lambda_min(Gamma) {fit['lambda_min_Gamma']:.6g}  "
+            f"max chi {fit['chi_subspace_max']:.4g}  margin {fit['margin']:.6g}  "
+            f"tr(Gamma) {fit['trace_Gamma']:.4g}"
         )
     else:
         LOGGER.info(
@@ -1188,6 +1339,8 @@ def main() -> None:
         # A/B triple instead (N_beta <= Gamma <= N_0) and its optimality gap
         "lambda_min_init": fit.get("init_objective", fit.get("lambda_min_N_beta")),
         "lambda_min_final": fit.get("objective", fit.get("lambda_min_Gamma")),
+        # the closed-form / A_eq solvers report the shared max-min certificate
+        # (lambda_min(Gamma), max_j chi_j, margin) instead of a training trace
         "closed_form": {
             k: fit[k]
             for k in (
@@ -1197,10 +1350,36 @@ def main() -> None:
                 "optimality_gap",
                 "sandwich_ok",
                 "beta",
+                "chi_subspace_max",
+                "margin",
+                "trace_Gamma",
             )
             if k in fit
         }
         or None,
+        "aeq": (
+            {
+                k: fit[k]
+                for k in (
+                    "eigenvalues",
+                    "width",
+                    "alpha",
+                    "rho",
+                    "rho_used",
+                    "rho_scale",
+                    "kappa",
+                    "reweight_iters",
+                    "reweight_history",
+                    "n_signal",
+                    "n_extra_signal",
+                    "capture",
+                    "chi_subspace",
+                )
+                if k in fit
+            }
+            if cfg.collective_solver == "aeq"
+            else None
+        ),
         "coarsening": {
             "n_original": co.n_original,
             "n_coarse": co.n_coarse,
