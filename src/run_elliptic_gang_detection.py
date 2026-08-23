@@ -263,19 +263,34 @@ def random_connected_baseline(A_scipy, sizes, rng, samples_per_size=1):
 # ---------------------------------------------------------------------------
 
 
-def coarsen_and_count(name, basis, *, adjacency, node_labels, eval_patterns, args):
+def coarsen_and_count(
+    name,
+    basis,
+    *,
+    adjacency,
+    node_labels,
+    eval_patterns,
+    args,
+    method=None,
+    dual_ward_alpha=None,
+    variant=None,
+):
     """Coarsen with R=span(basis) and count detected gangs / normals."""
 
+    method = method or args.coarsening_method
     coarsening = loukas_coarsen_pytorch(
         adjacency,
         basis,
         reduction=args.reduction,
         epsilon=args.epsilon,  # option 2: finite -> label-free RSA cost gate
         max_levels=args.max_levels,
-        method=args.coarsening_method,
+        method=method,
         max_contraction_size=args.max_contraction_size,
         max_cluster_size=args.linkage_max_size,
         epsilon_ramp_levels=(args.max_levels if args.epsilon_ramp else None),
+        dual_ward_alpha=(0.0 if dual_ward_alpha is None else float(dual_ward_alpha)),
+        dual_ward_tau=args.dual_ward_tau,
+        dual_ward_max_size=args.dual_ward_max_size,
     )
     _, by_label = evaluate_loukas_patterns(
         eval_patterns,
@@ -287,6 +302,11 @@ def coarsen_and_count(name, basis, *, adjacency, node_labels, eval_patterns, arg
     normal = by_label.get("normal", {})
     return {
         "encoder": name,
+        "variant": variant or method,
+        "method": method,
+        "dual_ward_alpha": (
+            None if dual_ward_alpha is None else float(dual_ward_alpha)
+        ),
         "basis_dim": int(basis.shape[1]),
         "n_original": coarsening.n_original,
         "n_coarse": coarsening.n_coarse,
@@ -305,7 +325,9 @@ def coarsen_and_count(name, basis, *, adjacency, node_labels, eval_patterns, arg
     }
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """CLI shared by this runner and :mod:`src.run_dual_ward_epsilon_sweep`."""
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data-dir", default="data/elliptic_actors", type=Path)
     ap.add_argument("--day-start", type=int, default=24)
@@ -381,6 +403,7 @@ def main() -> None:
             "kmeans",
             "linkage",
             "ward",
+            "dual-ward",
         ],
         default="ward",
         help="local-variation candidate family. 'edges' (default, option 2) is "
@@ -403,6 +426,33 @@ def main() -> None:
         default=4,
         help="super-node size cap for --coarsening-method linkage (curbs single-"
         "linkage chaining so a collapsed gang stays pure; 0 = uncapped)",
+    )
+    # Smooth Dual Ward (src/smooth_dual_ward.py) comparison knobs
+    ap.add_argument(
+        "--dual-ward-alphas",
+        type=str,
+        default="0,0.5,1",
+        help="comma-separated alpha values for the Smooth Dual Ward comparison. "
+        "alpha=0 -> fully normalized score sigma_DW in [0,1] (mass-free, "
+        "conductance-like); alpha=1 -> the raw dual-Ward increment Delta_DW; "
+        "in between -> Delta_DW / m_tau^(1-alpha). Empty string disables the "
+        "dual-ward comparison",
+    )
+    ap.add_argument(
+        "--dual-ward-tau",
+        type=float,
+        default=0.1,
+        help="screening level of the dual metric M_tau = L_sym + tau I used by "
+        "Smooth Dual Ward (must be > 0; it keeps the denominator m_tau positive)",
+    )
+    ap.add_argument(
+        "--dual-ward-max-size",
+        type=int,
+        default=0,
+        help="super-node cardinality cap for Smooth Dual Ward (0 = uncapped, the "
+        "default). Ward chains to comparable super-node sizes on this graph, so "
+        "the cap is NOT needed for correctness -- it only bounds the pure-Python "
+        "agglomeration's worst-case cost when many variants are run in one pass",
     )
     # collective-bank encoder hyper-parameters
     ap.add_argument(
@@ -455,12 +505,11 @@ def main() -> None:
     )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="results/elliptic_gang_detection", type=Path)
-    args = ap.parse_args()
+    return ap
 
-    os.makedirs(args.out, exist_ok=True)
-    rng = np.random.default_rng(args.seed)
-    torch.manual_seed(args.seed)
-    device = torch.device("cpu")
+
+def prepare_dataset(args, rng) -> SimpleNamespace:
+    """Load the day window, build the graph, and split gangs / normals."""
 
     print(f"=== Elliptic++ gang detection | days {args.day_start}-{args.day_end} ===")
     A_unw, A_w, cls, nodes_df = build_graph(args.data_dir, args.day_start, args.day_end)
@@ -494,6 +543,29 @@ def main() -> None:
     )
 
     normalized, adjacency = graph_operators(graph)
+    return SimpleNamespace(
+        A_unw=A_unw,
+        cls=cls,
+        graph=graph,
+        normalized=normalized,
+        adjacency=adjacency,
+        gang_sets=gang_sets,
+        gangs=gangs,
+        normals=normals,
+        gang_train=gang_train,
+        normal_train=normal_train,
+        normal_test=normal_test,
+        retain=retain,
+        eval_patterns=eval_patterns,
+    )
+
+
+def fit_encoders(args, data) -> list:
+    """Fit the four linear encoders and return ``[(name, basis), ...]``."""
+
+    graph, normalized, adjacency = data.graph, data.normalized, data.adjacency
+    retain, gang_train, normal_train = data.retain, data.gang_train, data.normal_train
+    cls = data.cls
     Xf = graph.x.to(device=normalized.device, dtype=normalized.dtype)
     total_width = args.structural_width + args.embed_dim
     common = dict(
@@ -565,7 +637,6 @@ def main() -> None:
     X2 = (X2 - X2.mean(0, keepdim=True)) / X2.std(0, keepdim=True).clamp_min(1e-8)
     bank_fit = fit_collective_bank(
         [("train", normalized, adjacency, gang_train, X2)],
-        # Xf,
         degree=args.degree,
         epochs=bank_epochs,
         learning_rate=args.learning_rate,
@@ -585,36 +656,67 @@ def main() -> None:
         normalized,
         adjacency,
         X2,
-        # Xf,
         bank_fit["theta"],
         args.ridge,
         gang_train,
         tau=args.bank_tau,
     )
 
-    encoders = [
+    return [
         ("structural", structural_basis),
         ("raw-feature", feature_basis),
         ("joint", joint_basis),
         ("collective-bank", bank_basis),
     ]
+
+
+def main() -> None:
+    ap = build_arg_parser()
+    args = ap.parse_args()
+
+    os.makedirs(args.out, exist_ok=True)
+    rng = np.random.default_rng(args.seed)
+    torch.manual_seed(args.seed)
+
+    data = prepare_dataset(args, rng)
+    graph = data.graph
+    adjacency = data.adjacency
+    gang_sets = data.gang_sets
+    gangs = data.gangs
+    eval_patterns = data.eval_patterns
+
+    encoders = fit_encoders(args, data)
     eps_desc = "inf" if args.epsilon == float("inf") else f"{args.epsilon:g}"
-    print(
-        f"\n  Coarsening (method={args.coarsening_method}, epsilon={eps_desc}, "
-        f"max_levels={args.max_levels}, reduction-cap={args.reduction:.0%}) "
-        f"and counting detected gangs …"
-    )
-    rows = [
-        coarsen_and_count(
-            name,
-            basis,
-            adjacency=adjacency,
-            node_labels=graph.y,
-            eval_patterns=eval_patterns,
-            args=args,
-        )
-        for name, basis in encoders
+    # Coarsening variants: the configured baseline (normally 'ward') plus one
+    # Smooth Dual Ward run per requested alpha.  alpha=0 and alpha=1 are the two
+    # endpoints of the smooth family (normalized sigma_DW vs raw Delta_DW).
+    dual_alphas = [
+        float(a) for a in str(args.dual_ward_alphas).split(",") if a.strip() != ""
     ]
+    variants = [(args.coarsening_method, args.coarsening_method, None)]
+    variants += [(f"dual-ward a={a:g}", "dual-ward", a) for a in dual_alphas]
+    print(
+        f"\n  Coarsening (baseline={args.coarsening_method}, epsilon={eps_desc}, "
+        f"max_levels={args.max_levels}, reduction-cap={args.reduction:.0%}, "
+        f"dual_ward_tau={args.dual_ward_tau:g}) and counting detected gangs …"
+    )
+    rows = []
+    for name, basis in encoders:
+        for variant, method, alpha in variants:
+            print(f"    {name:<16} / {variant} …", flush=True)
+            rows.append(
+                coarsen_and_count(
+                    name,
+                    basis,
+                    adjacency=adjacency,
+                    node_labels=graph.y,
+                    eval_patterns=eval_patterns,
+                    args=args,
+                    method=method,
+                    dual_ward_alpha=alpha,
+                    variant=variant,
+                )
+            )
 
     # ---- subspace capability: oracle epsilon of gangs vs random-connected ----
     print(
@@ -623,23 +725,28 @@ def main() -> None:
     )
     gang_sizes = [len(C) for C in gang_sets]
     rand_sets = random_connected_baseline(
-        A_unw, gang_sizes, rng, samples_per_size=args.oracle_baseline_samples
+        data.A_unw, gang_sizes, rng, samples_per_size=args.oracle_baseline_samples
     )
-    for r, (name, basis) in zip(rows, encoders):
+    for name, basis in encoders:
         prep = prepare_subspace(adjacency, basis)
         eps_gang, per_gang = set_costs(prep, gang_sets)
         eps_rand, per_rand = set_costs(prep, rand_sets)
         # ratio of typical per-set cost: <1 => subspace localizes gangs vs null
         med_gang = float(np.median(per_gang)) if per_gang.size else 0.0
         med_rand = float(np.median(per_rand)) if per_rand.size else 0.0
-        r["oracle_epsilon"] = eps_gang
-        r["oracle_epsilon_random"] = eps_rand
-        r["oracle_cost_per_gang_median"] = med_gang
-        r["oracle_cost_per_random_median"] = med_rand
-        r["oracle_gang_vs_random_ratio"] = (
-            med_gang / med_rand if med_rand > 0 else float("nan")
-        )
-        r["oracle_cost_top5_gangs"] = [float(c) for c in np.sort(per_gang)[::-1][:5]]
+        for r in rows:
+            if r["encoder"] != name:
+                continue
+            r["oracle_epsilon"] = eps_gang
+            r["oracle_epsilon_random"] = eps_rand
+            r["oracle_cost_per_gang_median"] = med_gang
+            r["oracle_cost_per_random_median"] = med_rand
+            r["oracle_gang_vs_random_ratio"] = (
+                med_gang / med_rand if med_rand > 0 else float("nan")
+            )
+            r["oracle_cost_top5_gangs"] = [
+                float(c) for c in np.sort(per_gang)[::-1][:5]
+            ]
 
     # ---- report -----------------------------------------------------------
     out_json = args.out / f"gang_detection_d{args.day_start}-{args.day_end}.json"
@@ -656,6 +763,8 @@ def main() -> None:
                 "epsilon": args.epsilon,
                 "max_levels": args.max_levels,
                 "coarsening_method": args.coarsening_method,
+                "dual_ward_alphas": dual_alphas,
+                "dual_ward_tau": args.dual_ward_tau,
                 "threshold": args.threshold,
                 "encoders": rows,
             },
@@ -672,15 +781,20 @@ def main() -> None:
     )
     print("=" * 78)
     hdr = (
-        f"{'encoder':<12} {'n_coarse':>9} {'lvl':>4} {'eps':>6} "
+        f"{'encoder':<12} {'coarsener':<16} {'n_coarse':>9} {'lvl':>4} {'eps':>6} "
         f"{'gangs_detected':>15} {'det_rate':>9} {'mean_recall':>12} "
         f"{'mean_prec':>10} {'normal_FP':>10}"
     )
     print(hdr)
     print("-" * len(hdr))
+    last_encoder = None
     for r in rows:
+        if last_encoder is not None and r["encoder"] != last_encoder:
+            print("-" * len(hdr))
+        last_encoder = r["encoder"]
         print(
-            f"{r['encoder']:<12} {r['n_coarse']:>9,} {r['n_levels']:>4} "
+            f"{r['encoder']:<12} {r['variant']:<16} {r['n_coarse']:>9,} "
+            f"{r['n_levels']:>4} "
             f"{r['epsilon_actual']:>6.2f} "
             f"{r['gangs_detected']:>7}/{r['gangs_total']:<7} "
             f"{r['gang_detection_rate']:>8.1%} "
@@ -693,7 +807,12 @@ def main() -> None:
         "(recall>thr AND precision>thr). 'eps' is the cumulative RSA cost actually "
         "spent (the label-free stop). 'normal_FP' = licit components that also "
         "collapse (lower is better). Precision/recall are reported for evaluation "
-        "only; the coarsening decision uses epsilon, never the gang labels."
+        "only; the coarsening decision uses epsilon, never the gang labels. "
+        "'coarsener' contrasts the plain Ward increment with Smooth Dual Ward at "
+        "alpha=0 (normalized sigma_DW), alpha=1 (raw Delta_DW) and any "
+        "intermediate mixture; dual-ward only merges graph-adjacent clusters, so "
+        "on a disconnected graph it bottoms out at the component count and its "
+        "n_coarse can exceed the requested target."
     )
 
     # ---- subspace capability table ---------------------------------------
@@ -709,7 +828,11 @@ def main() -> None:
     )
     print(cap_hdr)
     print("-" * len(cap_hdr))
-    for r in rows:
+    seen_encoders: set = set()
+    for r in rows:  # one line per encoder (the diagnostic is coarsener-agnostic)
+        if r["encoder"] in seen_encoders:
+            continue
+        seen_encoders.add(r["encoder"])
         top3 = ", ".join(f"{c:.2g}" for c in r["oracle_cost_top5_gangs"][:3])
         print(
             f"{r['encoder']:<12} {r['oracle_epsilon']:>10.3f} "

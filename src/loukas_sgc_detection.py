@@ -702,6 +702,59 @@ def _local_variation_cost(
     return float(cost.clamp_min(0.0))
 
 
+def _realized_partition_sigma(
+    adjacency: torch.Tensor,
+    A: torch.Tensor,
+    groups: torch.Tensor,
+    tau: float = 0.0,
+) -> float:
+    r"""Vectorized ``sqrt(sum_C c(C))`` over the supernodes of ``groups``.
+
+    Same quantity the per-set :func:`_local_variation_cost` returns, summed over
+    every supernode, but computed globally in ``O(E + N d)`` instead of building
+    a dense ``|C| x |C|`` local Laplacian per set.  This matters for the one-shot
+    families (``ward``, ``kmeans``, ``dual-ward``), which can emit a single very
+    large supernode -- the dense per-set path is quadratic in that size.
+
+    Using ``R_C = A_C - 1 p_C^T A_C`` (a rank-one shift), the Dirichlet part is
+    unchanged by the shift, so
+
+        trace(R^T L_C R) = sum_{(i,j) internal to C} w_ij ||A_i - A_j||^2,
+
+    and the Remark C.30 screening term is
+    ``tau * sum_{i in C} ||A_i - abar_C||^2`` with the degree-weighted centroid
+    ``abar_C = sum_{i in C} (d_i/ sum_C d) A_i``.
+    """
+
+    n_groups = int(groups.max().item()) + 1
+    counts = torch.bincount(groups, minlength=n_groups)
+    energy = torch.zeros(n_groups, dtype=A.dtype, device=A.device)
+
+    indices = adjacency.indices()
+    values = adjacency.values()
+    rows, cols = indices[0], indices[1]
+    keep = (rows < cols) & (groups[rows] == groups[cols])  # internal edges once
+    if keep.any():
+        r, c, w = rows[keep], cols[keep], values[keep]
+        diff = (A[r] - A[c]).square().sum(dim=1)
+        energy.index_add_(0, groups[r], w * diff)
+
+    if tau:
+        degree = _degrees(adjacency)
+        total = torch.zeros(n_groups, dtype=A.dtype, device=A.device)
+        total.index_add_(0, groups, degree)
+        weighted = torch.zeros(n_groups, A.shape[1], dtype=A.dtype, device=A.device)
+        weighted.index_add_(0, groups, degree.unsqueeze(1) * A)
+        centroid = weighted / total.clamp_min(torch.finfo(A.dtype).eps).unsqueeze(1)
+        residual = (A - centroid[groups]).square().sum(dim=1)
+        energy.index_add_(0, groups, tau * residual)
+
+    divisor = (counts - 1).clamp_min(1).to(A.dtype)
+    per_set = (energy / divisor).clamp_min(0.0)
+    per_set = torch.where(counts >= 2, per_set, torch.zeros_like(per_set))
+    return float(per_set.sum().clamp_min(0.0).sqrt())
+
+
 def _capped_partition(
     adjacency: torch.Tensor,
     target_basis: torch.Tensor,
@@ -1019,19 +1072,7 @@ def _kmeans_partition(
     groups = _connected_subclusters(adjacency, labels)
 
     # Realized RSA cost: sum the Loukas local-variation cost over each supernode.
-    neighbors, weight = _adjacency_lists(adjacency)
-    degree = _degrees(adjacency)
-    eps = torch.finfo(A.dtype).eps
-    members_by_group: Dict[int, List[int]] = defaultdict(list)
-    for node, group in enumerate(groups.tolist()):
-        members_by_group[group].append(node)
-    sigma_sq = 0.0
-    for members in members_by_group.values():
-        if len(members) >= 2:
-            sigma_sq += _local_variation_cost(
-                members, A, degree, neighbors, weight, eps, tau
-            )
-    return groups, math.sqrt(sigma_sq)
+    return groups, _realized_partition_sigma(adjacency, A, groups, tau)
 
 
 def _ward_partition(
@@ -1132,19 +1173,95 @@ def _ward_partition(
 
     # Realized RSA cost: sum the Loukas local-variation cost over each supernode
     # (same accounting as _kmeans_partition, for comparability across methods).
-    neighbors, weight = _adjacency_lists(adjacency)
-    degree = _degrees(adjacency)
-    eps = torch.finfo(A.dtype).eps
-    members_by_group: Dict[int, List[int]] = defaultdict(list)
-    for node, group in enumerate(groups.tolist()):
-        members_by_group[group].append(node)
-    sigma_sq = 0.0
-    for members in members_by_group.values():
-        if len(members) >= 2:
-            sigma_sq += _local_variation_cost(
-                members, A, degree, neighbors, weight, eps, tau
-            )
-    return groups, math.sqrt(sigma_sq)
+    return groups, _realized_partition_sigma(adjacency, A, groups, tau)
+
+
+def _smooth_dual_ward_partition(
+    adjacency: torch.Tensor,
+    target_basis: torch.Tensor,
+    n_target: int,
+    sigma_max: float,
+    *,
+    alpha: float = 0.0,
+    dual_tau: float = 0.1,
+    dual_max_size: int = 0,
+    dual_embedding: str = "dual",
+    laplacian_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian,
+    tau: float = 0.0,
+) -> tuple[torch.Tensor, float]:
+    r"""Smooth Dual Ward agglomeration (see :mod:`src.smooth_dual_ward`).
+
+    Same contiguity-constrained agglomerative skeleton as :func:`_ward_partition`,
+    but the merge is scored in the *dual* screened metric and divided by the
+    structural cost the merge incurs:
+
+        s_alpha(A, B) = Delta_DW(A, B) / m_tau(A, B)^(1 - alpha),
+
+    with ``Delta_DW = (v_A v_B/(v_A+v_B))||mu_A - mu_B||^2 = ||U_t^T M_t g||^2``
+    the dual-Ward increment on the volume-weighted dual embedding, and
+    ``m_tau = g^T M_tau g = ell + tau`` the cut/volume cost of the same contrast
+    direction ``g_{A,B}``.  ``alpha = 1`` is the plain (dual) Ward increment,
+    ``alpha = 0`` is the fully normalized ``sigma_DW in [0, 1]`` -- a
+    conductance-like "fraction of the merge direction that lies in the target
+    subspace", which is indifferent to cluster mass and therefore does not drift
+    toward merging whatever is smallest.
+
+    ``dual_tau`` is the screening level of the *dual-Ward metric*
+    ``M_tau = L_sym + tau I`` and must be strictly positive (it is what keeps the
+    denominator away from zero); it is independent of the outer ``tau`` used for
+    the pipeline's RSA accounting.  As with ``"ward"``/``"kmeans"`` this is a
+    one-shot global solve, so ``sigma_max`` is ignored and the returned ``sigma``
+    is the *realized* Loukas local-variation cost of the resulting supernodes
+    (identical accounting to the other methods, so the reported cumulative
+    ``epsilon`` stays comparable).
+
+    Because only graph-adjacent clusters merge, a disconnected graph bottoms out
+    at one cluster per connected component; if that is above ``n_target`` the
+    achieved reduction is lower than requested (no artificial cross-component
+    links are added, unlike scikit-learn's Ward).
+
+    ``dual_max_size`` optionally caps the super-node cardinality (0 = uncapped).
+    It is a cost bound rather than a correctness fix: the harmonic mass factor
+    saturates at ``min(v_A, v_B)``, so classical Ward chains to comparable
+    super-node sizes on the same graph.
+
+    ``dual_embedding`` selects what the merge is scored against: ``"dual"`` (the
+    spec) uses ``M_tau U_tau``, ``"primal"`` uses ``U_tau``.  The latter removes
+    the ``M_tau`` high-pass, so the score telescopes to the residual of the same
+    ``U_tau`` that :func:`_exact_rsa_epsilon` measures rather than the residual of
+    its Laplacian-filtered image.
+    """
+
+    n = adjacency.shape[0]
+    if n <= n_target or adjacency.indices().numel() == 0:
+        return torch.arange(n, device=adjacency.device), 0.0
+
+    import numpy as np
+    from scipy.sparse import coo_matrix
+
+    from src.smooth_dual_ward import smooth_dual_ward
+
+    indices = adjacency.indices().cpu().numpy()
+    values = adjacency.values().cpu().numpy()
+    W = coo_matrix((values, (indices[0], indices[1])), shape=(n, n)).tocsr()
+    Z = target_basis.detach().cpu().to(torch.float64).numpy()
+
+    result = smooth_dual_ward(
+        W,
+        Z,
+        tau=float(dual_tau),
+        alpha=float(alpha),
+        n_clusters=max(1, min(int(n_target), n)),
+        build_full_tree=False,
+        max_cluster_size=int(dual_max_size),
+        embedding=str(dual_embedding),
+    )
+    groups = torch.as_tensor(result.labels_, dtype=torch.long, device=adjacency.device)
+    _, groups = torch.unique(groups, sorted=True, return_inverse=True)
+
+    # Realized RSA cost in the *pipeline's* metric, for cross-method comparability.
+    A = _l_orthonormalize(target_basis, laplacian_fn(adjacency))
+    return groups, _realized_partition_sigma(adjacency, A, groups, tau)
 
 
 @dataclass
@@ -1841,6 +1958,10 @@ def loukas_coarsen_pytorch(
     epsilon_ramp_levels: int | None = None,
     laplacian: str = "combinatorial",
     tau: float = 0.0,
+    dual_ward_alpha: float = 0.0,
+    dual_ward_tau: float = 0.1,
+    dual_ward_max_size: int = 0,
+    dual_ward_embedding: str = "dual",
 ) -> LoukasCoarseningResult:
     """Loukas Algorithm 1 using the supplied ``R=span(target_basis)``.
 
@@ -1873,6 +1994,14 @@ def loukas_coarsen_pytorch(
       their errors.  One-shot (like ``"kmeans"``) and connected by construction
       (unlike ``"kmeans"``, no post-hoc connectivity split is needed).  Requires
       scikit-learn and scipy.  See :func:`_ward_partition`.
+    * ``"dual-ward"`` -- Smooth Dual Ward: the same contiguity-constrained
+      agglomeration, but each merge is scored by
+      ``s_alpha = Delta_DW / m_tau^(1 - alpha)`` in the screened dual metric
+      ``M_tau = L_sym + dual_ward_tau I`` (:mod:`src.smooth_dual_ward`).
+      ``dual_ward_alpha = 1`` recovers a (volume-weighted) dual Ward increment;
+      ``dual_ward_alpha = 0`` uses the fully normalized ``sigma_DW in [0, 1]``,
+      which is scale-free in cluster mass and so behaves like a subspace-aware
+      conductance.  See :func:`_smooth_dual_ward_partition`.
 
     ``laplacian`` chooses the metric the RSA distortion is measured in:
     ``"combinatorial"`` (default) uses ``L = D - W`` (:func:`_laplacian`), while
@@ -1904,10 +2033,11 @@ def loukas_coarsen_pytorch(
         "kmeans",
         "linkage",
         "ward",
+        "dual-ward",
     ):
         raise ValueError(
             "method must be 'edges', 'neighborhood', 'capped', 'star', 'kmeans', "
-            "'linkage', or 'ward'"
+            "'linkage', 'ward', or 'dual-ward'"
         )
     if laplacian in ("combinatorial", "comb"):
         base_fn: Callable[[torch.Tensor], torch.Tensor] = _laplacian
@@ -1956,6 +2086,16 @@ def loukas_coarsen_pytorch(
     elif method == "ward":
         partition = partial(
             _ward_partition,
+            laplacian_fn=laplacian_fn,
+            tau=tau,
+        )
+    elif method == "dual-ward":
+        partition = partial(
+            _smooth_dual_ward_partition,
+            alpha=dual_ward_alpha,
+            dual_tau=dual_ward_tau,
+            dual_max_size=dual_ward_max_size,
+            dual_embedding=dual_ward_embedding,
             laplacian_fn=laplacian_fn,
             tau=tau,
         )

@@ -235,7 +235,9 @@ def _write_missed_gang_diagnostics(rows: list, out: Path) -> None:
     LOGGER.info(f"missed-gang CSV + plot + summary -> {out}")
 
 
-def _run_pr_sweep(det, data, basis, gang_sets, tag, args, dataset="elliptic++") -> "dict | None":
+def _run_pr_sweep(
+    det, data, basis, gang_sets, tag, args, dataset="elliptic++"
+) -> "dict | None":
     """Full incremental Ward PR-sweep for one graph (training day-range or a transfer day).
 
     Walks the whole Ward merge order (finest -> 2 clusters) recording every metric
@@ -615,10 +617,13 @@ def main() -> None:
             "linkage",
             "ward",
             "ward-tree",
+            "dual-ward",
         ],
         default="ward-tree",
         help="'edges' scales best on the ~50k-node graph; 'ward-tree' builds the "
-        "full Ward tree (heavier) and stops per --ward-stop.",
+        "full Ward tree (heavier) and stops per --ward-stop; 'dual-ward' is Smooth "
+        "Dual Ward (src.smooth_dual_ward), a Ward variant scored in the screened "
+        "dual metric -- see --dual-ward-* below.",
     )
     ap.add_argument(
         "--coarsening-laplacian",
@@ -649,6 +654,45 @@ def main() -> None:
     ap.add_argument("--ward-stop", choices=["epsilon", "f1"], default="f1")
     ap.add_argument("--ward-num-cuts", type=int, default=500)
     ap.add_argument("--threshold", type=float, default=0.51)
+    # --- Smooth Dual Ward (coarsening_method="dual-ward"; see src.smooth_dual_ward) ---
+    ap.add_argument(
+        "--dual-ward-alpha",
+        type=float,
+        default=0.0,
+        help="smoothing exponent: 0 = normalized sigma_DW in [0,1] (mass-free, "
+        "conductance-like, empirically the best of the family), 1 = raw dual-Ward "
+        "increment Delta_DW",
+    )
+    ap.add_argument(
+        "--dual-ward-tau",
+        type=float,
+        default=0.5,
+        help="screening level of M_tau = L_sym + tau I (must be > 0)",
+    )
+    ap.add_argument(
+        "--dual-ward-max-size",
+        type=int,
+        default=0,
+        help="super-node cardinality cap (0 = uncapped; classical Ward chains to "
+        "comparable sizes on this graph, so this is a cost bound, not a fix)",
+    )
+    ap.add_argument(
+        "--dual-ward-embedding",
+        choices=["dual", "primal"],
+        default="dual",
+        help="'dual' (the spec) scores merges against M_tau U_tau, which acts as "
+        "a high-pass filter on the target and empirically loses to Ward; "
+        "'primal' scores against U_tau instead, matching the evaluated RSA "
+        "constant and closing most of that gap -- kept as the default here",
+    )
+    ap.add_argument(
+        "--compare-coarseners",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="in addition to --coarsening-method, also coarsen with plain 'ward' "
+        "and 'dual-ward' (at --dual-ward-alpha) on the SAME learned target basis "
+        "and report all three side by side",
+    )
     ap.add_argument("--max-normal-patterns", type=int, default=120)
     ap.add_argument("--seed", type=int, default=1)
     out_dir = f"results/elliptic_modular/{now}/"
@@ -762,6 +806,10 @@ def main() -> None:
         ward_stop=args.ward_stop,
         ward_num_cuts=args.ward_num_cuts,
         threshold=args.threshold,
+        dual_ward_alpha=args.dual_ward_alpha,
+        dual_ward_tau=args.dual_ward_tau,
+        dual_ward_max_size=args.dual_ward_max_size,
+        dual_ward_embedding=args.dual_ward_embedding,
         seed=args.seed,
     )
     det = CollectiveBankDetector(cfg)
@@ -930,6 +978,54 @@ def main() -> None:
             f"{r['mean_f1']:>7.3f} {r['detection_rate']:>10.1%} "
             f"{r['detected']:>4}/{r['total']:<5}"
         )
+
+    # --- 3'. coarsener comparison: same basis + gangs, different coarsening ---
+    # ward-tree can't be recut by loukas_coarsen_pytorch (it owns its own tree),
+    # so the comparison always includes plain 'ward' and 'dual-ward' plus
+    # whichever method was actually configured (if different from those two).
+    coarsener_reports: dict = {}
+    if args.compare_coarseners:
+        LOGGER.info("\n" + "=" * 74)
+        LOGGER.info("COARSENER COMPARISON (same learned target basis + train gangs)")
+        LOGGER.info("=" * 74)
+        variants = [("ward", {}), (f"dual-ward a={args.dual_ward_alpha:g}", {})]
+        methods = {"ward": "ward", variants[1][0]: "dual-ward"}
+        if cfg.coarsening_method not in ("ward", "dual-ward"):
+            variants.append((cfg.coarsening_method, {}))
+            methods[cfg.coarsening_method] = cfg.coarsening_method
+        chdr = (
+            f"  {'coarsener':<20}{'n_coarse':>10}{'eps':>8}{'recall':>9}"
+            f"{'precision':>11}{'f1':>8}{'detection':>11}{'det/tot':>10}"
+        )
+        LOGGER.info(chdr)
+        LOGGER.info("  " + "-" * (len(chdr) - 2))
+        for tag, _ in variants:
+            method = methods[tag]
+            variant_cfg = replace(cfg, coarsening_method=method)
+            variant_det = CollectiveBankDetector(variant_cfg)
+            v_co, _ = variant_det.coarsen(data, basis_, gang_train)
+            v_rep = variant_det.evaluate(data, v_co, {"all": gangs})["all"]
+            v_rep["n_coarse"] = int(v_co.n_coarse)
+            v_rep["epsilon"] = float(v_co.epsilon)
+            coarsener_reports[tag] = v_rep
+            LOGGER.info(
+                f"  {tag:<20}{v_co.n_coarse:>10,}{v_co.epsilon:>8.3f}"
+                f"{v_rep['mean_recall']:>9.3f}{v_rep['mean_precision']:>11.3f}"
+                f"{v_rep['mean_f1']:>8.3f}{v_rep['detection_rate']:>11.1%}"
+                f"{v_rep['detected']:>5}/{v_rep['total']:<4}"
+            )
+        LOGGER.info(
+            "\n  Read: all three coarsen the SAME target subspace learned by the "
+            f"configured filter (coarsening_method={cfg.coarsening_method!r} is the "
+            "one actually reported above/below); this isolates the coarsening "
+            "algorithm from the learned target. 'dual-ward' uses "
+            f"--dual-ward-embedding={args.dual_ward_embedding!r} "
+            f"(tau={args.dual_ward_tau:g}); 'primal' scores merges against U_tau "
+            "instead of the spec's M_tau U_tau, which removes a high-pass "
+            "distortion of the target that otherwise costs dual-ward most of its "
+            "detections relative to Ward on Elliptic++."
+        )
+        result["coarsener_comparison"] = coarsener_reports
 
     # --- 3a. full epsilon sweep on the training graph (reuses the fitted filter) --
     pr_sweep_records: list[dict] = []
@@ -1111,6 +1207,7 @@ def main() -> None:
             "epsilon": co.epsilon,
         },
         "report": result["report"],
+        "coarsener_comparison": result.get("coarsener_comparison") or None,
         # how the SHARED filter did on each training group's own graph (empty for a
         # single group); printed above, kept here so the export path can read it
         "per_group_report": result.get("per_group_report") or None,

@@ -47,6 +47,7 @@ from src.run_collective_bank_detection import (
     ward_tree_coarsen,
 )
 
+
 # --------------------------------------------------------------------------- #
 # configuration (all algorithm knobs; no argparse, no module globals)
 # --------------------------------------------------------------------------- #
@@ -140,6 +141,11 @@ class DetectorConfig:
     ward_stop: str = "epsilon"  # "epsilon" | "f1"
     ward_num_cuts: int = 200
     threshold: float = 0.51
+    # Smooth Dual Ward (coarsening_method="dual-ward"; see src.smooth_dual_ward)
+    dual_ward_alpha: float = 0.0  # 0 = normalized sigma_DW, 1 = raw Delta_DW
+    dual_ward_tau: float = 0.1  # screening level of M_tau = L_sym + tau I
+    dual_ward_max_size: int = 0  # super-node cardinality cap (0 = uncapped)
+    dual_ward_embedding: str = "dual"  # "dual" (M_tau U_tau) | "primal" (U_tau)
 
     seed: int = 0
 
@@ -161,6 +167,7 @@ class GraphData:
     * ``y``         -- node class labels ``(N,)`` (gang nodes marked ``1``); used
       only for evaluation and, optionally, negative sampling.
     """
+
     edge_index: torch.Tensor
     a_hat: torch.Tensor
     adjacency: torch.Tensor
@@ -168,7 +175,9 @@ class GraphData:
     y: torch.Tensor
 
     @classmethod
-    def from_graph(cls, graph, *, features: "torch.Tensor | None" = None) -> "GraphData":
+    def from_graph(
+        cls, graph, *, features: "torch.Tensor | None" = None
+    ) -> "GraphData":
         """Build from any ``torch_geometric``-style graph (``edge_index``, ``x``, ``y``).
 
         ``features`` overrides ``graph.x`` (e.g. to swap real node features for a
@@ -262,8 +271,14 @@ class CollectiveBankDetector:
         return specs
 
     # -- steps -------------------------------------------------------------- #
-    def fit(self, days, train_patterns: "list | None" = None, *, label_y=None,
-            label_idx=None) -> "CollectiveBankDetector":
+    def fit(
+        self,
+        days,
+        train_patterns: "list | None" = None,
+        *,
+        label_y=None,
+        label_idx=None,
+    ) -> "CollectiveBankDetector":
         """Learn the filter bank ``Theta*`` on one or more training graphs.
 
         ``days`` is ``[(label, GraphData, train_patterns, test_patterns), ...]``
@@ -293,8 +308,14 @@ class CollectiveBankDetector:
             thetas, reports = [], {}
             for lbl, d, pats, _te in specs:
                 th, rep = collective_pencil_theta(
-                    d.a_hat, d.adjacency, d.X, pats,
-                    degree=c.degree, tau=c.tau, beta=c.pencil_beta, basis=c.basis,
+                    d.a_hat,
+                    d.adjacency,
+                    d.X,
+                    pats,
+                    degree=c.degree,
+                    tau=c.tau,
+                    beta=c.pencil_beta,
+                    basis=c.basis,
                 )
                 thetas.append(th)
                 reports[lbl] = rep
@@ -313,10 +334,13 @@ class CollectiveBankDetector:
             from src.trace_ratio_bank import fit_trace_ratio_bank
 
             self.fit_info_ = fit_trace_ratio_bank(
-                [(lbl, d.a_hat, d.adjacency, pats, d.X)
-                 for lbl, d, pats, _te in specs],
-                degree=c.degree, heads=c.heads, iters=c.trace_ratio_iters,
-                tau=c.tau, ridge=c.ridge, basis=c.basis,
+                [(lbl, d.a_hat, d.adjacency, pats, d.X) for lbl, d, pats, _te in specs],
+                degree=c.degree,
+                heads=c.heads,
+                iters=c.trace_ratio_iters,
+                tau=c.tau,
+                ridge=c.ridge,
+                basis=c.basis,
                 softmin_temperature=c.softmin_temperature,
                 conf_weight=c.conf_weight,
             )
@@ -329,8 +353,7 @@ class CollectiveBankDetector:
         # epoch happened to draw.
         neg_sampler = self._negative_sampler(specs[0][1], specs[0][2])
         self.fit_info_ = fit_collective_bank(
-            [(lbl, d.a_hat, d.adjacency, pats, d.X, te)
-             for lbl, d, pats, te in specs],
+            [(lbl, d.a_hat, d.adjacency, pats, d.X, te) for lbl, d, pats, te in specs],
             degree=c.degree,
             epochs=c.epochs,
             learning_rate=c.learning_rate,
@@ -370,8 +393,12 @@ class CollectiveBankDetector:
             if self.pencil_theta_ is None:
                 raise RuntimeError("call fit(...) before target_subspace()")
             return apply_dictionary_theta(
-                data.a_hat, data.X, self.pencil_theta_,
-                degree=c.degree, tau=c.tau, basis=c.basis,
+                data.a_hat,
+                data.X,
+                self.pencil_theta_,
+                degree=c.degree,
+                tau=c.tau,
+                basis=c.basis,
             )
         self._require_fit()
         return build_bank_subspace(
@@ -398,7 +425,12 @@ class CollectiveBankDetector:
 
             basis = self.target_subspace(data, patterns)
             e = _basis_retained_energy(
-                data.a_hat, data.adjacency, patterns, basis, c.ridge, c.tau,
+                data.a_hat,
+                data.adjacency,
+                patterns,
+                basis,
+                c.ridge,
+                c.tau,
                 indicator=c.indicator,
             )
             m_v = _train_gang_m_vhat(data.a_hat, data.adjacency, patterns, c.tau)
@@ -408,7 +440,8 @@ class CollectiveBankDetector:
             diag = torch.diagonal(g).clamp(0.0, 1.0)
             return {
                 "per_gang_capture": [float(v) for v in diag],
-                "min_capture": float(diag.min()), "mean_capture": float(diag.mean()),
+                "min_capture": float(diag.min()),
+                "mean_capture": float(diag.mean()),
                 "lambda_min_gamma": float(torch.linalg.eigvalsh(g)[0]),
             }
         self._require_fit()
@@ -430,8 +463,12 @@ class CollectiveBankDetector:
         self._require_fit()
         c = self.config
         return {
-            "chebyshev": channel_gram_cond(data.a_hat, data.X, self.theta_, c.tau, "chebyshev"),
-            "monomial": channel_gram_cond(data.a_hat, data.X, self.theta_, c.tau, "monomial"),
+            "chebyshev": channel_gram_cond(
+                data.a_hat, data.X, self.theta_, c.tau, "chebyshev"
+            ),
+            "monomial": channel_gram_cond(
+                data.a_hat, data.X, self.theta_, c.tau, "monomial"
+            ),
         }
 
     def coarsen(self, data: GraphData, basis: torch.Tensor, train_patterns: list):
@@ -465,6 +502,14 @@ class CollectiveBankDetector:
             )
         else:
             budget = dict(reduction=c.reduction)
+        extra = {}
+        if c.coarsening_method == "dual-ward":
+            extra = dict(
+                dual_ward_alpha=c.dual_ward_alpha,
+                dual_ward_tau=c.dual_ward_tau,
+                dual_ward_max_size=c.dual_ward_max_size,
+                dual_ward_embedding=c.dual_ward_embedding,
+            )
         coarsening = loukas_coarsen_pytorch(
             data.adjacency,
             basis,
@@ -473,6 +518,7 @@ class CollectiveBankDetector:
             max_levels=c.max_levels,
             tau=c.tau,
             **budget,
+            **extra,
         )
         return coarsening, None
 
@@ -523,7 +569,11 @@ class CollectiveBankDetector:
         splits = {
             "train": train_patterns,
             "test": test_patterns,
-            "all": all_patterns if all_patterns is not None else train_patterns + test_patterns,
+            "all": (
+                all_patterns
+                if all_patterns is not None
+                else train_patterns + test_patterns
+            ),
         }
         report = self.evaluate(data, coarsening, splits)
         captures = {
